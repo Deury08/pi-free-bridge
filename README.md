@@ -20,11 +20,24 @@ Remove the old one with `pi remove npm:pi-opencode-bridge`.
 ## What it registers
 
 Seven models, discovered from the OpenCode registry
-(`~/.cache/opencode/models.json`, key `"opencode"`) filtered to entries whose every
-declared cost field is zero:
+(`~/.cache/opencode/models.json`, key `"opencode"`), filtered to entries whose every
+declared cost field is zero **and** that the surface actually advertises:
 
 `big-pickle`, `cat-jam-free`, `longcat-2.5-preview-free`, `mimo-v2.6-flash-free`,
 `nemotron-3.5-lightning-free`, `space-bunny-free`, `step-5-preview-free`
+
+Two filter traps, both measured, both worth keeping in mind:
+
+- `cost.cache_write` is **absent** on most free models, so testing all four cost
+  fields with `=== 0` classifies 36 of the 39 free registry models as paid. The
+  filter treats every *declared* cost field.
+- 32 of those 39 are no longer advertised by `/inference/v1/models`. Registering
+  them would put permanently broken entries in the picker, so the set is
+  intersected with the advertised list.
+
+The advertised list is a dated snapshot in `index.ts` so that startup stays
+offline and deterministic; `/free-bridge-refresh` re-fetches it, persists the
+result to `~/.pi/agent/pi-free-bridge.json` and re-registers the provider.
 
 Excluded on purpose:
 
@@ -33,9 +46,17 @@ Excluded on purpose:
   chat/completions (and `403` on `/messages`). They stay out of the model picker
   so they cannot produce startup warnings.
 
-Diagnostics: `/free-bridge-models` lists what got registered,
-`PI_FREE_BRIDGE_DRY_RUN=1` prints the registry source, headers and model list
-without touching Pi's config.
+Diagnostics:
+
+| Command | Effect |
+|---|---|
+| `/free-bridge-models` | lists what got registered and where the registry came from |
+| `/free-bridge-session` | shows the session id in use and its source |
+| `/free-bridge-session ses_…` | switches to a new session id and persists it |
+| `/free-bridge-refresh` | re-fetches the advertised model list and re-registers |
+
+`PI_FREE_BRIDGE_DRY_RUN=1` prints the same diagnostics at startup without touching
+Pi's config.
 
 ## The gate contract
 
@@ -81,10 +102,26 @@ without touching code:
 and persist it in `~/.pi/agent/pi-free-bridge.json`:
 
 ```json
-{ "sessionId": "ses_…" }
+{
+  "sessionId": "ses_…",
+  "liveIds": ["big-pickle", "…"]
+}
 ```
 
-`PI_FREE_BRIDGE_SESSION_ID` overrides both.
+`PI_FREE_BRIDGE_SESSION_ID` overrides the config file.
+
+## Tests
+
+```bash
+node test/smoke.mjs   # filter, header contract, excluded/paid leak — offline, no network
+node repro.mjs        # the live gate — network
+```
+
+`test/smoke.mjs` stubs Pi's `ExtensionAPI` and asserts the registration: provider
+id, surface, api key, the exact 7-model set, absence of excluded and paid models,
+the five required headers, and that the retired Zen route never reaches the
+registration. It is the regression
+net for the filter and the header recipe; `repro.mjs` covers the vendor side.
 
 ## Tripwire after a vendor change
 

@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -11,8 +11,8 @@ import { join } from "node:path";
  *  all reference `oc-sdk-zen/<model>`. Do not rename it (HANDOFF D2). */
 const PROVIDER = "oc-sdk-zen";
 
-/** The free tier moved here from /zen/v1, which is now hard-403 for every
- *  client outside the official CLI (HANDOFF §4.1). */
+/** The free tier moved here from the retired Zen surface, which is now hard-403
+ *  for every client outside the official CLI (HANDOFF §4.1). */
 const BASE_URL = "https://opencode.ai/inference/v1";
 const API = "openai-completions" as const;
 
@@ -34,8 +34,24 @@ const REGISTRY_PATHS = [
 	join(homedir(), ".config", "opencode", "models.json"),
 ];
 
-/** Optional user config: `{ "sessionId": "ses_…" }`. */
+/** Optional user config: `{ "sessionId": "ses_…", "liveIds": ["…"] }`. */
 const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
+
+/** Free ids the surface actually advertised on 2026-10-14.
+ *
+ *  Registration stays offline and deterministic: intersecting the registry with
+ *  `GET /inference/v1/models` on every launch would put a network round-trip on
+ *  the startup path. Refresh the snapshot with `/free-bridge-refresh`, which
+ *  fetches the live list and persists it to BRIDGE_CONFIG_PATH. */
+const SNAPSHOT_LIVE_FREE_IDS = [
+	"big-pickle",
+	"cat-jam-free",
+	"longcat-2.5-preview-free",
+	"mimo-v2.6-flash-free",
+	"nemotron-3.5-lightning-free",
+	"space-bunny-free",
+	"step-5-preview-free",
+];
 
 /** Models the surface advertises but cannot serve over chat/completions:
  *  400 ModelProtocolUnsupported on /inference/v1, 403 on /messages (HANDOFF D5). */
@@ -51,21 +67,49 @@ const REG_KEY = Symbol.for("pi-free-bridge:registered");
 // Session id
 // ---------------------------------------------------------------------------
 
+type BridgeConfig = {
+	sessionId?: string;
+	liveIds?: string[];
+};
+
+function readBridgeConfig(): BridgeConfig {
+	if (!existsSync(BRIDGE_CONFIG_PATH)) return {};
+	try {
+		const cfg = JSON.parse(readFileSync(BRIDGE_CONFIG_PATH, "utf-8"));
+		return cfg && typeof cfg === "object" ? (cfg as BridgeConfig) : {};
+	} catch {
+		// malformed config falls back to the built-in defaults
+		return {};
+	}
+}
+
+function writeBridgeConfig(patch: BridgeConfig): void {
+	const merged = { ...readBridgeConfig(), ...patch };
+	try {
+		writeFileSync(BRIDGE_CONFIG_PATH, `${JSON.stringify(merged, null, 2)}\n`, "utf-8");
+		return true;
+	} catch (err) {
+		console.error(`pi-free-bridge: could not write ${BRIDGE_CONFIG_PATH}: ${(err as Error).message}`);
+		return false;
+	}
+}
+
 function resolveSessionId(): { sessionId: string; source: string } {
 	const fromEnv = process.env.PI_FREE_BRIDGE_SESSION_ID?.trim();
 	if (fromEnv) return { sessionId: fromEnv, source: "PI_FREE_BRIDGE_SESSION_ID" };
 
-	if (existsSync(BRIDGE_CONFIG_PATH)) {
-		try {
-			const cfg = JSON.parse(readFileSync(BRIDGE_CONFIG_PATH, "utf-8"));
-			const id = typeof cfg?.sessionId === "string" ? cfg.sessionId.trim() : "";
-			if (id) return { sessionId: id, source: BRIDGE_CONFIG_PATH };
-		} catch {
-			// malformed config falls back to the built-in constant
-		}
-	}
+	const fromConfig = readBridgeConfig().sessionId?.trim();
+	if (fromConfig) return { sessionId: fromConfig, source: BRIDGE_CONFIG_PATH };
 
 	return { sessionId: DEFAULT_SESSION_ID, source: "built-in constant" };
+}
+
+function resolveLiveIds(): { liveIds: Set<string>; source: string } {
+	const fromConfig = readBridgeConfig().liveIds;
+	if (Array.isArray(fromConfig) && fromConfig.length > 0) {
+		return { liveIds: new Set(fromConfig), source: BRIDGE_CONFIG_PATH };
+	}
+	return { liveIds: new Set(SNAPSHOT_LIVE_FREE_IDS), source: "built-in snapshot (2026-10-14)" };
 }
 
 function buildHeaders(sessionId: string): Record<string, string> {
@@ -103,32 +147,55 @@ function isFree(meta: Record<string, unknown>): boolean {
 	return declared.length > 0 && declared.every((v) => v === 0);
 }
 
-function discoverFreeModels(): { models: RegistryModel[]; source: string } {
+function discoverFreeModels(liveIds: Set<string>): { models: RegistryModel[]; source: string; skipped: string[] } {
 	const path = resolveRegistryPath();
-	if (!path) return { models: [], source: "registry not found" };
+	if (!path) return { models: [], source: "registry not found", skipped: [] };
 
 	let data: Record<string, any>;
 	try {
 		data = JSON.parse(readFileSync(path, "utf-8"));
 	} catch (err) {
-		return { models: [], source: `registry unreadable: ${(err as Error).message}` };
+		return { models: [], source: `registry unreadable: ${(err as Error).message}`, skipped: [] };
 	}
 
 	const registryModels = data?.opencode?.models;
 	if (!registryModels || typeof registryModels !== "object") {
-		return { models: [], source: `registry has no "opencode.models": ${path}` };
+		return { models: [], source: `registry has no "opencode.models": ${path}`, skipped: [] };
 	}
 
 	const models: RegistryModel[] = [];
+	const skipped: string[] = [];
 	for (const [id, meta] of Object.entries<Record<string, unknown>>(registryModels)) {
 		if (!meta || typeof meta !== "object") continue;
-		if (EXCLUDED_MODELS.has(id)) continue;
+		if (EXCLUDED_MODELS.has(id)) {
+			skipped.push(id);
+			continue;
+		}
 		if (!isFree(meta)) continue;
+		// Free in the registry but not advertised by the surface: registering it
+		// would put a permanently broken entry in the picker.
+		if (!liveIds.has(id)) {
+			skipped.push(id);
+			continue;
+		}
 		models.push({ id, name: (meta.name as string) || id, meta });
 	}
 
 	models.sort((a, b) => a.id.localeCompare(b.id));
-	return { models, source: path };
+	return { models, source: path, skipped };
+}
+
+/** Ask the surface which models it advertises, then keep the free ones. */
+async function fetchLiveFreeIds(registryFree: Set<string>): Promise<string[]> {
+	const res = await fetch(`${BASE_URL}/models`, {
+		headers: { "user-agent": USER_AGENT, authorization: `Bearer ${API_KEY}` },
+	});
+	if (!res.ok) throw new Error(`${BASE_URL}/models -> ${res.status}`);
+	const payload = (await res.json()) as { data?: { id?: string }[] } | { models?: { id?: string }[] };
+	const listed = payload.data ?? payload.models ?? [];
+	return listed
+		.map((m) => (typeof m === "string" ? m : m?.id))
+		.filter((id): id is string => typeof id === "string" && registryFree.has(id));
 }
 
 function buildPiModels(raw: RegistryModel[]) {
@@ -180,10 +247,11 @@ function buildPiModels(raw: RegistryModel[]) {
 // Diagnostics
 // ---------------------------------------------------------------------------
 
-function printDryRun(discovered: { models: RegistryModel[]; source: string }, session: {
-	sessionId: string;
-	source: string;
-}): void {
+function printDryRun(
+	discovered: { models: RegistryModel[]; source: string; skipped: string[] },
+	session: { sessionId: string; source: string },
+	live: { liveIds: Set<string>; source: string },
+): void {
 	const lines = [
 		"pi-free-bridge dry run",
 		`  registry:    ${discovered.source}`,
@@ -191,9 +259,12 @@ function printDryRun(discovered: { models: RegistryModel[]; source: string }, se
 		`  api:         ${API}   apiKey: ${API_KEY}`,
 		`  session id:  ${session.sessionId} (from ${session.source})`,
 		`  headers:     ${Object.keys(buildHeaders(session.sessionId)).join(", ")}`,
+		`  live ids:    ${live.source}`,
 		`  excluded:    ${[...EXCLUDED_MODELS].join(", ")}`,
 		`  models (${discovered.models.length}):`,
 		...discovered.models.map((m) => `    - ${m.id}`),
+		`  skipped (${discovered.skipped.length}):`,
+		...discovered.skipped.map((m) => `    - ${m}`),
 	];
 	console.log(lines.join("\n"));
 }
@@ -207,10 +278,11 @@ export default function (pi: ExtensionAPI) {
 	if (g[REG_KEY]) return;
 
 	const session = resolveSessionId();
-	const discovered = discoverFreeModels();
+	const live = resolveLiveIds();
+	const discovered = discoverFreeModels(live.liveIds);
 
 	if (process.env.PI_FREE_BRIDGE_DRY_RUN === "1") {
-		printDryRun(discovered, session);
+		printDryRun(discovered, session, live);
 	}
 
 	if (discovered.models.length === 0) {
@@ -250,6 +322,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Session id must start with ses_", "warning");
 				return;
 			}
+			const persisted = writeBridgeConfig({ sessionId: next });
 			pi.registerProvider(PROVIDER, {
 				apiKey: API_KEY,
 				api: API,
@@ -259,9 +332,47 @@ export default function (pi: ExtensionAPI) {
 				models: buildPiModels(discovered.models),
 			});
 			ctx.ui.notify(
-				`Session id set to ${next} for this session. Persist it in ${BRIDGE_CONFIG_PATH} to keep it.`,
+				persisted
+					? `Session id set to ${next} and saved to ${BRIDGE_CONFIG_PATH}`
+					: `Session id set to ${next} for this session only (could not write ${BRIDGE_CONFIG_PATH})`,
 				"info",
 			);
+		},
+	});
+
+	pi.registerCommand("free-bridge-refresh", {
+		description: "Re-fetch the live free-model list from OpenCode and re-register the provider",
+		handler: async (_args: string, ctx) => {
+			ctx.ui.notify("Refreshing the live free-model list…", "info");
+			try {
+				const registryFree = new Set<string>();
+				for (const [id, meta] of Object.entries<Record<string, unknown>>(
+					JSON.parse(readFileSync(resolveRegistryPath()!, "utf-8"))?.opencode?.models ?? {},
+				)) {
+					if (isFree(meta) && !EXCLUDED_MODELS.has(id)) registryFree.add(id);
+				}
+				const liveIds = await fetchLiveFreeIds(registryFree);
+				if (liveIds.length === 0) {
+					ctx.ui.notify("The surface advertised no free models; keeping the current list", "warning");
+					return;
+				}
+				writeBridgeConfig({ liveIds });
+				const refreshed = discoverFreeModels(new Set(liveIds));
+				pi.registerProvider(PROVIDER, {
+					apiKey: API_KEY,
+					api: API,
+					baseUrl: BASE_URL,
+					authHeader: true,
+					headers: buildHeaders(resolveSessionId().sessionId),
+					models: buildPiModels(refreshed.models),
+				});
+				ctx.ui.notify(
+					`${PROVIDER} now registers ${refreshed.models.length} free models: ${refreshed.models.map((m) => m.id).join(", ")}`,
+					"info",
+				);
+			} catch (err) {
+				ctx.ui.notify(`Could not refresh: ${(err as Error).message}`, "error");
+			}
 		},
 	});
 
