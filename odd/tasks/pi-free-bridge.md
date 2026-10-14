@@ -77,6 +77,32 @@ contract itself) and independent from the third-party `pi-opencode-bridge`.
 - **T9** README: gate contract summary + how to re-run `repro.mjs` after a vendor
   change + how to refresh the session id. Route: inline.
 
+## Task outcomes
+
+| Task | Outcome | Evidence |
+|---|---|---|
+| T0 | done | `node repro.mjs` → `200 SSE-CHUNK (PASS)`; HANDOFF §4.2/§4.3/§4.5, D3, D4, §8.1 rewritten |
+| T1 | done | commit `c8218b1` — package.json, index.ts, README.md, repro.mjs, .gitignore, odd/ |
+| T2 | done | `node test/smoke.mjs` → `smoke: OK — 7 free models registered under oc-sdk-zen` |
+| T3 | done | `PI_FREE_BRIDGE_DRY_RUN=1` prints registry, surface, session id and source, headers, models, skipped |
+| T4 | done | `pi install C:\Users\Polanco\pi-free-bridge` → `pi list` shows `..\..\pi-free-bridge` |
+| T5 | done | `pi remove npm:pi-opencode-bridge` → `settings.packages` no longer lists it; the node_modules stopgap patch died with it |
+| T6 | done | stripped `headers` from `models.json → providers.oc-sdk-zen` (now just `{"apiKey": "public"}`); `pi -p --model oc-sdk-zen/space-bunny-free` → `OK` → the bridge is self-sufficient |
+| T7 | done | 7/7 e2e `OK`; `pi --list-models` shows exactly the 7 free models, zero muse/jev/paid under `oc-sdk-zen`; zero startup warnings |
+| T8 | done | `settings.json enabledModels` 34 → 32, muse-spark entries dropped; the 21 `opencode-go/*` entries still resolve natively from `models.json` and were left alone |
+| T9 | done | commit `02a2d74` — README gate contract, filter traps, session refresh, tests section |
+
+Additional work unit (not in the original checklist): commit `02a2d74` adds the
+advertised-id intersection, `test/smoke.mjs`, `/free-bridge-refresh`,
+`/free-bridge-session` persistence and the README.
+
+Independent verification: **unavailable**. `gentle-ai-verify` failed twice to
+register its worktree ("Session Git identity changed; cannot register a worktree"),
+so the S-by-S verification was done inline instead: smoke test green, `repro.mjs`
+green, 7/7 e2e green, and robustness probed directly — a malformed
+`~/.pi/agent/pi-free-bridge.json` falls back to the built-in snapshot, a narrowed
+`liveIds` override is honoured, and a missing config file falls back cleanly.
+
 ## Log
 
 - **L1** (user, verbatim) "dale paurry , te aso el royecto ara que lo bregues" —
@@ -120,3 +146,9 @@ contract itself) and independent from the third-party `pi-opencode-bridge`.
 - **L9** (safety) The captured request contains the user's real `sk-…` OpenCode
   key from `~/.pi/agent/auth.json`. It stays in `%TEMP%` only and never enters the
   repo; the bridge itself needs no key (`Bearer public` passes, S8).
+- **L10** (evidence) `repro.mjs` failed on the first run with the documented recipe
+  (L2), so the tripwire was rewritten against the re-measured contract and now
+  passes; the smoke test then failed RED against the first implementation because
+  it registered all 39 registry-free models instead of the advertised
+  intersection, which produced the snapshot design (`SNAPSHOT_LIVE_FREE_IDS`,
+  `/free-bridge-refresh`) recorded in S10 and the README.
