@@ -50,6 +50,10 @@ contract itself) and independent from the third-party `pi-opencode-bridge`.
 - **S12** "`settings.packages` contains the new package and NOT
   `npm:pi-opencode-bridge`" (HANDOFF §8.5).
 - **S13** "Zero occurrences of `zen/v1` in the new package" (HANDOFF §8.6).
+- **S14** Documentation is written in Spanish: the user asked "exlicame los
+  comandos", "documenta todo eso" and "en esañol"; README.md is therefore
+  Spanish, while commands, identifiers, config keys and code blocks stay in
+  their original form.
 
 ## Tasks
 
@@ -75,7 +79,8 @@ contract itself) and independent from the third-party `pi-opencode-bridge`.
 - **T8** `settings.json` cleanup: drop `muse-spark-*` from `enabledModels` (S5).
   Route: inline.
 - **T9** README: gate contract summary + how to re-run `repro.mjs` after a vendor
-  change + how to refresh the session id. Route: inline.
+  change + how to refresh the session id + full command reference. Covers S14
+  (Spanish). Route: inline.
 
 ## Task outcomes
 
@@ -90,7 +95,7 @@ contract itself) and independent from the third-party `pi-opencode-bridge`.
 | T6 | done | stripped `headers` from `models.json → providers.oc-sdk-zen` (now just `{"apiKey": "public"}`); `pi -p --model oc-sdk-zen/space-bunny-free` → `OK` → the bridge is self-sufficient |
 | T7 | done | 7/7 e2e `OK`; `pi --list-models` shows exactly the 7 free models, zero muse/jev/paid under `oc-sdk-zen`; zero startup warnings |
 | T8 | done | `settings.json enabledModels` 34 → 32, muse-spark entries dropped; the 21 `opencode-go/*` entries still resolve natively from `models.json` and were left alone |
-| T9 | done | commit `02a2d74` — README gate contract, filter traps, session refresh, tests section |
+| T9 | done | commit `02a2d74` + the follow-up docs commits — README con el contrato del gate, las trampas del filtro, el refresh de sesión, las pruebas y la referencia completa de comandos, en español (S14) |
 
 Additional work unit (not in the original checklist): commit `02a2d74` adds the
 advertised-id intersection, `test/smoke.mjs`, `/free-bridge-refresh`,
@@ -152,3 +157,7 @@ green, 7/7 e2e green, and robustness probed directly — a malformed
   it registered all 39 registry-free models instead of the advertised
   intersection, which produced the snapshot design (`SNAPSHOT_LIVE_FREE_IDS`,
   `/free-bridge-refresh`) recorded in S10 and the README.
+- **L11** (user, verbatim) "exlicame los comandos" then "documenta todo eso" then
+  "en esañol" — the user asked for the commands to be explained, then documented,
+  then requested the documentation in Spanish. README.md is now written in Spanish
+  (commands, identifiers and code blocks stay as-is); T9 remains done.
