@@ -37,6 +37,14 @@ const REGISTRY_PATHS = [
 /** Optional user config: `{ "sessionId": "ses_…", "liveIds": ["…"] }`. */
 const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
 
+/** Pi's global settings. Pi scopes the model picker to `enabledModels`, so a
+ *  non-empty list means "show ONLY these" — see ensureEnabledPattern. */
+const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+
+/** The scope entry the bridge needs. A glob, not literal ids: the bridge
+ *  registers its models at runtime, so literal ids hide anything new. */
+const SCOPE_PATTERN = `${PROVIDER}/*`;
+
 /** Free ids the surface actually advertised on 2026-10-14.
  *
  *  Registration stays offline and deterministic: intersecting the registry with
@@ -62,6 +70,209 @@ const EXCLUDED_MODELS = new Set([
 ]);
 
 const REG_KEY = Symbol.for("pi-free-bridge:registered");
+
+// ---------------------------------------------------------------------------
+// Picker scope (enabledModels)
+// ---------------------------------------------------------------------------
+
+/** Pi does not show every registered model. It scopes the picker to
+ *  `enabledModels` in its global settings: an empty/absent list is unscoped
+ *  (everything shows), a non-empty list shows ONLY those entries. The bridge
+ *  registers `oc-sdk-zen/*` at runtime, so a list that omits it hides every free
+ *  model — while `pi --list-models` still reports all of them, because the CLI
+ *  reads a different source (getAvailable) than the picker (scopedModels).
+ *
+ *  The repair below is append-only and idempotent: it never removes, reorders
+ *  or rewrites an existing entry, and never touches any other settings key. */
+export type EnabledPatternResult =
+	| { status: "unchanged" }
+	| { status: "added"; text: string; previousCount: number }
+	| { status: "malformed"; reason: string };
+
+function stripBom(text: string): string {
+	return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/** Locate the `enabledModels` array literal in the raw text.
+ *
+ *  Returns the offsets of `[` and `]`, or null. Only meaningful once JSON.parse
+ *  has already confirmed the value is a non-empty array of strings, which is
+ *  what makes the string-aware scan below safe. */
+function findEnabledModelsArray(text: string): { open: number; close: number } | null {
+	const key = text.indexOf('"enabledModels"');
+	if (key === -1) return null;
+
+	let i = key + '"enabledModels"'.length;
+	while (i < text.length && /\s/.test(text[i]!)) i++;
+	if (text[i] !== ":") return null;
+	i++;
+	while (i < text.length && /\s/.test(text[i]!)) i++;
+	if (text[i] !== "[") return null;
+
+	const open = i;
+	let depth = 0;
+	let inStr = false;
+	let esc = false;
+	for (i = open; i < text.length; i++) {
+		const ch = text[i]!;
+		if (inStr) {
+			if (esc) esc = false;
+			else if (ch === "\\") esc = true;
+			else if (ch === '"') inStr = false;
+			continue;
+		}
+		if (ch === '"') inStr = true;
+		else if (ch === "[") depth++;
+		else if (ch === "]") {
+			depth--;
+			if (depth === 0) return { open, close: i };
+		}
+	}
+	return null;
+}
+
+/** Byte offset just past the last complete string entry of an array of strings.
+ *  Scans forward so escapes inside entries cannot fool it. */
+function lastEntryEnd(text: string, open: number, close: number): number | null {
+	let i = open + 1;
+	let inStr = false;
+	let esc = false;
+	let end = -1;
+	for (; i < close; i++) {
+		const ch = text[i]!;
+		if (inStr) {
+			if (esc) esc = false;
+			else if (ch === "\\") esc = true;
+			else if (ch === '"') {
+				inStr = false;
+				end = i + 1;
+			}
+			continue;
+		}
+		if (ch === '"') inStr = true;
+	}
+	return end === -1 ? null : end;
+}
+
+/** The line ending this file already uses, taken from its first line break. */
+function detectEol(text: string): string {
+	const lf = text.indexOf("\n");
+	if (lf === -1) return "\n";
+	return text[lf - 1] === "\r" ? "\r\n" : "\n";
+}
+
+/** Leading whitespace of the line containing `pos`, or "" if it is not the
+ *  first thing on its line. */
+function lineIndent(text: string, pos: number): string {
+	const start = text.lastIndexOf("\n", pos - 1) + 1;
+	let i = start;
+	while (i < pos && (text[i] === " " || text[i] === "\t")) i++;
+	return i === pos ? "" : text.slice(start, i);
+}
+
+export function ensureEnabledPattern(rawText: string, pattern: string): EnabledPatternResult {
+	if (typeof rawText !== "string" || rawText.trim() === "") {
+		return { status: "malformed", reason: "settings.json is empty or unreadable" };
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(stripBom(rawText));
+	} catch (err) {
+		return { status: "malformed", reason: `invalid JSON: ${(err as Error).message}` };
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return { status: "malformed", reason: "settings.json is not a JSON object" };
+	}
+
+	const settings = parsed as Record<string, unknown>;
+	const enabled = settings.enabledModels;
+
+	if (enabled === undefined) {
+		// Absent leaves the picker unscoped — every model already shows. Appending
+		// the glob there would *narrow* the picker, so there is nothing to repair.
+		return { status: "unchanged" };
+	}
+	if (!Array.isArray(enabled)) {
+		return { status: "malformed", reason: "enabledModels is not an array" };
+	}
+	if (enabled.length === 0) {
+		// Same as absent: an empty list leaves the picker unscoped.
+		return { status: "unchanged" };
+	}
+	if (!enabled.every((v) => typeof v === "string")) {
+		return { status: "malformed", reason: "enabledModels contains a non-string entry" };
+	}
+	if (enabled.includes(pattern)) {
+		return { status: "unchanged" };
+	}
+
+	// Splice the new entry into the raw text rather than re-serializing the whole
+	// document. JSON.parse -> JSON.stringify round-trips would rewrite every byte
+	// outside this array: it normalises CRLF to LF, collapses duplicate keys, and
+	// silently rounds integers above 2^53. This file belongs to Pi and to the
+	// user's editor, so the repair has to leave every other byte exactly as it
+	// found it.
+	const body = stripBom(rawText);
+	const span = findEnabledModelsArray(body);
+	if (!span) return { status: "malformed", reason: "could not locate the enabledModels array" };
+
+	const anchor = lastEntryEnd(body, span.open, span.close);
+	if (anchor === null) {
+		return { status: "malformed", reason: "enabledModels array could not be scanned" };
+	}
+
+	const head = body.slice(span.open + 1, anchor);
+	// A single-line array keeps the new entry on that line; a multi-line one
+	// matches the indentation and line ending the file already uses.
+	const inline = !head.includes("\n");
+	const insertion = inline
+		? `, ${JSON.stringify(pattern)}`
+		: `,${detectEol(body)}${lineIndent(body, anchor)}${JSON.stringify(pattern)}`;
+
+	const text = body.slice(0, anchor) + insertion + body.slice(anchor);
+
+	// Belt and braces: never emit a write we have not proven changes exactly one
+	// field and keeps the array contents.
+	try {
+		const reparsed = JSON.parse(text) as Record<string, unknown>;
+		const expected = { ...settings, enabledModels: [...enabled, pattern] };
+		if (JSON.stringify(reparsed) !== JSON.stringify(expected)) {
+			return { status: "malformed", reason: "repaired settings.json did not round-trip" };
+		}
+	} catch (err) {
+		return { status: "malformed", reason: `repaired settings.json is invalid: ${(err as Error).message}` };
+	}
+
+	return { status: "added", text, previousCount: enabled.length };
+}
+
+/** Append `oc-sdk-zen/*` to the given settings file if it is missing.
+ *
+ *  `PI_FREE_BRIDGE_SELF_REPAIR=0` disables the write here, not at the call site,
+ *  so no caller — including /free-bridge-doctor — can bypass it. */
+export function repairEnabledModels(settingsPath: string = SETTINGS_PATH): EnabledPatternResult {
+	if (process.env.PI_FREE_BRIDGE_SELF_REPAIR === "0") {
+		return { status: "unchanged" };
+	}
+
+	let raw: string;
+	try {
+		raw = readFileSync(settingsPath, "utf-8");
+	} catch (err) {
+		return { status: "malformed", reason: `could not read ${settingsPath}: ${(err as Error).message}` };
+	}
+
+	const result = ensureEnabledPattern(raw, SCOPE_PATTERN);
+	if (result.status !== "added") return result;
+
+	try {
+		writeFileSync(settingsPath, result.text, "utf-8");
+	} catch (err) {
+		return { status: "malformed", reason: `could not write ${settingsPath}: ${(err as Error).message}` };
+	}
+	return result;
+}
 
 // ---------------------------------------------------------------------------
 // Session id
@@ -306,6 +517,25 @@ export default function (pi: ExtensionAPI) {
 
 	g[REG_KEY] = true;
 
+	// Keep the picker able to see the models this bridge just registered. Silent
+	// when the scope is already healthy; this is a repair, not a notification.
+	// See ensureEnabledPattern for why this cannot fix the running session.
+	// The kill switch lives inside repairEnabledModels, not here, so every caller
+	// is covered.
+	const scope = repairEnabledModels();
+	if (scope.status === "added") {
+		console.error(
+			`pi-free-bridge: added "${SCOPE_PATTERN}" to enabledModels in ${SETTINGS_PATH} ` +
+				`(${scope.previousCount} -> ${scope.previousCount + 1} entries). ` +
+				"Restart Pi for the model picker to pick it up.",
+		);
+	} else if (scope.status === "malformed") {
+		console.error(
+			`pi-free-bridge: could not verify the model-picker scope — ${scope.reason}. ` +
+				`Run /free-bridge-doctor for details.`,
+		);
+	}
+
 	pi.registerCommand("free-bridge-session", {
 		description: "Show or set the OpenCode session id used by the free-tier gate",
 		handler: async (args: string, ctx) => {
@@ -384,6 +614,46 @@ export default function (pi: ExtensionAPI) {
 				...discovered.models.map((m) => `  ${PROVIDER}/${m.id}`),
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("free-bridge-doctor", {
+		description: "Diagnose and repair why the free OpenCode models are missing from the picker",
+		handler: async (_args: string, ctx) => {
+			const lines = [
+				"pi-free-bridge doctor",
+				`  provider:   ${PROVIDER}`,
+				`  registered: ${discovered.models.length} free models from ${discovered.source}`,
+				`  session id: ${session.sessionId} (from ${session.source})`,
+				`  live ids:   ${live.source}`,
+				`  skipped:    ${discovered.skipped.length ? discovered.skipped.join(", ") : "none"}`,
+			];
+
+			const result = repairEnabledModels();
+			if (result.status === "unchanged") {
+				lines.push(`  scope:      ok — "${SCOPE_PATTERN}" is in enabledModels`);
+			} else if (result.status === "added") {
+				lines.push(
+					`  scope:      repaired — appended "${SCOPE_PATTERN}" to enabledModels ` +
+						`(${result.previousCount} -> ${result.previousCount + 1} entries)`,
+				);
+			} else {
+				lines.push(`  scope:      FAILED — ${result.reason}`);
+				lines.push(`              edit ${SETTINGS_PATH} by hand and add "${SCOPE_PATTERN}"`);
+			}
+
+			lines.push(
+				"",
+				"  Pi resolves the picker scope once at startup and never re-reads",
+				"  settings.json, so any change here applies on the next Pi launch.",
+				"",
+				`  If the models still do not appear, run:`,
+				`    pi -p --model ${PROVIDER}/space-bunny-free "Reply with exactly: OK"`,
+				"  A non-zero exit or a non-OK reply is a gate or session-id problem,",
+				"  not a scope problem — see /free-bridge-session.",
+			);
+
+			ctx.ui.notify(lines.join("\n"), result.status === "malformed" ? "error" : "info");
 		},
 	});
 }

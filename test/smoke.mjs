@@ -39,6 +39,8 @@ const pi = {
 };
 
 process.env.PI_FREE_BRIDGE_DRY_RUN = "1";
+// Never let importing the extension write the real ~/.pi/agent/settings.json.
+process.env.PI_FREE_BRIDGE_SELF_REPAIR = "0";
 const bridge = (await import("../index.ts")).default;
 bridge(pi);
 

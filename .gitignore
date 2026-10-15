@@ -1,3 +1,8 @@
 node_modules/
 *.log
 .DS_Store
+
+# Scratch dumps from manual gate triage (see HANDOFF.md §4). Local evidence,
+# not part of the package.
+big.txt
+raw_*.txt

@@ -95,12 +95,76 @@ Forma del archivo de config:
 Precedencia: env → config → constante incluida. Un config malformado o ausente
 cae en silencio a los valores por defecto (verificado).
 
+### El picker está acotado por `enabledModels`
+
+El selector de modelos de Pi **no** ofrece todo lo que el puente registra: lo acota
+la lista `enabledModels` de `~/.pi/agent/settings.json`. Vacía → el picker ofrece todo
+lo disponible. Con entradas → el picker ofrece **solo** esas.
+
+Esto explica la contradicción más común: `pi --list-models` muestra los 7 modelos y el
+picker no. **Son rutas distintas** — la CLI usa `getAvailable()`, el picker usa el scope
+de `enabledModels`.
+
+El puente necesita esa entrada, con **glob** y no ids literales. Se **agrega** a la lista
+que ya tenés, no la reemplaza: si copiás este bloque tal cual sobre un `settings.json`
+que ya tiene otras entradas, borrás esos modelos del picker.
+
+```jsonc
+// ~/.pi/agent/settings.json
+"enabledModels": [
+  "opencode-go/…",   // lo que ya tengas — no lo toques
+  "oc-sdk-zen/*"     // lo único que necesita el puente
+]
+```
+
+`oc-sdk-zen/*` cubre los 7 modelos del momento y también los que agregue
+`/free-bridge-refresh`. Con ids literales (`oc-sdk-zen/space-bunny-free`, …) todo modelo
+nuevo queda invisible hasta que edites la lista a mano, y es fácil olvidarse de alguno:
+el síntoma es "falta un modelo en el picker" sin ningún error que lo explique.
+
+### El puente repara el scope solo
+
+No hace falta que edites `settings.json` a mano, ni después de un reinstall. En cada
+arranque la extensión revisa `enabledModels` y, si le falta `oc-sdk-zen/*`, **se lo
+agrega sola**.
+
+El arreglo es append-only e idempotente: nunca borra, nunca reordena, nunca reescribe
+una entrada existente y no toca ninguna otra clave del archivo. El insertado es a nivel
+de bytes, no un round-trip de JSON — por eso no te reformatea el archivo ni te cambia
+los CRLF a LF. Si el glob ya está, no escribe nada.
+
+Si la lista está **ausente o vacía**, tampoco hace nada, y es a propósito: una lista
+vacía deja el picker sin scope (muestra todo), así que agregar el glob ahí lo
+*achicaría* en vez de arreglarlo. El bug solo existe cuando la lista tiene algo.
+
+⚠️ **Pi resuelve el scope una sola vez, al arrancar, y nunca vuelve a leer
+`settings.json`.** Si el arreglo se aplicó, el picker de esa sesión sigue como estaba:
+**reiniciá Pi**.
+
+⚠️ Si en `/models` guardás la selección, Pi reescribe la lista con los ids elegidos y
+**pierde el glob**. No pasa nada: el próximo arranque lo repone.
+
+Para ver qué está pasando y repararlo a mano cuando quieras:
+
+```
+/free-bridge-doctor
+```
+
+Diagnostica y repara: lista lo registrado, el session id, los modelos salteados y el
+estado del scope. Si no puede escribir, dice exactamente por qué y qué editar a mano.
+
+Comprobar que el scope resuelve (cero `No models match pattern` = todo patrón matcheó):
+
+```bash
+pi -p --model oc-sdk-zen/space-bunny-free "Reply with exactly: OK"
+```
+
 ### Qué comando, cuándo
 
 | Síntoma | Primer movimiento |
 |---|---|
 | Los modelos gratis devuelven `403` de golpe | `node repro.mjs`. Pasa → problema de session id: `/free-bridge-session`. Falla → el gate se movió de nuevo: re-derivarlo y actualizar `HANDOFF.md` §4 + `index.ts` |
-| Falta un modelo en el picker | `/free-bridge-refresh`, y después `/free-bridge-models` |
+| Falta un modelo en el picker | `/free-bridge-doctor` — repara el scope y dice por qué. Solo si `oc-sdk-zen/*` ya figura ahí: reiniciá Pi, después `/free-bridge-refresh`, y por último `/free-bridge-models` |
 | Entradas rotas o inesperadas en el picker | `node test/smoke.mjs` |
 | Cambiaste el filtro o la receta de headers | `node test/smoke.mjs` (offline), después `node repro.mjs` (live) |
 | Un modelo falla end-to-end pero el gate está sano | `pi -p --no-session --model oc-sdk-zen/<id> "Reply with exactly: OK"` para aislar ese modelo |
