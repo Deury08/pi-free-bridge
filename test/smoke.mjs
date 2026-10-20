@@ -9,13 +9,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const REQUIRED_MODELS = [
+	"beam-free",
 	"big-pickle",
-	"cat-jam-free",
+	"deepseek-v4.1-flash-free",
+	"glm-5.3-flash-free",
 	"longcat-2.5-preview-free",
+	"minimax-m3.1-flash-free",
 	"mimo-v2.6-flash-free",
 	"nemotron-3.5-lightning-free",
-	"space-bunny-free",
-	"step-5-preview-free",
+	"nemotron-3.5-super-vl-free",
 ];
 
 const EXCLUDED_MODELS = [
