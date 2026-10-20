@@ -223,10 +223,45 @@ y persistilo en `~/.pi/agent/pi-free-bridge.json`:
 
 `PI_FREE_BRIDGE_SESSION_ID` pisa al config.
 
+### Requests sin tools (compactación, `/compact`, resúmenes de rama)
+
+El requisito de `tools` aplica a **toda** request, y las llamadas one-off de Pi arman
+su contexto con un system prompt y **ninguna tool** — por eso volvían `403
+FreeTierError` mientras el turno normal de conversación funcionaba:
+
+- `pi-coding-agent/dist/core/compaction/compaction.js:498` — `buildSummarizationContext`
+  arma el contexto con un system prompt y un mensaje `user`; sin `tools`.
+- `pi-coding-agent/dist/core/compaction/branch-summarization.js:224` — la misma forma
+  para el resumen de rama.
+- `pi-ai/dist/utils/transcript.js:41` — `getCurrentTools` resuelve las tools
+  replayando en orden cada delta `toolsAdded`/`toolsRemoved` de los system messages.
+- `pi-ai/dist/api/openai-completions.js:600` — `params.tools` sólo se agrega cuando el
+  transcript resuelto trae tools, así que un contexto sin tools no manda el array.
+
+El puente revisa el contexto de cada request antes de que llegue al provider
+(`gateRequestContext` en `index.ts`). Cuando el transcript no resuelve ya `read` y
+`bash`, los nombres que faltan se inyectan como un system message **al final** y
+`toolChoice` se fija en `none`, para que una request de resumen nunca pueda invocarlos.
+Un transcript que ya resuelve ambos nombres pasa intacto.
+
+Dos detalles que importan:
+
+- La inyección se **agrega al final**, no se parchea en el system message líder: Pi
+  resuelve cada delta, así que un `toolsRemoved` anterior volvería a borrar la tool
+  inyectada.
+- Sólo se agregan los nombres que faltan de verdad, para que un set parcial se una en
+  vez de duplicarse.
+
+La resolución de tools de Pi está reimplementada a propósito en forma local:
+`@earendil-works/pi-ai` lo provee el host y no se resuelve desde la carpeta de este
+paquete (un import estático falla con `ERR_MODULE_NOT_FOUND` y rompe los tests
+independientes), así que el puente no le agrega ninguna dependencia en runtime.
+
 ## Pruebas
 
 ```bash
 node test/smoke.mjs   # filtro, contrato de headers, fuga de excluidos/pagados — offline, sin red
+node test/gate-tools.mjs  # inyección de read/bash en requests sin tools — offline, sin red
 node repro.mjs        # gate vivo — con red
 ```
 

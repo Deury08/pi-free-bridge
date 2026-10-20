@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -455,6 +455,162 @@ function buildPiModels(raw: RegistryModel[]) {
 }
 
 // ---------------------------------------------------------------------------
+// Free-tier gate: tools-less requests
+// ---------------------------------------------------------------------------
+
+/** The gate rejects any request whose `tools` array does not carry BOTH `read`
+ *  and `bash` (HANDOFF §4.2). Pi's one-off calls — the auto-compaction,
+ *  `/compact` and the branch summarization — build their request context from a
+ *  system prompt plus a user message with NO tools at all
+ *  (pi-coding-agent dist/core/compaction/compaction.js:498 and
+ *  dist/core/compaction/branch-summarization.js:224), and pi-ai only sets
+ *  `params.tools` when the resolved transcript has tools
+ *  (pi-ai dist/api/openai-completions.js:600), so those requests answered
+ *  `403 FreeTierError`. */
+const GATE_TOOL_NAMES = ["read", "bash"];
+
+/** Minimal tool declarations. The gate only inspects the names; `toolChoice:
+ *  "none"` keeps the model from calling them. */
+type GateTool = {
+	name: string;
+	description: string;
+	parameters: { type: "object"; properties: Record<string, never> };
+};
+
+/** The subset of Pi's message shape this module needs. Deliberately loose: the
+ *  real messages come from pi-ai, which this package does not depend on. */
+type GateMessage = {
+	role: string;
+	content?: unknown;
+	timestamp?: number;
+	toolsAdded?: { name: string }[];
+	toolsRemoved?: { name: string }[];
+};
+
+export type GateContext = {
+	systemPrompt?: string;
+	messages: GateMessage[];
+	tools?: unknown[];
+};
+
+export type GateRequestContext = {
+	messages: GateMessage[];
+	/** Present only when the gate tools had to be injected. */
+	toolChoice?: "none";
+};
+
+/** Resolve the tool set Pi would send for this transcript.
+ *
+ *  Pi resolves it by replaying every system message's `toolsAdded` /
+ *  `toolsRemoved` deltas in order (`getCurrentTools`, pi-ai
+ *  dist/utils/transcript.js:41). The replay is replicated here on purpose:
+ *  `@earendil-works/pi-ai` is supplied by the host and is NOT resolvable from
+ *  this package's folder — `import("@earendil-works/pi-ai")` fails with
+ *  ERR_MODULE_NOT_FOUND here — and the tests run the extension under plain
+ *  node. Importing it would add a runtime dependency the bridge does not need. */
+function resolveToolNames(messages: GateMessage[]): Set<string> {
+	const tools = new Map<string, { name: string }>();
+	for (const message of messages) {
+		if (message.role !== "system") continue;
+		for (const removed of message.toolsRemoved ?? []) tools.delete(removed.name);
+		for (const added of message.toolsAdded ?? []) tools.set(added.name, added);
+	}
+	return new Set(tools.keys());
+}
+
+/** Make a request context acceptable to the free-tier gate.
+ *
+ *  A context that already resolves both gate tools is returned untouched: the
+ *  normal conversation path must not change. Otherwise the missing names are
+ *  injected as a TRAILING system message and `toolChoice` is pinned to `none`.
+ *
+ *  The injection is appended, not patched into the leading system message,
+ *  because Pi resolves every delta: an earlier `toolsRemoved` would otherwise
+ *  drop the injected tool again (pi-ai
+ *  dist/utils/transcript.js:41-51). Only the names that are actually missing
+ *  are added, so a partial tool set is unioned instead of duplicated. */
+export function gateRequestContext(context: GateContext): GateRequestContext {
+	const present = resolveToolNames(context.messages);
+	const missing = GATE_TOOL_NAMES.filter((name) => !present.has(name));
+	if (missing.length === 0) {
+		return { messages: context.messages };
+	}
+
+	const injectedTools: GateTool[] = missing.map((name) => ({
+		name,
+		description: `${name} (injected by pi-free-bridge for the OpenCode free-tier gate)`,
+		parameters: { type: "object", properties: {} },
+	}));
+
+	const injected: GateMessage = {
+		role: "system",
+		content: "",
+		toolsAdded: injectedTools,
+		timestamp: Date.now(),
+	};
+
+	return { messages: [...context.messages, injected], toolChoice: "none" };
+}
+
+/** Pi hands extensions its own copy of pi-ai — as a virtual module
+ *  (pi-coding-agent dist/core/extensions/virtual-modules.js) and as a jiti
+ *  alias — so the module is importable at runtime. It is not resolvable from
+ *  this package's own folder, so it is imported lazily on the first request
+ *  instead of statically at module load. */
+const COMPAT_MODULE = "@earendil-works/pi-ai/compat";
+
+type CompatModule = {
+	streamSimple: (
+		model: unknown,
+		context: { systemPrompt?: string; messages: unknown[]; tools?: unknown[] },
+		options?: Record<string, unknown>,
+	) => unknown;
+};
+
+let compatModule: Promise<CompatModule | undefined> | undefined;
+
+function loadCompat(): Promise<CompatModule | undefined> {
+	compatModule ??= import(COMPAT_MODULE).then(
+		(mod) => mod as unknown as CompatModule,
+		() => undefined,
+	);
+	return compatModule;
+}
+
+/** Stream handler for the provider.
+ *
+ *  Pi routes every request for this provider — the normal conversation turn as
+ *  well as the one-off calls — through the provider's `streamSimple`
+ *  (pi-coding-agent dist/core/provider-composer.js:374). The context is
+ *  passed through the gate first, so a tools-less request still carries the
+ *  names the gate requires, and `toolChoice` is forwarded as `none` for those
+ *  requests only.
+ *
+ *  Pi's provider composer runs this handler behind `lazyStream`
+ *  (dist/core/provider-composer.js:428), which awaits the result before
+ *  forwarding events, so loading the host module asynchronously is safe; the
+ *  cast keeps the provider config assignable to Pi's synchronous type. */
+const gateStreamSimple = (async (
+	model: unknown,
+	context: GateContext,
+	options?: Record<string, unknown>,
+) => {
+	const compat = await loadCompat();
+	if (!compat) {
+		throw new Error(
+			`pi-free-bridge: cannot load ${COMPAT_MODULE}; the free-tier gate cannot be satisfied.`,
+		);
+	}
+
+	const gated = gateRequestContext(context);
+	return compat.streamSimple(
+		model,
+		{ ...context, messages: gated.messages },
+		{ ...options, toolChoice: gated.toolChoice },
+	);
+}) as unknown as ProviderConfig["streamSimple"];
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
@@ -513,6 +669,7 @@ export default function (pi: ExtensionAPI) {
 		authHeader: true,
 		headers: buildHeaders(session.sessionId),
 		models: buildPiModels(discovered.models),
+		streamSimple: gateStreamSimple,
 	});
 
 	g[REG_KEY] = true;
@@ -560,6 +717,7 @@ export default function (pi: ExtensionAPI) {
 				authHeader: true,
 				headers: buildHeaders(next),
 				models: buildPiModels(discovered.models),
+				streamSimple: gateStreamSimple,
 			});
 			ctx.ui.notify(
 				persisted
@@ -595,6 +753,7 @@ export default function (pi: ExtensionAPI) {
 					authHeader: true,
 					headers: buildHeaders(resolveSessionId().sessionId),
 					models: buildPiModels(refreshed.models),
+					streamSimple: gateStreamSimple,
 				});
 				ctx.ui.notify(
 					`${PROVIDER} now registers ${refreshed.models.length} free models: ${refreshed.models.map((m) => m.id).join(", ")}`,
