@@ -45,20 +45,22 @@ const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
  *  registers its models at runtime, so literal ids hide anything new. */
 const SCOPE_PATTERN = `${PROVIDER}/*`;
 
-/** Free ids the surface actually advertised on 2026-10-14.
+/** Free ids the surface actually advertised on 2026-10-20.
  *
  *  Registration stays offline and deterministic: intersecting the registry with
  *  `GET /inference/v1/models` on every launch would put a network round-trip on
  *  the startup path. Refresh the snapshot with `/free-bridge-refresh`, which
  *  fetches the live list and persists it to BRIDGE_CONFIG_PATH. */
 const SNAPSHOT_LIVE_FREE_IDS = [
+	"beam-free",
 	"big-pickle",
-	"cat-jam-free",
+	"deepseek-v4.1-flash-free",
+	"glm-5.3-flash-free",
 	"longcat-2.5-preview-free",
 	"mimo-v2.6-flash-free",
+	"minimax-m3.1-flash-free",
 	"nemotron-3.5-lightning-free",
-	"space-bunny-free",
-	"step-5-preview-free",
+	"nemotron-3.5-super-vl-free",
 ];
 
 /** Models the surface advertises but cannot serve over chat/completions:
@@ -807,7 +809,7 @@ export default function (pi: ExtensionAPI) {
 				"  settings.json, so any change here applies on the next Pi launch.",
 				"",
 				`  If the models still do not appear, run:`,
-				`    pi -p --model ${PROVIDER}/space-bunny-free "Reply with exactly: OK"`,
+				`    pi -p --model ${PROVIDER}/minimax-m3.1-flash-free "Reply with exactly: OK"`,
 				"  A non-zero exit or a non-OK reply is a gate or session-id problem,",
 				"  not a scope problem — see /free-bridge-session.",
 			);

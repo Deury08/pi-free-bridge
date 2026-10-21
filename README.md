@@ -11,7 +11,7 @@ sobrevive a `pi update` y no depende de ningún puente de terceros.
 ```bash
 pi install C:\Users\Polanco\pi-free-bridge
 pi list
-pi -p --model oc-sdk-zen/space-bunny-free "Reply with exactly: OK"
+pi -p --model oc-sdk-zen/minimax-m3.1-flash-free "Reply with exactly: OK"
 ```
 
 Reemplaza al puente de terceros `pi-opencode-bridge`; **no corran los dos en paralelo**.
@@ -19,13 +19,14 @@ Sacalo con `pi remove npm:pi-opencode-bridge`.
 
 ## Qué registra
 
-Siete modelos, descubiertos desde el registry de OpenCode
+Nueve modelos, descubiertos desde el registry de OpenCode
 (`~/.cache/opencode/models.json`, clave `"opencode"`), filtrados a entradas cuyo
 cada campo de costo declarado es cero **y** que la superficie efectivamente
 publicita:
 
-`big-pickle`, `cat-jam-free`, `longcat-2.5-preview-free`, `mimo-v2.6-flash-free`,
-`nemotron-3.5-lightning-free`, `space-bunny-free`, `step-5-preview-free`
+`beam-free`, `big-pickle`, `deepseek-v4.1-flash-free`, `glm-5.3-flash-free`,
+`longcat-2.5-preview-free`, `mimo-v2.6-flash-free`, `minimax-m3.1-flash-free`,
+`nemotron-3.5-lightning-free`, `nemotron-3.5-super-vl-free`
 
 Dos trampas del filtro, ambas medidas, ambas que conviene tener presentes:
 
@@ -117,10 +118,10 @@ que ya tiene otras entradas, borrás esos modelos del picker.
 ]
 ```
 
-`oc-sdk-zen/*` cubre los 7 modelos del momento y también los que agregue
-`/free-bridge-refresh`. Con ids literales (`oc-sdk-zen/space-bunny-free`, …) todo modelo
-nuevo queda invisible hasta que edites la lista a mano, y es fácil olvidarse de alguno:
-el síntoma es "falta un modelo en el picker" sin ningún error que lo explique.
+`oc-sdk-zen/*` cubre los 9 modelos del momento y también los que agregue
+`/free-bridge-refresh`. Con ids literales (`oc-sdk-zen/minimax-m3.1-flash-free`, …) todo
+modelo nuevo queda invisible hasta que edites la lista a mano, y es fácil olvidarse de
+alguno: el síntoma es "falta un modelo en el picker" sin ningún error que lo explique.
 
 ### El puente repara el scope solo
 
@@ -156,7 +157,7 @@ estado del scope. Si no puede escribir, dice exactamente por qué y qué editar 
 Comprobar que el scope resuelve (cero `No models match pattern` = todo patrón matcheó):
 
 ```bash
-pi -p --model oc-sdk-zen/space-bunny-free "Reply with exactly: OK"
+pi -p --model oc-sdk-zen/minimax-m3.1-flash-free "Reply with exactly: OK"
 ```
 
 ### Qué comando, cuándo
