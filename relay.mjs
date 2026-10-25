@@ -1,0 +1,380 @@
+// pi-free-bridge relay — the only process that talks to the OpenCode free tier.
+//
+// Pi runs on Node, and the `/inference/v1` gate now rejects every request whose
+// TLS ClientHello is not Bun's (GATE-DIAGNOSIS.md §3.1). Pi therefore points its
+// provider at this local server, which makes the upstream call from Bun, injects
+// the `<env>` block and the tools the gate requires, and pipes the response back
+// byte-for-byte.
+//
+//   Pi (Node) -> http://127.0.0.1:<port>/v1/chat/completions -> relay (Bun) -> upstream
+//
+// The module exports its pure helpers so `test/relay.test.mjs` can run them
+// under plain Node; the server only starts when this file is executed directly.
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { createServer } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+// ---------------------------------------------------------------------------
+// Gate helpers (pure, exported for tests)
+// ---------------------------------------------------------------------------
+
+const ENV_BLOCK = /<env>[\s\S]*Working directory:[\s\S]*<\/env>/;
+
+/** The block the gate parses for (GATE-DIAGNOSIS.md §3.2). */
+function envBlock(cwd) {
+	const directory = String(cwd ?? process.cwd()).replace(/\\/g, "/");
+	return `<env>\n  Working directory: ${directory}\n  Platform: win32\n</env>`;
+}
+
+function appendEnv(content, block) {
+	if (typeof content === "string") return content.length > 0 ? `${content}\n\n${block}` : block;
+	// A parts array is a legal message shape. Appending one text part keeps every
+	// existing part intact; the gate only needs the block somewhere in the prompt.
+	if (Array.isArray(content)) return [...content, { type: "text", text: block }];
+	return block;
+}
+
+/**
+ * Append the gate-mandated `<env>` block to the first system/developer message.
+ * Prepends a system message when there is none. Returns a new array and never
+ * mutates the input, except that an already-conforming prompt is returned as-is.
+ */
+export function ensureEnvBlock(messages, cwd) {
+	const list = Array.isArray(messages) ? messages : [];
+	const block = envBlock(cwd);
+
+	const index = list.findIndex(
+		(message) => message && (message.role === "system" || message.role === "developer"),
+	);
+	if (index === -1) return [{ role: "system", content: block }, ...list];
+
+	const target = list[index];
+	if (typeof target.content === "string" && ENV_BLOCK.test(target.content)) return list;
+
+	const next = list.slice();
+	next[index] = { ...target, content: appendEnv(target.content, block) };
+	return next;
+}
+
+function gateToolDeclarations() {
+	return ["read", "bash"].map((name) => ({
+		type: "function",
+		function: {
+			name,
+			description: `${name} (injected by pi-free-bridge for the OpenCode free-tier gate)`,
+			parameters: { type: "object", properties: {} },
+		},
+	}));
+}
+
+function toolName(tool) {
+	if (!tool || typeof tool !== "object") return undefined;
+	const nested = tool.function;
+	if (nested && typeof nested === "object" && typeof nested.name === "string") return nested.name;
+	if (typeof tool.name === "string") return tool.name;
+	return undefined;
+}
+
+/**
+ * Make the wire body carry both gate tool names. A missing or empty `tools`
+ * array is replaced with minimal `read` + `bash` declarations; a partial set is
+ * completed with only the missing names. Whenever the array is augmented,
+ * `tool_choice` is pinned to `"none"` so the model cannot call them.
+ */
+export function ensureGateTools(body) {
+	const next = { ...(body && typeof body === "object" ? body : {}) };
+	const tools = next.tools;
+
+	if (!Array.isArray(tools) || tools.length === 0) {
+		next.tools = gateToolDeclarations();
+		next.tool_choice = "none";
+		return next;
+	}
+
+	const present = new Set(tools.map(toolName).filter((name) => typeof name === "string"));
+	const missing = ["read", "bash"].filter((name) => !present.has(name));
+	if (missing.length === 0) return next;
+
+	next.tools = [...tools, ...gateToolDeclarations().filter((tool) => missing.includes(tool.function.name))];
+	next.tool_choice = "none";
+	return next;
+}
+
+/**
+ * Map a local pathname onto the upstream surface. A leading `/v1` is dropped
+ * when the base already ends with it, so `/v1/chat/completions` does not become
+ * `/v1/v1/chat/completions`; every other path is preserved.
+ */
+export function toUpstreamUrl(upstreamBase, pathname) {
+	const base = String(upstreamBase ?? "").replace(/\/+$/, "");
+	let rest = String(pathname ?? "");
+	if (!rest.startsWith("/")) rest = `/${rest}`;
+	if (/\/v1$/.test(base)) rest = rest.replace(/^\/v1(?=\/|$)/, "");
+	if (rest === "" || rest === "/") return base;
+	return `${base}${rest}`;
+}
+
+// ---------------------------------------------------------------------------
+// Session harvest (S31, S32)
+// ---------------------------------------------------------------------------
+//
+// The package ships no session id. The gate only trusts ids the official
+// OpenCode client created, so one is harvested from the local store: newest
+// `session` row first, newest `storage/session_diff/ses_*.json` second.
+// `bun:sqlite` is imported dynamically so importing this module under plain
+// Node (the helper tests) never touches it.
+
+const SESSION_ID = /^ses_/;
+
+/** `~/.local/share/opencode`, the store the official client writes. */
+function openCodeShareDir() {
+	return join(homedir(), ".local", "share", "opencode");
+}
+
+async function readSessionFromDb(shareDir) {
+	const dbPath = join(shareDir, "opencode.db");
+	if (!existsSync(dbPath)) return undefined;
+
+	try {
+		const { Database } = await import("bun:sqlite");
+		const db = new Database(dbPath, { readonly: true });
+		try {
+			const rows = db.query("select id from session order by time_created desc limit 5").all();
+			for (const row of rows) {
+				const id = row && typeof row.id === "string" ? row.id : undefined;
+				if (id && SESSION_ID.test(id)) return id;
+			}
+		} finally {
+			db.close();
+		}
+	} catch {
+		// Missing table/column, permissions, or a non-Bun runtime: fall through.
+	}
+	return undefined;
+}
+
+function readSessionFromDiff(shareDir) {
+	const diffDir = join(shareDir, "storage", "session_diff");
+	let entries;
+	try {
+		entries = readdirSync(diffDir);
+	} catch {
+		return undefined;
+	}
+
+	let newest;
+	for (const name of entries) {
+		if (!name.startsWith("ses_") || !name.endsWith(".json")) continue;
+		const id = name.slice(0, -".json".length);
+		if (!SESSION_ID.test(id)) continue;
+
+		let mtimeMs;
+		try {
+			const stats = statSync(join(diffDir, name));
+			if (!stats.isFile()) continue;
+			mtimeMs = stats.mtimeMs;
+		} catch {
+			continue;
+		}
+		if (!newest || mtimeMs > newest.mtimeMs) newest = { id, mtimeMs };
+	}
+	return newest?.id;
+}
+
+/**
+ * Harvest a session id from an OpenCode store rooted at `shareDir`. Returns
+ * `{ sessionId, source }` or `undefined`; every source failure is silent.
+ */
+export async function resolveSessionFromStore({ shareDir = openCodeShareDir() } = {}) {
+	const fromDb = await readSessionFromDb(shareDir);
+	if (fromDb) return { sessionId: fromDb, source: "opencode.db" };
+
+	const fromDiff = readSessionFromDiff(shareDir);
+	if (fromDiff) return { sessionId: fromDiff, source: "session-diff" };
+
+	return undefined;
+}
+
+/** S31 precedence: an explicit override wins over the harvested id. */
+async function resolveRelaySession() {
+	const override = process.env.RELAY_SESSION?.trim();
+	if (override) {
+		const declared = process.env.RELAY_SESSION_SOURCE;
+		return { sessionId: override, source: declared === "config" ? "config" : "env" };
+	}
+	return resolveSessionFromStore();
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+const SERVICE = "pi-free-bridge-relay";
+const DEFAULT_PORT = 8788;
+const DEFAULT_UPSTREAM = "https://opencode.ai/inference/v1";
+const DEFAULT_USER_AGENT = "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+
+function sendJson(res, status, payload) {
+	if (res.headersSent) {
+		res.end();
+		return;
+	}
+	res.writeHead(status, { "content-type": "application/json" });
+	res.end(JSON.stringify(payload));
+}
+
+async function readBody(req) {
+	const chunks = [];
+	for await (const chunk of req) {
+		chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+	}
+	return Buffer.concat(chunks).toString("utf8");
+}
+
+async function forward(req, res, pathname, config) {
+	try {
+		const raw = await readBody(req);
+		const incoming = JSON.parse(raw);
+		const source = incoming && typeof incoming === "object" ? incoming : {};
+
+		// The only mutations on the Pi path: the gate-mandated `<env>` block, the
+		// tool names, and `stream: true` (S21-S23).
+		const body = ensureGateTools({
+			...source,
+			messages: ensureEnvBlock(source.messages, config.cwd),
+			stream: true,
+		});
+
+		const upstream = await fetch(toUpstreamUrl(config.upstream, pathname), {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"user-agent": config.userAgent,
+				authorization: `Bearer ${config.apiKey}`,
+				"x-opencode-session": config.session,
+				"x-opencode-session-id": config.session,
+			},
+			body: JSON.stringify(body),
+		});
+
+		// S20: status and content-type pass through, the body is piped unparsed.
+		const headers = {};
+		const contentType = upstream.headers.get("content-type");
+		if (contentType) headers["content-type"] = contentType;
+		res.writeHead(upstream.status, headers);
+
+		if (!upstream.body) {
+			res.end();
+			return;
+		}
+
+		const reader = upstream.body.getReader();
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			res.write(Buffer.from(value));
+		}
+		res.end();
+	} catch (err) {
+		sendJson(res, 502, { error: { message: err && err.message ? err.message : String(err) } });
+	}
+}
+
+async function handle(req, res, config) {
+	const { pathname } = new URL(req.url ?? "/", "http://127.0.0.1");
+
+	if (req.method === "GET" && pathname === "/health") {
+		// S33: the marker stays `service` + `ok`; the extra fields let the
+		// extension report which id is actually on the wire.
+		sendJson(res, 200, {
+			service: SERVICE,
+			ok: true,
+			sessionId: config.session,
+			sessionSource: config.sessionSource,
+		});
+		return;
+	}
+
+	if (req.method === "POST" && pathname.startsWith("/v1/")) {
+		await forward(req, res, pathname, config);
+		return;
+	}
+
+	sendJson(res, 404, { error: { message: `no route for ${req.method} ${pathname}` } });
+}
+
+async function startServer() {
+	const parsedPort = Number.parseInt(process.env.PORT ?? "", 10);
+	const port = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort < 65536 ? parsedPort : DEFAULT_PORT;
+
+	// S31: resolve the session before listening, so a missing id is a clear
+	// startup failure instead of a 429 on the first request.
+	const session = await resolveRelaySession();
+	if (!session) {
+		process.stderr.write(
+			"pi-free-bridge relay: no OpenCode session id found — run OpenCode once, " +
+				"or set PI_FREE_BRIDGE_SESSION_ID.\n",
+		);
+		process.exit(1);
+	}
+
+	const config = {
+		upstream: process.env.RELAY_UPSTREAM || DEFAULT_UPSTREAM,
+		session: session.sessionId,
+		sessionSource: session.source,
+		cwd: process.env.RELAY_CWD || process.cwd(),
+		userAgent: process.env.RELAY_USER_AGENT || DEFAULT_USER_AGENT,
+		apiKey: process.env.RELAY_API_KEY || "public",
+	};
+
+	const server = createServer((req, res) => {
+		void handle(req, res, config).catch((err) => {
+			sendJson(res, 502, { error: { message: err && err.message ? err.message : String(err) } });
+		});
+	});
+
+	server.on("error", (err) => {
+		const message =
+			err && err.code === "EADDRINUSE"
+				? `port ${port} is already in use — set PI_FREE_BRIDGE_RELAY_PORT to a free port`
+				: err && err.message
+					? err.message
+					: String(err);
+		process.stderr.write(`pi-free-bridge relay: ${message}\n`);
+		process.exit(1);
+	});
+
+	server.listen(port, "127.0.0.1", () => {
+		// The extension waits for exactly this line. Nothing else may reach stdout.
+		process.stdout.write(`pi-free-bridge relay listening on http://127.0.0.1:${port}/v1\n`);
+
+		// The parent keeps this pipe open; its death closes it and takes the relay
+		// with it, so a crashed Pi never leaves an orphan (S26).
+		process.stdin.resume();
+		process.stdin.on("end", () => process.exit(0));
+		process.stdin.on("close", () => process.exit(0));
+		process.stdin.on("error", () => process.exit(0));
+	});
+}
+
+/** True when this file is the entry point, under both Node and Bun. */
+function isDirectRun() {
+	const entry = process.argv[1];
+	if (!entry) return false;
+	try {
+		return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+	} catch {
+		return pathToFileURL(entry).href === import.meta.url;
+	}
+}
+
+if (isDirectRun()) {
+	startServer().catch((err) => {
+		process.stderr.write(
+			`pi-free-bridge relay: ${err && err.message ? err.message : String(err)}\n`,
+		);
+		process.exit(1);
+	});
+}
