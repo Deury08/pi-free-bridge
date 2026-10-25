@@ -3,19 +3,90 @@
 Puente [OpenCode](https://opencode.ai) solo-modelos-gratis para [Pi](https://github.com/earendil-works/pi-coding-agent).
 
 Registra **únicamente** el tier gratuito anónimo de OpenCode bajo el provider id
-**`oc-sdk-zen`** e inyecta él mismo el contrato de headers del gate, así que
-sobrevive a `pi update` y no depende de ningún puente de terceros.
+**`oc-sdk-zen`** e inyecta el contrato del gate desde un relay local ejecutado por
+Bun, así que sobrevive a `pi update` y no depende de ningún puente de terceros.
 
 ## Instalar
 
 ```bash
 pi install C:\Users\Polanco\pi-free-bridge
 pi list
-pi -p --model oc-sdk-zen/minimax-m3.1-flash-free "Reply with exactly: OK"
+pi -p --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 ```
 
 Reemplaza al puente de terceros `pi-opencode-bridge`; **no corran los dos en paralelo**.
 Sacalo con `pi remove npm:pi-opencode-bridge`.
+
+## El relay de Bun (requisito)
+
+El gate de `/inference/v1` ahora inspecciona el fingerprint TLS del cliente y
+solo acepta clientes que se parezcan a Bun. Pi 1.2.0 corre sobre Node, así que
+ningún request que salga desde Pi puede pasar el gate, sin importar los headers
+ni el cuerpo. Por eso la extensión ya no llama a OpenCode: levanta un relay
+local ejecutado por Bun y apunta el provider a `http://127.0.0.1:<puerto>/v1`.
+
+```
+Pi (Node) → http://127.0.0.1:<puerto>/v1/chat/completions → relay (Bun) → upstream
+```
+
+El relay es el único proceso que abre la conexión TLS contra OpenCode. Ahí viven
+los headers del gate, el session id, el bloque `<env>` con `Working directory:`
+y las tools `read`/`bash`. La respuesta vuelve byte por byte, sin parsear y sin
+reescribir ningún chunk.
+
+### Bun es obligatorio
+
+La extensión resuelve el ejecutable en este orden:
+
+1. `PI_FREE_BRIDGE_BUN` (ruta explícita al binario)
+2. `bun` en `PATH` (en Windows, `bun.exe`)
+3. `~/.bun/bin/bun.exe`
+
+Si no encuentra ninguno, `/free-bridge-doctor` muestra `bun: MISSING` y el
+primer request falla con un error que indica cómo instalarlo. Instalación:
+<https://bun.sh>.
+
+### Puerto
+
+Por defecto el relay escucha en `127.0.0.1:8788` y expone `GET /health`, que
+devuelve el session id efectivo y de dónde salió:
+
+```json
+{"service":"pi-free-bridge-relay","ok":true,"sessionId":"ses_…","sessionSource":"opencode.db"}
+```
+
+`sessionSource` es `env`, `config`, `opencode.db` o `session-diff`. El puerto se
+puede cambiar con:
+
+1. `PI_FREE_BRIDGE_RELAY_PORT`
+2. `relayPort` en `~/.pi/agent/pi-free-bridge.json`
+3. `8788`
+
+Si el puerto está ocupado, la extensión primero prueba `/health`: si responde
+con `{"service":"pi-free-bridge-relay","ok":true}` reutiliza ese relay; si
+responde otra cosa, falla con un mensaje que pide elegir otro puerto. Para
+liberarlo, cerrá la instancia anterior de Pi o cambiá el puerto:
+
+```bash
+PI_FREE_BRIDGE_RELAY_PORT=8790 pi
+```
+
+En PowerShell: `$env:PI_FREE_BRIDGE_RELAY_PORT = 8790` y después `pi`.
+
+El relay se apaga solo cuando Pi termina (su stdin se cierra), así que no quedan
+procesos huérfanos. Un relay reutilizado pertenece a otra instancia de Pi y no
+se toca.
+
+### Cómo verificar que funciona
+
+```bash
+node --test test/relay.test.mjs          # helpers del relay — offline
+curl http://127.0.0.1:8788/health        # relay vivo
+pi -p --no-session --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
+```
+
+Dentro de Pi, `/free-bridge-doctor` informa la ruta de Bun, el puerto, si el
+relay está `running`, `reused` o `not started`, y la URL upstream.
 
 ## Qué registra
 
@@ -27,6 +98,10 @@ publicita:
 `beam-free`, `big-pickle`, `deepseek-v4.1-flash-free`, `glm-5.3-flash-free`,
 `longcat-2.5-preview-free`, `mimo-v2.6-flash-free`, `minimax-m3.1-flash-free`,
 `nemotron-3.5-lightning-free`, `nemotron-3.5-super-vl-free`
+
+Ese es el snapshot que el paquete trae para arrancar offline; el set real cambia
+con el tiempo (hoy la superficie publica otro conjunto). `/free-bridge-refresh` lo
+re-pide y lo persiste, que es la forma de actualizarlo sin tocar código.
 
 Dos trampas del filtro, ambas medidas, ambas que conviene tener presentes:
 
@@ -58,7 +133,7 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | Comando | Qué hace | Cuándo usarlo |
 |---|---|---|
 | `/free-bridge-models` | Lista los modelos efectivamente registrados y de dónde salió el registry | El picker se ve mal, o querés confirmar el filtro |
-| `/free-bridge-session` | Muestra el session id en uso y su origen (env, config o constante incluida) | Si los requests empiezan a fallar — revisá el id antes de tocar código |
+| `/free-bridge-session` | Muestra el session id que el relay está mandando y su origen (`env`, `config`, `opencode.db` o `session-diff`) | Si los requests empiezan a fallar — mirá el id antes de tocar código |
 | `/free-bridge-session ses_…` | Cambia el session id de esta sesión **y lo persiste** en `~/.pi/agent/pi-free-bridge.json` | El gate responde `403` porque el id quedó viejo |
 | `/free-bridge-refresh` | Pide `GET /inference/v1/models`, lo cruza con los gratis del registry, persiste el resultado y re-registra el provider | OpenCode agregó o sacó un modelo gratis |
 
@@ -67,8 +142,8 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | Comando | Qué hace | Requiere red |
 |---|---|---|
 | `node repro.mjs [model-id]` | Dispara un request crudo contra el gate; espera `200 SSE-CHUNK (PASS)`. Sin argumento sondea `mimo-v2.6-flash-free` | sí |
-| `node test/smoke.mjs` | Aserciona el registro contra el registry real: provider id, el set exacto de 7 modelos, cero fugas de modelos excluidos o pagados, los 5 headers requeridos, ninguna ruta retirada | no |
-| `PI_FREE_BRIDGE_DRY_RUN=1 pi …` | Imprime origen del registry, superficie, api key, session id + origen, headers, modelos aceptados y descartados, y sigue normal | no |
+| `node test/smoke.mjs` | Aserciona el registro contra el registry real: provider id, el set exacto de modelos gratis, cero fugas de modelos excluidos o pagados, y que cada modelo apunte al relay local | no |
+| `PI_FREE_BRIDGE_DRY_RUN=1 pi …` | Imprime origen del registry, superficie, api key, session id + origen, modelos aceptados y descartados, y sigue normal | no |
 | `pi -p --no-session --model oc-sdk-zen/<id> "Reply with exactly: OK"` | Sondeo end-to-end de un modelo a través de Pi | sí |
 | `pi list` | Muestra los paquetes instalados (el nuestro aparece como `..\..\pi-free-bridge`) | no |
 | `pi --list-models` | Muestra qué va a ofrecer el picker | no |
@@ -82,6 +157,9 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `PI_FREE_BRIDGE_SESSION_ID` | Sobreescribe el session id (máxima precedencia) |
 | `~/.pi/agent/pi-free-bridge.json` → `sessionId` | Session id persistido |
 | `~/.pi/agent/pi-free-bridge.json` → `liveIds` | Sobreescribe el snapshot de modelos publicitados |
+| `~/.pi/agent/pi-free-bridge.json` → `relayPort` | Puerto del relay (por defecto `8788`) |
+| `PI_FREE_BRIDGE_RELAY_PORT` | Pisa el puerto del relay |
+| `PI_FREE_BRIDGE_BUN` | Ruta explícita al ejecutable de Bun |
 | `PI_FREE_BRIDGE_DRY_RUN=1` | Diagnóstico de arranque |
 
 Forma del archivo de config:
@@ -89,12 +167,14 @@ Forma del archivo de config:
 ```json
 {
   "sessionId": "ses_…",
-  "liveIds": ["big-pickle", "…"]
+  "liveIds": ["big-pickle", "…"],
+  "relayPort": 8788
 }
 ```
 
-Precedencia: env → config → constante incluida. Un config malformado o ausente
-cae en silencio a los valores por defecto (verificado).
+Precedencia del session id: `PI_FREE_BRIDGE_SESSION_ID` → `sessionId` del config →
+cosecha automática desde el store de OpenCode. Un config malformado o ausente
+cae en silencio a la cosecha (verificado).
 
 ### El picker está acotado por `enabledModels`
 
@@ -118,8 +198,8 @@ que ya tiene otras entradas, borrás esos modelos del picker.
 ]
 ```
 
-`oc-sdk-zen/*` cubre los 9 modelos del momento y también los que agregue
-`/free-bridge-refresh`. Con ids literales (`oc-sdk-zen/minimax-m3.1-flash-free`, …) todo
+`oc-sdk-zen/*` cubre todos los modelos del momento y también los que agregue
+`/free-bridge-refresh`. Con ids literales (`oc-sdk-zen/deepseek-v4.1-flash-free`, …) todo
 modelo nuevo queda invisible hasta que edites la lista a mano, y es fácil olvidarse de
 alguno: el síntoma es "falta un modelo en el picker" sin ningún error que lo explique.
 
@@ -157,7 +237,7 @@ estado del scope. Si no puede escribir, dice exactamente por qué y qué editar 
 Comprobar que el scope resuelve (cero `No models match pattern` = todo patrón matcheó):
 
 ```bash
-pi -p --model oc-sdk-zen/minimax-m3.1-flash-free "Reply with exactly: OK"
+pi -p --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 ```
 
 ### Qué comando, cuándo
@@ -179,9 +259,10 @@ forwarder local y bisecteándolo; `HANDOFF.md` §4 de este repo tiene toda la
 evidencia.
 
 **Superficie:** `https://opencode.ai/inference/v1/chat/completions`
-(`/zen/v1` responde 403 duro a todo cliente que no sea el oficial).
+(`/zen/v1` responde 403 duro a todo cliente que no sea el oficial). Pi no habla
+con esta superficie: habla con el relay, que reenvía acá desde Bun.
 
-**Headers** — se requieren cinco, ni uno más:
+**Headers** — se requieren cinco, ni uno más (los fija el relay):
 
 | Header | Valor |
 |---|---|
@@ -204,16 +285,28 @@ sobre un body inválido y está obsoleto).
   `[bash]` solo o dos nombres arbitrarios no
 
 **Session id:** el gate rechaza ids autogenerados (`ses_<hex><base62>`,
-`ses_000…`, basura) y no existe endpoint para crear sesiones, así que el puente
-incluye una constante conocida. Si la superficie vuelve a responder 403, renovalo
-sin tocar código:
+`ses_000…`, basura) y no existe endpoint para crear sesiones. El paquete **no
+incluye** ningún id: el relay cosecha uno del store local de OpenCode al
+arrancar, en este orden:
+
+1. `RELAY_SESSION` — sólo lo setea la extensión cuando hay un override explícito.
+2. La sesión más nueva de `~/.local/share/opencode/opencode.db`
+   (`select id from session order by time_created desc limit 5`, primero que
+   empiece con `ses_`). Se abre en modo lectura y cualquier falla se ignora.
+3. El archivo `ses_*.json` más reciente por mtime en
+   `~/.local/share/opencode/storage/session_diff/`.
+
+Si ninguno existe, el relay no arranca y escribe una sola línea accionable:
+corré OpenCode una vez o seteá `PI_FREE_BRIDGE_SESSION_ID`.
+
+Para forzar otro id:
 
 ```
-/free-bridge-session                       # ver el id actual y su origen
-/free-bridge-session ses_abc123…           # usar uno nuevo en esta sesión
+/free-bridge-session                       # ver el id efectivo y su origen
+/free-bridge-session ses_abc123…           # usar uno nuevo y persistirlo
 ```
 
-y persistilo en `~/.pi/agent/pi-free-bridge.json`:
+El id forzado se persiste en `~/.pi/agent/pi-free-bridge.json`:
 
 ```json
 {
@@ -222,7 +315,8 @@ y persistilo en `~/.pi/agent/pi-free-bridge.json`:
 }
 ```
 
-`PI_FREE_BRIDGE_SESSION_ID` pisa al config.
+`PI_FREE_BRIDGE_SESSION_ID` pisa al config. Cualquiera de los dos gana sobre la
+cosecha; si querés volver a la cosecha, borrá la clave del config y reiniciá Pi.
 
 ### Requests sin tools (compactación, `/compact`, resúmenes de rama)
 
@@ -239,38 +333,37 @@ FreeTierError` mientras el turno normal de conversación funcionaba:
 - `pi-ai/dist/api/openai-completions.js:600` — `params.tools` sólo se agrega cuando el
   transcript resuelto trae tools, así que un contexto sin tools no manda el array.
 
-El puente revisa el contexto de cada request antes de que llegue al provider
-(`gateRequestContext` en `index.ts`). Cuando el transcript no resuelve ya `read` y
-`bash`, los nombres que faltan se inyectan como un system message **al final** y
-`toolChoice` se fija en `none`, para que una request de resumen nunca pueda invocarlos.
-Un transcript que ya resuelve ambos nombres pasa intacto.
+El relay completa el array `tools` en el wire antes de reenviar: si falta o está
+vacío, inyecta declaraciones mínimas de `read` y `bash`; si tiene sólo una de
+las dos, agrega únicamente la que falta. Cuando el array se modifica, fija
+`tool_choice` en `"none"` para que una request de resumen nunca pueda invocarlas.
+Un array que ya trae ambos nombres pasa intacto. La misma regla aplica al bloque
+`<env>`: se agrega sólo si el system prompt no lo tiene.
 
-Dos detalles que importan:
-
-- La inyección se **agrega al final**, no se parchea en el system message líder: Pi
-  resuelve cada delta, así que un `toolsRemoved` anterior volvería a borrar la tool
-  inyectada.
-- Sólo se agregan los nombres que faltan de verdad, para que un set parcial se una en
-  vez de duplicarse.
-
-La resolución de tools de Pi está reimplementada a propósito en forma local:
-`@earendil-works/pi-ai` lo provee el host y no se resuelve desde la carpeta de este
-paquete (un import estático falla con `ERR_MODULE_NOT_FOUND` y rompe los tests
-independientes), así que el puente no le agrega ninguna dependencia en runtime.
+`gateRequestContext` sigue en `index.ts` como implementación de referencia a
+nivel de contexto y la ejercita `test/gate-tools.mjs`; el camino de ejecución de
+Pi ya no la usa. La resolución de tools de Pi está reimplementada en forma local
+porque `@earendil-works/pi-ai` lo provee el host y no se resuelve desde la
+carpeta de este paquete (un import estático falla con `ERR_MODULE_NOT_FOUND` y
+rompe los tests independientes), así que el puente no le agrega ninguna
+dependencia en runtime.
 
 ## Pruebas
 
 ```bash
-node test/smoke.mjs   # filtro, contrato de headers, fuga de excluidos/pagados — offline, sin red
-node test/gate-tools.mjs  # inyección de read/bash en requests sin tools — offline, sin red
+node --test test/relay.test.mjs  # helpers del relay: <env>, tools, mapeo de URL, cosecha de sesión — offline
+node test/gate-tools.mjs  # inyección de read/bash a nivel de contexto — offline
+node test/smoke.mjs   # filtro y registro contra el relay local — offline
 node repro.mjs        # gate vivo — con red
 ```
 
-`test/smoke.mjs` stubbea el `ExtensionAPI` de Pi y aserca el registro: provider id,
-superficie, api key, el set exacto de 7 modelos, ausencia de modelos excluidos o
-pagados, los cinco headers requeridos, y que la ruta retirada del Zen nunca llegue
-al registro. Es la red de regresión del filtro y la receta de headers;
-`repro.mjs` cubre el lado del vendor.
+`test/relay.test.mjs` cubre las funciones puras de `relay.mjs` sin Bun y sin red,
+incluida la cosecha de sesión contra un store temporal (`opencode.db` y
+`session_diff/`), sin fixture de SQLite.
+`test/gate-tools.mjs` cubre el contrato de tools a nivel de transcript.
+`test/smoke.mjs` aserciona el registro contra el registry real: el provider y
+todos los modelos apuntan a `http://127.0.0.1:<puerto>/v1`, y el provider ya no
+declara headers (los pone el relay).
 
 ## Tripwire tras un cambio del vendor
 
