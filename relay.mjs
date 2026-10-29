@@ -1,23 +1,27 @@
-// pi-free-bridge relay — the only process that talks to the OpenCode free tier.
+// pi-free-bridge relay — Bun fallback for the OpenCode free tier.
+// 
+// PREFERRED PATH: bridge-go (native Go binary, no Bun dependency)
+//   Pi (Node) -> http://127.0.0.1:<port>/v1/chat/completions -> bridge-go (Go) -> upstream
+//   bridge-go uses uTLS to impersonate Bun's ClientHello (JA4 t13d1713h1) and passes the gate.
+//   Install: `npm install pi-free-bridge` (postinstall downloads bridge-go for your platform).
+//   Or build locally: `cd bridge-go && go build -o bridge-go ./cmd/bridge-go`
 //
-// Pi runs on Node, and the `/inference/v1` gate now rejects every request whose
-// TLS ClientHello is not Bun's (GATE-DIAGNOSIS.md §3.1). Pi therefore points its
-// provider at this local server, which makes the upstream call from Bun, injects
-// the `<env>` block and the tools the gate requires, and pipes the response back
-// byte-for-byte.
-//
-//   Pi (Node) -> http://127.0.0.1:<port>/v1/chat/completions -> relay (Bun) -> upstream
-//
-// The module exports its pure helpers so `test/relay.test.mjs` can run them
-// under plain Node; the server only starts when this file is executed directly.
+// FALLBACK PATH (this file): Bun relay — kept for compatibility and rescue.
+//   Pi runs on Node, and the `/inference/v1` gate rejects every request whose
+//   TLS ClientHello is not Bun's (GATE-DIAGNOSIS.md §3.1). Pi therefore points its
+//   provider at this local server, which makes the upstream call from Bun, injects
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-
-// ---------------------------------------------------------------------------
-// Gate helpers (pure, exported for tests)
+//   the `<env>` block and the tools the gate requires, and pipes the response back
+//   byte-for-byte.
+// 
+//   Pi (Node) -> http://127.0.0.1:<port>/v1/chat/completions -> relay (Bun) -> upstream
+//
+// The module exports its pure helpers so `test/relay.test.mjs` can run them
+// under plain Node; the server only starts when this file is executed directly.
 // ---------------------------------------------------------------------------
 
 const ENV_BLOCK = /<env>[\s\S]*Working directory:[\s\S]*<\/env>/;

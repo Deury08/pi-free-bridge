@@ -435,6 +435,35 @@ function resolveBunPath(): string | undefined {
 }
 
 /** Probe a port for our own relay. `absent` means nothing is listening there. */
+
+function resolveBridgeGoPath(): string | undefined {
+	const override = process.env.PI_FREE_BRIDGE_BINARY?.trim();
+	if (override && existsSync(override)) return override;
+
+	const binary = process.platform === "win32" ? "bridge-go.exe" : "bridge-go";
+	
+	// Check node_modules/.bin first (postinstall location)
+	const moduleBin = join(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", ".bin", binary);
+	if (existsSync(moduleBin)) return moduleBin;
+
+	// Check PATH
+	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+		const directory = entry.replace(/^"|"$/g, "");
+		if (!directory) continue;
+		const candidate = join(directory, binary);
+		if (existsSync(candidate)) return candidate;
+	}
+
+	return undefined;
+}
+
+function describeBridgeGo(): string {
+	const path = resolveBridgeGoPath();
+	if (!path) return "MISSING u2014 run `npm install` or build from bridge-go/";
+	const rel = path.includes("node_modules") ? "installed" : "from PATH";
+	return `${path} (${rel})`;
+}
+
 async function probeRelay(port: number): Promise<"healthy" | "foreign" | "absent"> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 750);
@@ -1041,7 +1070,8 @@ function printDryRun(
 		`  registry:    ${discovered.source}`,
 		`  upstream:    ${UPSTREAM_URL}`,
 		`  relay:       ${RELAY_URL} (port ${RELAY_PORT})`,
-		`  bun:         ${resolveBunPath() ?? "MISSING"}`,
+		`  bun:         ${resolveBunPath() ?? "MISSING"}`
+`  bridge-go:   ${describeBridgeGo()}`,
 		`  api:         ${API}   apiKey: ${API_KEY}`,
 		`  session id:  ${
 			session.sessionId
@@ -1296,7 +1326,8 @@ export default function (pi: ExtensionAPI) {
 						? `${health.sessionId} (from ${health.sessionSource})`
 						: "MISSING — run OpenCode once, or set PI_FREE_BRIDGE_SESSION_ID"
 				}`,
-				`  bun:        ${resolveBunPath() ?? "MISSING"}`,
+				`  bun:        ${resolveBunPath() ?? "MISSING"}`
+`  bridge-go:   ${describeBridgeGo()}`,
 				`  relay port: ${RELAY_PORT}`,
 				`  relay:      ${describeRelay()}`,
 				`  upstream:   ${UPSTREAM_URL}`,

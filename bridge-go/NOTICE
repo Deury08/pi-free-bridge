@@ -1,0 +1,30 @@
+bridge-go
+Copyright (c) 2026 Deury08
+
+This product includes components derived from or inspired by:
+
+1. opencode2api (https://github.com/jasonxu114514/opencode2api)
+   Copyright (c) 2024 jasonxu114514
+   Licensed under GNU General Public License v3.0
+   - The Bun ClientHello fingerprint specification (JA4 t13d1713h1)
+   - The concept of WARP exit rotation for free-tier IP limits
+   - The OpenCode gate contract structure (env block, tool aliasing, session affinity)
+   Note: This implementation is a clean-room reimplementation based on publicly
+   observable behavior and specifications. No GPL-3.0 code is included.
+
+2. refraction-networking/utls (https://github.com/refraction-networking/utls)
+   Copyright (c) 2017-2023 The uTLS Authors
+   Licensed under MIT License
+   - Used for TLS ClientHello impersonation
+
+3. golang.zx2c4.com/wireguard (https://git.zx2c4.com/wireguard-go/)
+   Copyright (c) 2017-2023 WireGuard Authors
+   Licensed under MIT License
+   - Referenced for WARP tunnel design (stub only, not included)
+
+4. gvisor.dev/gvisor (https://github.com/google/gvisor)
+   Copyright 2018 The gVisor Authors
+   Licensed under Apache License 2.0
+   - Referenced for userspace network stack design (stub only, not included)
+
+All derived works retain their original licenses as noted above.

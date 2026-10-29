@@ -19,11 +19,13 @@
     "index.ts",
     "relay.mjs",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "bridge-go"
   ],
   "type": "module",
   "scripts": {
-    "test": "node --test test/relay.test.mjs"
+    "test": "node --test test/relay.test.mjs",
+    "postinstall": "node scripts/postinstall.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
