@@ -81,6 +81,7 @@ se toca.
 
 ```bash
 node --test test/relay.test.mjs          # helpers del relay — offline
+bun test/proxy-failover.e2e.mjs          # failover directo→proxy con un proxy mock
 curl http://127.0.0.1:8788/health        # relay vivo
 pi -p --no-session --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 ```
@@ -161,6 +162,12 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `PI_FREE_BRIDGE_RELAY_PORT` | Pisa el puerto del relay |
 | `PI_FREE_BRIDGE_BUN` | Ruta explícita al ejecutable de Bun |
 | `PI_FREE_BRIDGE_DRY_RUN=1` | Diagnóstico de arranque |
+| `~/.pi/agent/pi-free-bridge.json` → `proxy` | Pool de proxies del failover (ver abajo) |
+| `RELAY_PROXY_STATIC` | Lista de proxies separada por comas (pisa el config) |
+| `RELAY_PROXY_SOURCE` | URL de una lista cruda de proxies (una por línea) |
+| `RELAY_PROXY_MAX` | Tamaño máximo del pool (por defecto `5`) |
+| `RELAY_PROXY_REFRESH_MINUTES` | Cada cuánto se re-pide `RELAY_PROXY_SOURCE` (por defecto `30`) |
+| `RELAY_PROXY_TIMEOUT_MS` | Tope hasta las cabeceras de cada intento (por defecto `15000`) |
 
 Forma del archivo de config:
 
@@ -168,7 +175,12 @@ Forma del archivo de config:
 {
   "sessionId": "ses_…",
   "liveIds": ["big-pickle", "…"],
-  "relayPort": 8788
+  "relayPort": 8788,
+  "proxy": {
+    "static": ["http://1.2.3.4:8080"],
+    "source": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "refreshMinutes": 30
+  }
 }
 ```
 
@@ -347,6 +359,37 @@ porque `@earendil-works/pi-ai` lo provee el host y no se resuelve desde la
 carpeta de este paquete (un import estático falla con `ERR_MODULE_NOT_FOUND` y
 rompe los tests independientes), así que el puente no le agrega ninguna
 dependencia en runtime.
+
+## Failover por proxy (opcional)
+
+El relay sale **directo** a OpenCode como siempre. Los proxies existen solo para
+cuando la IP directa deja de servir: es un salvavidas, no el camino normal.
+
+```text
+preferencia:  directo → proxy1 → proxy2 → …
+
+1. arranque:            sale directo
+2. directo falla:       rota al primer proxy del pool
+3. un proxy anda:       se queda en ese proxy (no rota por request)
+4. ese proxy falla:     se lo descarta y pasa al siguiente
+5. todos descartados:   vuelve a probar directo
+```
+
+Reglas del pool:
+
+- Solo `http`/`https`: Bun rechaza `socks5://` con `UnsupportedProxyProtocol`
+  (medido). Una línea `host:puerto` se interpreta como `http`.
+- Un proxy que falla (error de red, HTTP 429) se descarta por una ventana igual al
+  ciclo de refresco y vuelve solo cuando el pool se refresca.
+- Los reintentos ocurren **antes** de mandar la primera cabecera al cliente: un
+  stream ya empezado nunca se reenvía.
+- Sin `proxy` configurado, el camino es exactamente el de antes (sin overhead).
+
+Verificación local del camino completo (proxy mock, sin red real):
+
+```bash
+bun test/proxy-failover.e2e.mjs
+```
 
 ## Pruebas
 
