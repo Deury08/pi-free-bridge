@@ -1223,6 +1223,50 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("free-bridge-proxy", {
+		description: "Test the proxy pool: reachability, latency and the effective egress order",
+		handler: async (_args: string, ctx) => {
+			const proxyConfig = relayProxyOptions();
+			if (!proxyConfig) {
+				ctx.ui.notify(
+					[
+						"pi-free-bridge proxy: no pool configured — egress is direct only.",
+						`  add \"proxy\" to ${BRIDGE_CONFIG_PATH}, for example:`,
+						'    { "proxy": { "static": ["http://1.2.3.4:8080"], "refreshMinutes": 30 } }',
+						"  proxies are only used when the direct path fails.",
+					].join("\n"),
+					"info",
+				);
+				return;
+			}
+
+			let payload;
+			try {
+				const res = await fetch(`http://${RELAY_HOST}:${RELAY_PORT}/proxies`, {
+					signal: AbortSignal.timeout(30_000),
+				});
+				if (!res.ok) throw new Error(`relay answered HTTP ${res.status}`);
+				payload = await res.json();
+			} catch (err) {
+				ctx.ui.notify(
+					`pi-free-bridge proxy: the relay did not answer — ${(err as Error).message}\n` +
+						"  the pool lives in the relay, so it has to be running to be tested.",
+					"error",
+				);
+				return;
+			}
+
+			const lines = ["pi-free-bridge proxy", `  preference: ${(payload.preference ?? []).join(" -> ")}`];
+			for (const candidate of payload.candidates ?? []) {
+				const verdict = candidate.ok
+					? `ok (HTTP ${candidate.status}, ${candidate.latencyMs} ms)`
+					: `DEAD — ${candidate.error}`;
+				lines.push(`  ${candidate.candidate}: ${verdict}`);
+			}
+			ctx.ui.notify(lines.join("\n"), (payload.candidates ?? []).some((c: { ok: boolean }) => c.ok) ? "info" : "warning");
+		},
+	});
+
 	pi.registerCommand("free-bridge-doctor", {
 		description: "Diagnose and repair why the free OpenCode models are missing from the picker",
 		handler: async (_args: string, ctx) => {

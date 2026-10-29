@@ -40,6 +40,12 @@ refreshed from its source.
   30); a refresh failure keeps the previous list. Discarded-expiry resets on
   refresh. No running timer is added beyond the refresh cycle.
 
+- **S11** — user: "debemos tener un modo proxy para hacer test". The relay exposes
+  `GET /proxies`: the configured pool, the effective preference order and a
+  per-candidate reachability probe (`direct` included, `{ok,status,latencyMs}` or
+  `{ok:false,error}`). Pi exposes `/free-bridge-proxy`, which prints that report
+  and explains what to configure when no pool exists.
+
 ## Tasks
 
 | ID | Specs | Route | Commit |

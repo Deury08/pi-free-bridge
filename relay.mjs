@@ -194,6 +194,10 @@ export function createEgressPlanner({ proxies = [], now = Date.now } = {}) {
 			discardedUntil.clear();
 			if (lastGood && !pool.includes(lastGood)) lastGood = null;
 		},
+		/** S11: the pool as configured, ignoring discards, for diagnostics. */
+		configured() {
+			return [...pool];
+		},
 	};
 }
 
@@ -389,6 +393,63 @@ async function fetchUpstream(config, forwardInit, pathname) {
 	throw lastError ?? new Error("no egress candidate available");
 }
 
+// ---------------------------------------------------------------------------
+// Proxy diagnostics (S11: a test mode for the pool)
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe one candidate by asking for the models surface through it. Any HTTP
+ * response — even 404 — proves the tunnel works, so the check separates
+ * "proxy is dead" from "upstream dislikes the request". `direct` is probed
+ * with no proxy so the caller can compare. Never throws.
+ */
+async function probeCandidate(candidate, upstreamUrl, timeoutMs) {
+	const startedAt = Date.now();
+	const deadline = attemptDeadline(timeoutMs);
+	try {
+		const response = await fetch(`${upstreamUrl.replace(/\/+$/, "")}/models`, {
+			method: "GET",
+			...(candidate === DIRECT ? {} : { proxy: candidate }),
+			signal: deadline.signal,
+		});
+		deadline.settle();
+		try {
+			await response.body?.cancel();
+		} catch {
+			// Draining the probe response is best-effort.
+		}
+		return { candidate, ok: true, status: response.status, latencyMs: Date.now() - startedAt };
+	} catch (err) {
+		deadline.settle();
+		return {
+			candidate,
+			ok: false,
+			error: err && err.message ? err.message : String(err),
+			latencyMs: Date.now() - startedAt,
+		};
+	}
+}
+
+/**
+ * S11 test mode: probe every configured candidate concurrently and report the
+ * pool, the effective preference order and per-proxy reachability. Ordered
+ * `direct` first, then the pool as configured, so the output mirrors the real
+ * failover preference.
+ */
+async function probeEgress(config) {
+	const upstreamUrl = String(config.upstream ?? "");
+	const candidates = [DIRECT, ...config.planner.configured()];
+	const results = await Promise.all(
+		candidates.map((candidate) => probeCandidate(candidate, upstreamUrl, config.attemptTimeoutMs)),
+	);
+	return {
+		service: SERVICE,
+		upstream: upstreamUrl,
+		preference: config.planner.plan(),
+		candidates: results,
+	};
+}
+
 async function forward(req, res, pathname, config) {
 	try {
 		const raw = await readBody(req);
@@ -452,6 +513,15 @@ async function handle(req, res, config) {
 			sessionId: config.session,
 			sessionSource: config.sessionSource,
 		});
+		return;
+	}
+
+	if (req.method === "GET" && pathname === "/proxies") {
+		// S11: the test mode — reachability of every configured egress.
+		await probeEgress(config).then(
+			(payload) => sendJson(res, 200, payload),
+			(err) => sendJson(res, 502, { error: { message: err && err.message ? err.message : String(err) } }),
+		);
 		return;
 	}
 

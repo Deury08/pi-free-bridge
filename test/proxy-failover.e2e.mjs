@@ -77,6 +77,18 @@ try {
 	const second = await post();
 	await second.text();
 	check("sticky: the next request reuses the healthy proxy (S3)", second.status === 200 && proxyHits === 2);
+
+	// S11: the test mode reports reachability for every configured candidate.
+	const probe = await fetch(`http://127.0.0.1:${port}/proxies`);
+	const report = await probe.json();
+	const byCandidate = new Map((report.candidates ?? []).map((entry) => [entry.candidate, entry]));
+	check("test mode: the diagnostic endpoint answers (S11)", probe.status === 200);
+	check("test mode: the live proxy is reported ok (S11)", byCandidate.get(proxyUrl)?.ok === true);
+	check("test mode: direct is reported dead because its host does not resolve (S11)", byCandidate.get("direct")?.ok === false);
+	check(
+		"test mode: the exposed preference is the sticky proxy the relay is using (S3, S11)",
+		Array.isArray(report.preference) && report.preference.length === 1 && report.preference[0] === proxyUrl,
+	);
 } catch (err) {
 	check(`e2e completed without error: ${err?.message ?? err}`, false);
 } finally {
