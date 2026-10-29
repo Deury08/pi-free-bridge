@@ -385,6 +385,51 @@ Reglas del pool:
   stream ya empezado nunca se reenvía.
 - Sin `proxy` configurado, el camino es exactamente el de antes (sin overhead).
 
+### Modo forzado (probar los proxies sin quemar la IP)
+
+Por defecto el pool es un salvavidas. Si querés que los proxies salgan **primero**
+aunque tu IP directa todavía tenga cuota — por ejemplo para e2e, o porque sospechás
+que te marcaron — activá el modo forzado. `directo` queda **último**, así un pool
+muerto degrada al comportamiento normal en vez de dejarte sin servicio:
+
+```text
+forzado:  proxy1 → proxy2 → … → directo
+```
+
+Tres formas de prenderlo, de más estable a más quirúrgica:
+
+| Alcance | Cómo |
+| --- | --- |
+| Relay entero (config) | `"proxy": { "force": true }` en `pi-free-bridge.json` |
+| Relay entero (env) | `RELAY_PROXY_FORCE=1` |
+| Un solo request | header `x-free-bridge-force-proxy: 1` |
+
+El header no toca estado compartido, así que es el que conviene para tests: fuerza
+el pool en esa llamada y las concurrentes quedan como estaban.
+
+### Modo test: `/free-bridge-proxy`
+
+```
+pi-free-bridge proxy
+  preference: http://1.2.3.4:8080 -> direct
+  forced:     yes — the pool is preferred over direct
+  last egress: http://1.2.3.4:8080
+  direct: ok (HTTP 200, 180 ms)
+  http://1.2.3.4:8080: ok (HTTP 200, 640 ms)
+  http://5.6.7.8:3128: DEAD — ConnectionRefused
+```
+
+Sondea `directo` y cada proxy en paralelo contra `<upstream>/models`: **cualquier**
+respuesta HTTP (aunque sea 404) prueba que el túnel anda, así no confundís un proxy
+sano con el gate enojado. `lastEgress` te dice quién sirvió la última request, que
+es la evidencia dura de que el proxy se usó de verdad.
+
+Por HTTP directo, para scripts:
+
+```bash
+curl -s http://127.0.0.1:8788/proxies | python -m json.tool
+```
+
 Verificación local del camino completo (proxy mock, sin red real):
 
 ```bash

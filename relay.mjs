@@ -167,18 +167,35 @@ const DIRECT = "direct";
  * an error (S4); direct is never excluded from a fresh plan (S2): each fresh
  * attempt re-tests it, and a new egress cycle always starts there.
  */
-export function createEgressPlanner({ proxies = [], now = Date.now } = {}) {
+export function createEgressPlanner({ proxies = [], now = Date.now, force = false } = {}) {
 	let pool = [...proxies];
 	let lastGood = null;
+	let forced = Boolean(force);
 	const discardedUntil = new Map();
 
 	const alive = () => pool.filter((entry) => (discardedUntil.get(entry) ?? 0) <= now());
 
 	return {
-		/** Preference order for the next attempt cycle (S2-S4). */
-		plan() {
+		/**
+		 * Preference order for the next attempt cycle (S2-S4, S12). `force` is a
+		 * per-call override so a single request never mutates shared state.
+		 */
+		plan(force) {
 			if (lastGood && alive().includes(lastGood)) return [lastGood];
-			return [DIRECT, ...alive()];
+			// S12: forced mode puts the pool first and keeps direct as the last resort,
+			// so a dead pool degrades to today's behavior instead of failing outright.
+			const alivePool = alive();
+			const forcing = force === undefined ? forced : Boolean(force);
+			if (forcing && alivePool.length > 0) return [...alivePool, DIRECT];
+			return [DIRECT, ...alivePool];
+		},
+		/** S12: whether the pool is preferred over direct by configuration. */
+		isForced() {
+			return forced;
+		},
+		/** S12: the egress that served the last successful attempt, for verification. */
+		lastEgress() {
+			return lastGood;
 		},
 		/** S3: stick to the candidate that served a successful request. */
 		markGood(candidate) {
@@ -376,11 +393,11 @@ async function attemptUpstream(candidate, upstreamUrl, config, forwardInit) {
  * socket (S8), so the client never sees a half-sent retry. Exhausting every
  * candidate surfaces the last underlying error as today's 502.
  */
-async function fetchUpstream(config, forwardInit, pathname) {
+async function fetchUpstream(config, forwardInit, pathname, force) {
 	const upstreamUrl = toUpstreamUrl(config.upstream, pathname);
 	const discardMs = config.discardMs;
 	let lastError;
-	for (const candidate of config.planner.plan()) {
+	for (const candidate of config.planner.plan(force)) {
 		try {
 			const upstream = await attemptUpstream(candidate, upstreamUrl, config, forwardInit);
 			config.planner.markGood(candidate);
@@ -445,6 +462,8 @@ async function probeEgress(config) {
 	return {
 		service: SERVICE,
 		upstream: upstreamUrl,
+		forced: config.planner.isForced(),
+		lastEgress: config.planner.lastEgress(),
 		preference: config.planner.plan(),
 		candidates: results,
 	};
@@ -464,6 +483,14 @@ async function forward(req, res, pathname, config) {
 			stream: true,
 		});
 
+		// S12: `x-free-bridge-force-proxy: 1` prefers the pool for THIS request only,
+		// so e2e can exercise the proxy path without burning the direct quota. An
+		// absent header must stay `undefined`, otherwise it would override the
+		// configured force flag with false.
+		const forceHeader = String(req.headers["x-free-bridge-force-proxy"] ?? "").trim();
+		const force =
+			forceHeader === "" ? undefined : forceHeader === "1" || forceHeader.toLowerCase() === "true";
+
 		const forwardInit = {
 			method: "POST",
 			headers: {
@@ -476,7 +503,7 @@ async function forward(req, res, pathname, config) {
 			body: JSON.stringify(body),
 		};
 
-		const upstream = await fetchUpstream(config, forwardInit, pathname);
+		const upstream = await fetchUpstream(config, forwardInit, pathname, force);
 
 		// S20: status and content-type pass through, the body is piped unparsed.
 		const headers = {};
@@ -512,6 +539,8 @@ async function handle(req, res, config) {
 			ok: true,
 			sessionId: config.session,
 			sessionSource: config.sessionSource,
+			proxyForced: config.planner.isForced(),
+			lastEgress: config.planner.lastEgress(),
 		});
 		return;
 	}
@@ -609,7 +638,8 @@ async function startServer() {
 	// S2: with no proxy configured the planner degenerates to direct-only and
 	// forward() takes the exact pre-failover code path.
 	const staticPool = parseProxyPool(commaListEnv("RELAY_PROXY_STATIC"), { cap: config.proxyMax });
-	const planner = createEgressPlanner({ proxies: staticPool });
+	const forced = /^(1|true|yes)$/i.test((process.env.RELAY_PROXY_FORCE ?? "").trim());
+	const planner = createEgressPlanner({ proxies: staticPool, force: forced });
 	config.planner = planner;
 
 	if (config.proxySource) {

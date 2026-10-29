@@ -75,6 +75,31 @@ test("planner: falls back to direct + alive proxies when last healthy dies", () 
 	assert.deepStrictEqual(planner.plan(), ["direct", "http://p1"]);
 });
 
+test("planner forced: the pool goes first and direct stays as the last resort (S12)", () => {
+	const planner = createEgressPlanner({ proxies: ["http://p1", "http://p2"], force: true });
+	assert.deepStrictEqual(planner.plan(), ["http://p1", "http://p2", "direct"]);
+	assert.equal(planner.isForced(), true);
+});
+
+test("planner forced: a per-call override does not mutate shared state (S12)", () => {
+	const planner = createEgressPlanner({ proxies: ["http://p1"] });
+	assert.deepStrictEqual(planner.plan(true), ["http://p1", "direct"]);
+	assert.deepStrictEqual(planner.plan(), ["direct", "http://p1"]);
+	assert.equal(planner.isForced(), false);
+});
+
+test("planner forced: an empty pool still plans direct (S12)", () => {
+	const planner = createEgressPlanner({ proxies: [], force: true });
+	assert.deepStrictEqual(planner.plan(), ["direct"]);
+});
+
+test("planner: lastEgress reports the egress that served the request (S12)", () => {
+	const planner = createEgressPlanner({ proxies: ["http://p1"] });
+	assert.equal(planner.lastEgress(), null);
+	planner.markGood("http://p1");
+	assert.equal(planner.lastEgress(), "http://p1");
+});
+
 test("planner: direct is never discarded for longer than one attempt (S2)", () => {
 	const planner = createEgressPlanner({ proxies: ["http://p1"] });
 	const first = planner.plan();

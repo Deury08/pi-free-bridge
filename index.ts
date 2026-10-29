@@ -295,6 +295,8 @@ type BridgeConfig = {
 		static?: string[];
 		source?: string;
 		refreshMinutes?: number;
+		/** S12: prefer the pool even when the direct path still works. */
+		force?: boolean;
 	};
 };
 
@@ -374,6 +376,7 @@ type RelayOptions = {
 		static?: string[];
 		source?: string;
 		refreshMinutes?: number;
+		force?: boolean;
 	};
 };
 
@@ -548,6 +551,7 @@ function relayEnv(options: RelayOptions): Record<string, string | undefined> {
 		if (typeof proxy.refreshMinutes === "number" && proxy.refreshMinutes > 0) {
 			env.RELAY_PROXY_REFRESH_MINUTES = String(proxy.refreshMinutes);
 		}
+		if (proxy.force === true) env.RELAY_PROXY_FORCE = "1";
 	}
 
 	if (options.sessionId) {
@@ -631,16 +635,22 @@ function relayProxyOptions(): RelayOptions["proxy"] {
 	const source = typeof proxy.source === "string" && proxy.source.trim() !== "" ? proxy.source.trim() : undefined;
 	const refreshMinutes =
 		typeof proxy.refreshMinutes === "number" && proxy.refreshMinutes > 0 ? proxy.refreshMinutes : undefined;
+	const force = proxy.force === true;
 
 	if (!staticPool?.length && !source) return undefined;
-	return { static: staticPool, source, refreshMinutes };
+	return { static: staticPool, source, refreshMinutes, force };
 }
 
 async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 	// The proxy pool is part of the identity: a changed pool must not keep talking
 	// to a relay spawned with the previous one.
 	const proxyKey = options.proxy
-		? JSON.stringify([options.proxy.static ?? [], options.proxy.source ?? "", options.proxy.refreshMinutes ?? 0])
+		? JSON.stringify([
+				options.proxy.static ?? [],
+				options.proxy.source ?? "",
+				options.proxy.refreshMinutes ?? 0,
+				options.proxy.force === true,
+			])
 		: "";
 	const key = `${options.port}\u0000${options.sessionId ?? ""}\u0000${proxyKey}`;
 
@@ -1256,7 +1266,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const lines = ["pi-free-bridge proxy", `  preference: ${(payload.preference ?? []).join(" -> ")}`];
+			const lines = [
+				"pi-free-bridge proxy",
+				`  preference: ${(payload.preference ?? []).join(" -> ")}`,
+				`  forced:     ${payload.forced ? "yes — the pool is preferred over direct" : "no — direct first"}`,
+				`  last egress: ${payload.lastEgress ?? "direct (nothing proxied yet)"}`,
+			];
 			for (const candidate of payload.candidates ?? []) {
 				const verdict = candidate.ok
 					? `ok (HTTP ${candidate.status}, ${candidate.latencyMs} ms)`

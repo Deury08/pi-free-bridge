@@ -46,6 +46,17 @@ refreshed from its source.
   `{ok:false,error}`). Pi exposes `/free-bridge-proxy`, which prints that report
   and explains what to configure when no pool exists.
 
+- **S12** — user: "quiero agregar que se pueda poner el proxy aunque la ip limpia
+  sin proxy no este quemada, asi podemos hacer e2e con los proxys". A force mode
+  prefers the pool over direct while keeping `direct` as the last resort, so a
+  dead pool degrades to today's behavior instead of failing:
+  - `proxy.force: true` in the bridge config, or `RELAY_PROXY_FORCE=1`, turns it
+    on for the whole relay;
+  - the request header `x-free-bridge-force-proxy: 1` turns it on for one single
+    request without touching shared state (used by e2e);
+  - `/health` and `GET /proxies` report `proxyForced` and `lastEgress`, so a test
+    can prove the proxy served a request even when direct was healthy.
+
 ## Tasks
 
 | ID | Specs | Route | Commit |
