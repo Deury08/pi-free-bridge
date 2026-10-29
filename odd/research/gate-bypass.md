@@ -7,7 +7,7 @@
 
 ## Log
 
-- L1 (pedidos del usuario, verbatim): "espera pero hay un dato creo que mi opencode corre en bun, pero que tal si corriera en node, esta idea vale oro, creo que hay de donde tirar" → "te pase ese repo porque pense que podriamos sacar algo de ahi, pero lo realmente bueno es no atarnos a bun seria poder hacer las peticiones directas desde pi, aunque sacar un binario con go no esta mal... la idea principal seria no depender de bun aunque lo dejemos" → "mira investiga en la docu de opencode y veras que funciona en node, entonces hay un dato que nos falta" → "haceme un md de la investigacion asi despues retomamos de ahi los conceptos".
+- L1 (pedidos del usuario, verbatim): "quiero que habras una branch para investigar algo" → "espera pero hay un dato creo que mi opencode corre en bun, pero que tal si corriera en node, esta idea vale oro, creo que hay de donde tirar" → "te pase ese repo porque pense que podriamos sacar algo de ahi, pero lo realmente bueno es no atarnos a bun seria poder hacer las peticiones directas desde pi, aunque sacar un binario con go no esta mal... la idea principal seria no depender de bun aunque lo dejemos" → "mira investiga en la docu de opencode y veras que funciona en node, entonces hay un dato que nos falta" → "haceme un md de la investigacion asi despues retomamos de ahi los conceptos".
 
 ## 1. Preguntas con veredicto (evidencia en vivo, no teórica)
 
@@ -77,7 +77,7 @@ Tres capas separadas (`internal/rotation/state.go`, `internal/gateway/rotation.g
 
 1. **Pools Zen/Go keys** — rotación de cuentas de pago. No aplica (anónimo = 1 credencial `Bearer public`).
 2. **Rotación de modelos** (alias `sota`/`sweet`) — alias sticky: si el modelo corriente
-   falla o se agota, pausa con cooldown y cae al siguiente en orden. Concepto portable
+   falla o se agota, pausa con cooldown y cae al siguiente en la lista. Concepto portable
    al failover de `oc-sdk-zen`.
 3. **Salida WARP (la que importa para el tier gratis)** — túneles userspace Cloudflare
    WARP (pool, `stack: ipv6`), **un exit IP por request**, jubilando el exit si el stream
