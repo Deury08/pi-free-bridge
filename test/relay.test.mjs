@@ -13,11 +13,128 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+	attemptDeadline,
+	createEgressPlanner,
 	ensureEnvBlock,
 	ensureGateTools,
+	parseProxyPool,
 	resolveSessionFromStore,
 	toUpstreamUrl,
 } from "../relay.mjs";
+
+// ---------------------------------------------------------------------------
+// parseProxyPool (S5, S6)
+// ---------------------------------------------------------------------------
+
+test("parseProxyPool: keeps http/https, maps host:port to http, drops socks and garbage", () => {
+	const text = [
+		"# comment",
+		"",
+		"1.2.3.4:8080",
+		"http://5.6.7.8:3128",
+		"https://proxy.example.com:443",
+		"socks5://9.9.9.9:1080",
+		"socks4://10.0.0.1:9050",
+		"not-a-proxy",
+		"1.2.3.4:8080",
+	].join("\n");
+
+	assert.deepStrictEqual(parseProxyPool(text, { cap: 10 }), [
+		"http://1.2.3.4:8080",
+		"http://5.6.7.8:3128",
+		"https://proxy.example.com:443",
+	]);
+});
+
+test("parseProxyPool: caps and dedupes in order", () => {
+	const text = ["http://a:1", "http://b:2", "http://a:1", "http://c:3", "http://d:4"].join("\n");
+	assert.deepStrictEqual(parseProxyPool(text, { cap: 3 }), ["http://a:1", "http://b:2", "http://c:3"]);
+});
+
+// ---------------------------------------------------------------------------
+// createEgressPlanner (S2, S3, S4)
+// ---------------------------------------------------------------------------
+
+test("planner: fresh plan is direct first, then alive proxies", () => {
+	const planner = createEgressPlanner({ proxies: ["http://p1", "http://p2"] });
+	assert.deepStrictEqual(planner.plan(), ["direct", "http://p1", "http://p2"]);
+});
+
+test("planner: sticks to the last healthy candidate (S3)", () => {
+	const planner = createEgressPlanner({ proxies: ["http://p1", "http://p2"] });
+	assert.deepStrictEqual(planner.plan(), ["direct", "http://p1", "http://p2"]);
+	planner.markGood("http://p1");
+	assert.deepStrictEqual(planner.plan(), ["http://p1"]);
+});
+
+test("planner: falls back to direct + alive proxies when last healthy dies", () => {
+	const planner = createEgressPlanner({ proxies: ["http://p1", "http://p2"] });
+	planner.markGood("http://p2");
+	assert.deepStrictEqual(planner.plan(), ["http://p2"]);
+	planner.markError("http://p2", 1000);
+	assert.deepStrictEqual(planner.plan(), ["direct", "http://p1"]);
+});
+
+test("planner: direct is never discarded for longer than one attempt (S2)", () => {
+	const planner = createEgressPlanner({ proxies: ["http://p1"] });
+	const first = planner.plan();
+	assert.deepStrictEqual(first, ["direct", "http://p1"]);
+	// Even after a direct failure, the next fresh plan re-tests direct.
+	planner.markError("direct", 60_000);
+	assert.deepStrictEqual(planner.plan(), ["direct", "http://p1"]);
+});
+
+test("planner: discarded proxy revives after its discard window (S4)", () => {
+	let now = 0;
+	const planner = createEgressPlanner({ proxies: ["http://p1"], now: () => now });
+	planner.markError("http://p1", 60_000);
+	assert.deepStrictEqual(planner.plan(), ["direct"]);
+	now = 60_001;
+	assert.deepStrictEqual(planner.plan(), ["direct", "http://p1"]);
+});
+
+test("planner: resetDiscards revives everything (pool refresh, S10)", () => {
+	const planner = createEgressPlanner({ proxies: ["http://p1", "http://p2"], now: () => 0 });
+	planner.markError("http://p1", 60_000);
+	planner.markError("http://p2", 60_000);
+	assert.deepStrictEqual(planner.plan(), ["direct"]);
+	planner.setProxies(["http://fresh"]);
+	assert.deepStrictEqual(planner.plan(), ["direct", "http://fresh"]);
+});
+
+// ---------------------------------------------------------------------------
+// attemptDeadline (S9)
+// ---------------------------------------------------------------------------
+
+test("attemptDeadline: settle() clears the timeout, signal stays clean", () => {
+	const scheduled = new Map();
+	let nextId = 0;
+	const deadline = attemptDeadline(15_000, {
+		schedule: (fn, ms) => {
+			const id = nextId++;
+			scheduled.set(id, { fn, ms });
+			return id;
+		},
+		clear: (id) => scheduled.delete(id),
+	});
+	assert.equal(scheduled.size, 1);
+	assert.equal(scheduled.values().next().value.ms, 15_000);
+	assert.equal(deadline.signal.aborted, false);
+	deadline.settle();
+	assert.equal(scheduled.size, 0);
+	assert.equal(deadline.signal.aborted, false);
+});
+
+test("attemptDeadline: the scheduled abort aborts the signal (S9)", () => {
+	const deadline = attemptDeadline(15_000, {
+		schedule: (fn) => {
+			fn();
+			return 0;
+		},
+		clear: () => {},
+	});
+	assert.equal(deadline.signal.aborted, true);
+});
 
 // ---------------------------------------------------------------------------
 // ensureEnvBlock (S21)

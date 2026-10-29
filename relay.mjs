@@ -117,6 +117,103 @@ export function toUpstreamUrl(upstreamBase, pathname) {
 }
 
 // ---------------------------------------------------------------------------
+// Proxy failover helpers (odd/tasks/proxy-failover.md S3-S6, S9, S10)
+//
+// Evidence (probe 2026-11): Bun's fetch honors the `proxy` option for
+// http/https (CONNECT tunnel, the TLS ClientHello stays Bun's) and rejects
+// `socks5://` with UnsupportedProxyProtocol. Pools are therefore http-only.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a raw proxy list into a Bun-usable pool (S5, S6). One entry per line;
+ * `#` comments and blanks are dropped. Explicit schemes: only http/https
+ * survive, socks4/socks5 are dropped. A bare `host:port` line becomes http.
+ * Duplicates keep first position; `cap` bounds the result in listed order.
+ */
+export function parseProxyPool(text, { cap = 5 } = {}) {
+	const seen = new Set();
+	const pool = [];
+	for (const rawLine of String(text ?? "").split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (line.length === 0 || line.startsWith("#")) continue;
+
+		let entry;
+		if (/^https:\/\//i.test(line) || /^http:\/\//i.test(line)) {
+			entry = line.toLowerCase();
+		} else if (/^socks[45]:\/\//i.test(line)) {
+			// Bun fetch drops this scheme outright; a dead entry in the pool would
+			// burn one failover hop every request.
+			continue;
+		} else if (/^[^\s/:]+:\d+$/.test(line)) {
+			entry = `http://${line.toLowerCase()}`;
+		} else {
+			continue;
+		}
+
+		if (seen.has(entry)) continue;
+		seen.add(entry);
+		pool.push(entry);
+		if (pool.length >= cap) break;
+	}
+	return pool;
+}
+
+const DIRECT = "direct";
+
+/**
+ * Egress planner for forward(): direct-first with stick-to-last-healthy (S2,
+ * S3). A plan is either `[lastGood]` while it lives, or the preference order
+ * `[direct, ...alive proxies]`. Proxies are discarded until `discardMs` after
+ * an error (S4); direct is never excluded from a fresh plan (S2): each fresh
+ * attempt re-tests it, and a new egress cycle always starts there.
+ */
+export function createEgressPlanner({ proxies = [], now = Date.now } = {}) {
+	let pool = [...proxies];
+	let lastGood = null;
+	const discardedUntil = new Map();
+
+	const alive = () => pool.filter((entry) => (discardedUntil.get(entry) ?? 0) <= now());
+
+	return {
+		/** Preference order for the next attempt cycle (S2-S4). */
+		plan() {
+			if (lastGood && alive().includes(lastGood)) return [lastGood];
+			return [DIRECT, ...alive()];
+		},
+		/** S3: stick to the candidate that served a successful request. */
+		markGood(candidate) {
+			if (candidate && candidate !== DIRECT) lastGood = candidate;
+		},
+		/** S4: discard until the deadline; direct only fails for one attempt. */
+		markError(candidate, discardMs) {
+			if (candidate && candidate !== DIRECT) discardedUntil.set(candidate, now() + discardMs);
+		},
+		/** S10: a pool refresh resets discards and takes the new list. */
+		setProxies(next) {
+			pool = [...next];
+			discardedUntil.clear();
+			if (lastGood && !pool.includes(lastGood)) lastGood = null;
+		},
+	};
+}
+
+/**
+ * Bound exactly the time until upstream HEADERS arrive (S9): the caller settles
+ * the deadline when fetch resolves, and the SSE stream after that runs
+ * unbounded. `schedule`/`clear` stay injectable so the tests drive the clock.
+ */
+export function attemptDeadline(timeoutMs, { schedule = setTimeout, clear = clearTimeout } = {}) {
+	const controller = new AbortController();
+	const id = schedule(() => controller.abort(), timeoutMs);
+	return {
+		signal: controller.signal,
+		settle() {
+			clear(id);
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Session harvest (S31, S32)
 // ---------------------------------------------------------------------------
 //
