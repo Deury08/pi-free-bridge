@@ -330,6 +330,65 @@ async function readBody(req) {
 	return Buffer.concat(chunks).toString("utf8");
 }
 
+/**
+ * One upstream attempt through `candidate` (S4, S9). Network errors and 429 are
+ * retryable egress failures; everything else is returned to the caller as-is.
+ * The attempt timeout bounds only the time until headers arrive; once fetch
+ * resolves the deadline is settled and the stream runs unbounded.
+ */
+const RETRYABLE_STATUS = 429;
+
+async function attemptUpstream(candidate, upstreamUrl, config, forwardInit) {
+	const proxyInit = candidate === DIRECT ? {} : { proxy: candidate };
+	const deadline = attemptDeadline(config.attemptTimeoutMs);
+	let upstream;
+	try {
+		upstream = await fetch(upstreamUrl, {
+			...forwardInit,
+			...proxyInit,
+			signal: deadline.signal,
+		});
+	} catch (err) {
+		deadline.settle();
+		throw err;
+	}
+	deadline.settle();
+
+	if (upstream.status === RETRYABLE_STATUS) {
+		try {
+			await upstream.body?.cancel();
+		} catch {
+			// Releasing the discarded attempt is best-effort only.
+		}
+		throw new Error(`upstream ${RETRYABLE_STATUS} via ${candidate}`);
+	}
+	return upstream;
+}
+
+/**
+ * Direct-first failover loop (S2-S4): walk the planner's preference order and
+ * return the first attempt that yields usable headers. Every failure is bound
+ * to the pool refresh window and retried before anything reaches the client
+ * socket (S8), so the client never sees a half-sent retry. Exhausting every
+ * candidate surfaces the last underlying error as today's 502.
+ */
+async function fetchUpstream(config, forwardInit, pathname) {
+	const upstreamUrl = toUpstreamUrl(config.upstream, pathname);
+	const discardMs = config.discardMs;
+	let lastError;
+	for (const candidate of config.planner.plan()) {
+		try {
+			const upstream = await attemptUpstream(candidate, upstreamUrl, config, forwardInit);
+			config.planner.markGood(candidate);
+			return upstream;
+		} catch (err) {
+			lastError = err;
+			config.planner.markError(candidate, discardMs);
+		}
+	}
+	throw lastError ?? new Error("no egress candidate available");
+}
+
 async function forward(req, res, pathname, config) {
 	try {
 		const raw = await readBody(req);
@@ -344,7 +403,7 @@ async function forward(req, res, pathname, config) {
 			stream: true,
 		});
 
-		const upstream = await fetch(toUpstreamUrl(config.upstream, pathname), {
+		const forwardInit = {
 			method: "POST",
 			headers: {
 				"content-type": "application/json",
@@ -354,7 +413,9 @@ async function forward(req, res, pathname, config) {
 				"x-opencode-session-id": config.session,
 			},
 			body: JSON.stringify(body),
-		});
+		};
+
+		const upstream = await fetchUpstream(config, forwardInit, pathname);
 
 		// S20: status and content-type pass through, the body is piped unparsed.
 		const headers = {};
@@ -402,6 +463,50 @@ async function handle(req, res, config) {
 	sendJson(res, 404, { error: { message: `no route for ${req.method} ${pathname}` } });
 }
 
+// ---------------------------------------------------------------------------
+// Proxy pool bootstrapping (S5, S6, S10)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PROXY_MAX = 5;
+const DEFAULT_REFRESH_MINUTES = 30;
+const DEFAULT_ATTEMPT_TIMEOUT_MS = 15_000;
+
+function intEnv(name, fallback) {
+	const parsed = Number.parseInt(process.env[name] ?? "", 10);
+	return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function commaListEnv(name) {
+	return (process.env[name] ?? "").split(",").filter(Boolean).join("\n");
+}
+
+/**
+ * Refresh the planner pool from RELAY_PROXY_SOURCE (S10). Every failure keeps
+ * the previous list and only complains on stderr; stdout is reserved for the
+ * single startup line.
+ */
+async function refreshProxyPool(config, planner) {
+	try {
+		const deadline = attemptDeadline(10_000);
+		const response = await fetch(config.proxySource, { signal: deadline.signal });
+		deadline.settle();
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		const text = await response.text();
+		const next = parseProxyPool(text, { cap: config.proxyMax });
+		if (next.length === 0) throw new Error("source yielded no usable http proxy");
+		planner.setProxies(next);
+		process.stderr.write(
+			`pi-free-bridge relay: proxy pool refreshed (${next.length} candidates)\n`,
+		);
+	} catch (err) {
+		process.stderr.write(
+			`pi-free-bridge relay: proxy pool refresh failed, keeping previous pool — ${
+				err && err.message ? err.message : String(err)
+			}\n`,
+		);
+	}
+}
+
 async function startServer() {
 	const parsedPort = Number.parseInt(process.env.PORT ?? "", 10);
 	const port = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort < 65536 ? parsedPort : DEFAULT_PORT;
@@ -417,6 +522,7 @@ async function startServer() {
 		process.exit(1);
 	}
 
+	const refreshMs = intEnv("RELAY_PROXY_REFRESH_MINUTES", DEFAULT_REFRESH_MINUTES) * 60_000;
 	const config = {
 		upstream: process.env.RELAY_UPSTREAM || DEFAULT_UPSTREAM,
 		session: session.sessionId,
@@ -424,7 +530,25 @@ async function startServer() {
 		cwd: process.env.RELAY_CWD || process.cwd(),
 		userAgent: process.env.RELAY_USER_AGENT || DEFAULT_USER_AGENT,
 		apiKey: process.env.RELAY_API_KEY || "public",
+		attemptTimeoutMs: intEnv("RELAY_PROXY_TIMEOUT_MS", DEFAULT_ATTEMPT_TIMEOUT_MS),
+		proxyMax: intEnv("RELAY_PROXY_MAX", DEFAULT_PROXY_MAX),
+		proxySource: process.env.RELAY_PROXY_SOURCE?.trim() || null,
+		discardMs: refreshMs,
 	};
+
+	// S2: with no proxy configured the planner degenerates to direct-only and
+	// forward() takes the exact pre-failover code path.
+	const staticPool = parseProxyPool(commaListEnv("RELAY_PROXY_STATIC"), { cap: config.proxyMax });
+	const planner = createEgressPlanner({ proxies: staticPool });
+	config.planner = planner;
+
+	if (config.proxySource) {
+		const refresh = () => void refreshProxyPool(config, planner);
+		refresh();
+		const timer = setInterval(refresh, refreshMs);
+		// A dead timer must not keep Bun (and Pi's child) alive on its own.
+		timer.unref?.();
+	}
 
 	const server = createServer((req, res) => {
 		void handle(req, res, config).catch((err) => {
