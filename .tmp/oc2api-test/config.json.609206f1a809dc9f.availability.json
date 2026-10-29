@@ -1,0 +1,90 @@
+{
+  "beam-free": {
+    "model": "beam-free",
+    "disabled": false,
+    "checked_at": "2026-10-29T04:40:24.4379095Z",
+    "next_check": "2026-10-29T05:40:24.4379095Z",
+    "reason": "http_429",
+    "channel": "anonymous",
+    "probe_version": 1,
+    "auto_effort": {},
+    "effort_checked_at": "0001-01-01T00:00:00Z"
+  },
+  "big-pickle": {
+    "model": "big-pickle",
+    "disabled": false,
+    "checked_at": "2026-10-29T04:40:25.1131334Z",
+    "next_check": "2026-10-29T05:40:25.1131334Z",
+    "reason": "http_429",
+    "channel": "anonymous",
+    "probe_version": 1,
+    "auto_effort": {},
+    "effort_checked_at": "0001-01-01T00:00:00Z"
+  },
+  "deepseek-v4.1-flash-free": {
+    "model": "deepseek-v4.1-flash-free",
+    "disabled": false,
+    "checked_at": "2026-10-29T04:40:25.3365835Z",
+    "next_check": "2026-10-29T05:40:25.3365835Z",
+    "reason": "http_429",
+    "channel": "anonymous",
+    "probe_version": 1,
+    "auto_effort": {},
+    "effort_checked_at": "0001-01-01T00:00:00Z"
+  },
+  "flint-40b-free": {
+    "model": "flint-40b-free",
+    "disabled": false,
+    "checked_at": "2026-10-29T04:40:25.5607151Z",
+    "next_check": "2026-10-29T05:40:25.5607151Z",
+    "reason": "http_429",
+    "channel": "anonymous",
+    "probe_version": 1,
+    "auto_effort": {},
+    "effort_checked_at": "0001-01-01T00:00:00Z"
+  },
+  "glm-5.3-flash-free": {
+    "model": "glm-5.3-flash-free",
+    "disabled": false,
+    "checked_at": "2026-10-29T04:40:25.75048Z",
+    "next_check": "2026-10-29T05:40:25.75048Z",
+    "reason": "http_429",
+    "channel": "anonymous",
+    "probe_version": 1,
+    "auto_effort": {},
+    "effort_checked_at": "0001-01-01T00:00:00Z"
+  },
+  "mimo-v2.6-flash-free": {
+    "model": "mimo-v2.6-flash-free",
+    "disabled": false,
+    "checked_at": "2026-10-29T04:40:26.1063669Z",
+    "next_check": "2026-10-29T05:40:26.1063669Z",
+    "reason": "http_429",
+    "channel": "anonymous",
+    "probe_version": 1,
+    "auto_effort": {},
+    "effort_checked_at": "0001-01-01T00:00:00Z"
+  },
+  "nemotron-3.5-lightning-free": {
+    "model": "nemotron-3.5-lightning-free",
+    "disabled": false,
+    "checked_at": "2026-10-29T04:40:26.3583839Z",
+    "next_check": "2026-10-29T05:40:26.3583839Z",
+    "reason": "http_429",
+    "channel": "anonymous",
+    "probe_version": 1,
+    "auto_effort": {},
+    "effort_checked_at": "0001-01-01T00:00:00Z"
+  },
+  "nemotron-3.5-super-vl-free": {
+    "model": "nemotron-3.5-super-vl-free",
+    "disabled": false,
+    "checked_at": "2026-10-29T04:40:26.6498755Z",
+    "next_check": "2026-10-29T05:40:26.6498755Z",
+    "reason": "http_429",
+    "channel": "anonymous",
+    "probe_version": 1,
+    "auto_effort": {},
+    "effort_checked_at": "0001-01-01T00:00:00Z"
+  }
+}

@@ -1,0 +1,6 @@
+data: {"id":"02179324720379147fde1ce057a4e39ca4c3f804f8e42e03147f3","object":"chat.completion.chunk","created":1793247204,"model":"deepseek-v4.1-flash-free","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":""}}],"usage":null}
+
+data: {"id":"02179324720379147fde1ce057a4e39ca4c3f804f8e42e03147f3","object":"chat.completion.chunk","created":1793247204,"model":"deepseek-v4.1-flash-free","choices":[{"index":0,"finish_reason":"stop","delta":{"role":"assistant","content":"OK","reasoning_content":""}}],"usage":{"prompt_tokens":55,"completion_tokens":2,"total_tokens":57,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0},"cost":0,"opencode":{"billing_source":"free","list_cost":0,"tokens":{"input":55,"output":2,"reasoning":0,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0}}}}
+
+data: [DONE]
+

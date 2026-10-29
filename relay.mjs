@@ -357,7 +357,7 @@ async function readBody(req) {
  * The attempt timeout bounds only the time until headers arrive; once fetch
  * resolves the deadline is settled and the stream runs unbounded.
  */
-const RETRYABLE_STATUS = 429;
+const RETRYABLE_STATUS = new Set([429, 407]);
 
 async function attemptUpstream(candidate, upstreamUrl, config, forwardInit) {
 	const proxyInit = candidate === DIRECT ? {} : { proxy: candidate };
@@ -375,13 +375,13 @@ async function attemptUpstream(candidate, upstreamUrl, config, forwardInit) {
 	}
 	deadline.settle();
 
-	if (upstream.status === RETRYABLE_STATUS) {
+	if (RETRYABLE_STATUS.has(upstream.status)) {
 		try {
 			await upstream.body?.cancel();
 		} catch {
 			// Releasing the discarded attempt is best-effort only.
 		}
-		throw new Error(`upstream ${RETRYABLE_STATUS} via ${candidate}`);
+		throw new Error(`upstream ${upstream.status} via ${candidate}`);
 	}
 	return upstream;
 }

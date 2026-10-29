@@ -1,0 +1,32 @@
+{
+  "groups": [
+    {
+      "id": "sota",
+      "alias": "sota",
+      "order": [
+        "deepseek-v4.1-flash",
+        "glm-5.3",
+        "grok-4.6",
+        "kimi-k3",
+        "qwen3.8-max"
+      ],
+      "current": "deepseek-v4.1-flash",
+      "generation": 2,
+      "paused": {},
+      "available": null,
+      "switches": null
+    },
+    {
+      "id": "sweet",
+      "alias": "sweet",
+      "order": [],
+      "current": "",
+      "generation": 1,
+      "paused": {},
+      "available": null,
+      "switches": null
+    }
+  ],
+  "attempts": null,
+  "first_output_seconds": 30
+}
