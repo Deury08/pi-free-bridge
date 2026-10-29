@@ -524,6 +524,8 @@ async function forward(req, res, pathname, config) {
 		}
 		res.end();
 	} catch (err) {
+		process.stderr.write(`pi-free-bridge relay: forward error — ${err && err.message ? err.message : String(err)}
+`);
 		sendJson(res, 502, { error: { message: err && err.message ? err.message : String(err) } });
 	}
 }
