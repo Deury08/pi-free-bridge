@@ -3,7 +3,9 @@ package egress
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -15,6 +17,7 @@ type CoordinatorConfig struct {
 	MaxAttempts    int
 	LocalConfig    LocalConfig
 	WarpConfig     WarpConfig
+	WarpProxy      string        // URL of warp-minimal HTTP proxy (e.g. "http://127.0.0.1:8789")
 }
 
 // Coordinator manages the fallback chain: Local -> WARP -> Local (with backoff).
@@ -100,15 +103,17 @@ func (c *Coordinator) RoundTrip(ctx context.Context, req *http.Request) (*http.R
 		continue
 	}
 
-	// Phase 2: WARP pool
-	if c.warp.config.Enabled {
-		for attempts < c.config.MaxAttempts {
-			if !c.warp.IsAvailable() {
-				break
+	// Phase 2: WARP pool via warp-minimal HTTP proxy
+	if c.config.WarpProxy != "" && !c.local.IsCooledDown() {
+		warpProxyURL, err := url.Parse(c.config.WarpProxy)
+		if err == nil {
+			attempts++
+			resp, err := c.roundTripViaWarpProxy(ctx, req, warpProxyURL)
+			if err == nil && resp != nil {
+				c.attempts = attempts
+				return resp, nil, "warp"
 			}
-			// TODO: Implement WARP round trip when WARP is fully implemented
-			// For now, skip to phase 3
-			break
+			lastResp, lastErr = resp, err
 		}
 	}
 
@@ -154,6 +159,31 @@ func (c *Coordinator) RoundTrip(ctx context.Context, req *http.Request) (*http.R
 	return nil, lastErr, "failed"
 }
 
+// roundTripViaWarpProxy forwards the request through the warp-minimal HTTP proxy.
+func (c *Coordinator) roundTripViaWarpProxy(ctx context.Context, req *http.Request, proxyURL *url.URL) (*http.Response, error) {
+	transport := &http.Transport{
+		Proxy:           http.ProxyURL(proxyURL),
+		DialContext:     (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		ForceAttemptHTTP2: false,
+		IdleConnTimeout: 90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	// Rewrite the request to go through the proxy: keep the target URL as-is,
+	// the transport's Proxy will route it through warp-minimal.
+	outReq := req.Clone(ctx)
+	outReq.Host = req.URL.Host
+
+	return client.Do(outReq)
+}
+
 // getCooldownUntil is a helper to check cooldown expiry (for coordinator).
 func (e *LocalEgress) getCooldownUntil() time.Time {
 	e.mu.Lock()
@@ -185,6 +215,7 @@ func (c *Coordinator) HealthStatus() map[string]any {
 		"local_cooldown":    c.local.IsCooledDown(),
 		"warp_enabled":      c.warp.config.Enabled,
 		"warp_available":    c.warp.IsAvailable(),
+		"warp_proxy":        c.config.WarpProxy,
 		"strategy":          c.config.Strategy,
 		"max_attempts":      c.config.MaxAttempts,
 		"last_attempts":     c.attempts,

@@ -25,7 +25,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/relay.test.mjs",
-    "postinstall": "node scripts/postinstall.mjs"
+    "postinstall": "node scripts/postinstall.mjs",
+    "postinstall:warp": "PI_FREE_BRIDGE_WARP=true node scripts/postinstall.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

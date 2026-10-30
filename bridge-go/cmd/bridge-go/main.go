@@ -28,6 +28,7 @@ type Config struct {
 	WarpEnabled    bool   `json:"warp_enabled"`
 	WarpPoolSize   int    `json:"warp_pool_size"`
 	WarpStack      string `json:"warp_stack"`
+	WarpProxy      string `json:"warp_proxy"`
 }
 
 func main() {
@@ -83,6 +84,7 @@ func main() {
 			Stack:      cfg.WarpStack,
 			SourceIPv6: "",
 		},
+		WarpProxy: cfg.WarpProxy,
 	})
 	if err != nil {
 		log.Fatalf("create coordinator: %v", err)
@@ -101,13 +103,12 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("Shutdown signal received")
-		context.Background()
+
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {

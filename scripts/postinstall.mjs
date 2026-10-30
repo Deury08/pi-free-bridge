@@ -17,6 +17,10 @@ const RELEASE_BASE = "https://github.com/Deury08/pi-free-bridge/releases/downloa
 const REPO = "Deury08/pi-free-bridge";
 const BINARY_NAME = "bridge-go";
 
+const WARP_RELEASE_BASE = "https://github.com/Deury08/warp-minimal/releases/download";
+const WARP_VERSION = "v0.1.0";
+const WARP_BINARY_NAME = "warp-minimal";
+
 const PLATFORM_MAP = {
   "win32-x64": "windows_amd64",
   "win32-arm64": "windows_arm64",
@@ -37,8 +41,18 @@ function getAssetName(platformKey, version) {
   if (!mapped) {
     throw new Error(`Unsupported platform: ${platformKey}`);
   }
-  const ext = platform === "win32" ? ".exe" : "";
+  const ext = process.platform === "win32" ? ".exe" : "";
   return `bridge-go_${version}_${mapped}${ext === ".exe" ? ".zip" : ".tar.gz"}`;
+}
+
+function getWarpAssetName(platformKey, version) {
+  const mapped = PLATFORM_MAP[platformKey];
+  if (!mapped) {
+    throw new Error(`Unsupported platform: ${platformKey}`);
+  }
+  const ext = process.platform === "win32" ? ".exe" : "";
+  const archiveExt = process.platform === "win32" ? ".zip" : ".tar.gz";
+  return `warp-minimal_${version}_${mapped}${ext}${archiveExt}`;
 }
 
 function downloadFile(url, dest) {
@@ -74,6 +88,39 @@ function extractArchive(archivePath, destDir) {
     if (result.error || result.status !== 0) {
       throw new Error(`Failed to extract tar.gz`);
     }
+  }
+}
+
+async function downloadWarpBinary() {
+  console.log("[postinstall] Installing warp-minimal (optional)...");
+
+  const platformKey = getPlatformKey();
+  const assetName = getWarpAssetName(platformKey, WARP_VERSION);
+  const downloadUrl = `${WARP_RELEASE_BASE}/${WARP_VERSION}/${assetName}`;
+  const archivePath = join(BIN_DIR, assetName);
+  const binaryPath = join(BIN_DIR, WARP_BINARY_NAME + (process.platform === "win32" ? ".exe" : ""));
+
+  console.log(`[postinstall] Platform: ${platformKey}`);
+  console.log(`[postinstall] Downloading: ${downloadUrl}`);
+
+  if (!existsSync(BIN_DIR)) {
+    mkdirSync(BIN_DIR, { recursive: true });
+  }
+
+  try {
+    await downloadFile(downloadUrl, archivePath);
+    console.log("[postinstall] Download complete, extracting...");
+    extractArchive(archivePath, BIN_DIR);
+
+    if (process.platform !== "win32") {
+      chmodSync(binaryPath, 0o755);
+    }
+
+    unlinkSync(archivePath);
+    console.log(`[postinstall] warp-minimal installed to ${binaryPath}`);
+  } catch (err) {
+    console.error("[postinstall] Failed to download warp-minimal:", err.message);
+    console.log("[postinstall] warp-minimal is optional; you can build it from source in warp-minimal/");
   }
 }
 
@@ -127,6 +174,14 @@ async function main() {
       process.exit(1);
     }
   }
+}
+
+const wantWarp =
+  process.env.PI_FREE_BRIDGE_WARP === "true" ||
+  process.argv.includes("--warp");
+
+if (wantWarp) {
+  await downloadWarpBinary();
 }
 
 main().catch((err) => {
