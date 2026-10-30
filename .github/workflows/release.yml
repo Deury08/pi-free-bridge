@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            asset: bridge-go
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+            asset: bridge-go
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            asset: bridge-go
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            asset: bridge-go
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            asset: bridge-go
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            asset: bridge-go
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build bridge-go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          out="bridge-go${{ matrix.ext }}"
+          cd bridge-go
+          go build -ldflags="-s -w" -o "$out" ./cmd/bridge-go
+          cd ..
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" "bridge-go/bridge-go${{ matrix.ext }}"
+          else
+            tar -czf "bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" -C bridge-go "bridge-go${{ matrix.ext }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+            bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec sha256sum {} \; > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+            artifacts/checksums.txt
+          generate_release_notes: true
