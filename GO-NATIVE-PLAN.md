@@ -98,3 +98,29 @@ Los comandos del usuario en Pi deben ser exactamente los mismos:
 - Docker: solo documentar por ahora, implementar después
 - Warp: apagado por ahora
 - Rama master intacta (producción)
+
+## Decisión: Cosecho híbrido de session ID
+
+**Quién cosecha:** Pi (máquina del usuario) con fallback en bridge-go (si está en la misma máquina).
+
+**Flujo:**
+1. Pi cosecha el session ID de `~/.local/share/opencode/storage/session_diff/` (más reciente por mtime)
+2. Pi pasa el ID a bridge-go vía variable de entorno `PI_FREE_BRIDGE_SESSION_ID` al hacer spawn
+3. bridge-go revisa la env var primero; si no hay, intenta cosechar localmente (fallback para misma máquina)
+4. Si no hay ID en ningún lado → error con instrucciones claras
+
+**Beneficio:** Funciona en Docker y máquinas remotas (Pi pasa el ID). Funciona en misma máquina (bridge-go cosecha solo). Sin latencia adicional (~3 ms en startup, 0 ms por request).
+
+**Pool de IDs:** No se contempla. Los IDs de OpenCode no expiran (confianza permanente). Un solo ID cosechado es suficiente. Mintear IDs sintéticos no funciona (el gate los rechaza ~83% de las veces).
+
+## TODO: Rutas de cosecho multi-OS
+
+Las rutas actuales de cosecho son específicas de Linux/macOS:
+- `~/.local/share/opencode/storage/session_diff/`
+- `~/.local/share/opencode/opencode.db`
+
+En Windows, OpenCode puede guardar en:
+- `%APPDATA%\opencode\` o `%LOCALAPPDATA%\opencode\`
+- `C:\Users\<user>\.local\share\opencode\` (si usa paths estilo Unix)
+
+**Pendiente:** Verificar las rutas reales de OpenCode en Windows y hacer el cosecho multi-plataforma en ambas capas (Pi en TS y bridge-go en Go). Esto se trabajará después, cuando se implemente la limpieza de la rama.
