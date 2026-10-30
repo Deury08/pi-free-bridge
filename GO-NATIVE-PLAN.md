@@ -124,3 +124,43 @@ Conclusión: No se necesita lógica multi-OS. La ruta ~/.local/share/opencode/ f
 4. Implementar cosecho híbrido: Pi cosecha + pasa via env var, bridge-go fallback
 5. Publicar tag v0.1.0 para disparar el release
 6. Actualizar GO-NATIVE.md con las instrucciones finales
+
+## Rutas de cosecho multi-OS (investigado en internet)
+
+OpenCode usa `xdg-basedir` que devuelve `~/.local/share` en **todos los OS** (incluyendo Windows). No usa `%APPDATA%` ni `%LOCALAPPDATA%`.
+
+### Ruta base
+
+```
+$XDG_DATA_HOME/opencode/    (si XDG_DATA_HOME está seteado)
+~/.local/share/opencode/     (fallback, en Linux, macOS Y Windows)
+```
+
+Verificado por:
+- Docs oficiales de OpenCode: Windows → `%USERPROFILE%\.local\share\opencode`
+- Múltiples herramientas third-party que replican el comportamiento de OpenCode
+- El paquete npm `xdg-basedir` que OpenCode usa internamente
+
+### Rutas de cosecho
+
+| Recurso | Ruta | Existe en Windows |
+|---------|------|-------------------|
+| session_diff | `~/.local/share/opencode/storage/session_diff/` | ✅ Verificado |
+| opencode.db | `~/.local/share/opencode/opencode.db` | ✅ Verificado |
+| auth.json | `~/.local/share/opencode/auth.json` | ✅ Verificado |
+
+### Override
+
+OpenCode también soporta `OPENCODE_DATA_DIR` que overridea toda la ruta de datos.
+
+### Conclusión para Pi (TS) y bridge-go (Go)
+
+No se necesita lógica multi-OS. Ambos pueden resolver la ruta con:
+
+- **Go:** `os.UserHomeDir()` + `/.local/share/opencode/` (con check de `XDG_DATA_HOME` y `OPENCODE_DATA_DIR`)
+- **TS:** `os.homedir()` + `/.local/share/opencode/` (con check de `process.env.XDG_DATA_HOME` y `process.env.OPENCODE_DATA_DIR`)
+
+La prioridad de override es:
+1. `OPENCODE_DATA_DIR` (override completo)
+2. `XDG_DATA_HOME` + `/opencode`
+3. `~/.local/share/opencode` (default, todos los OS)
