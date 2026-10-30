@@ -71,6 +71,55 @@ pi -p --no-session --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exact
 
 Si bridge-go no está disponible, el postinstall intenta compilarlo desde el código fuente si Go está instalado.
 
+## Opciones de instalación (para el usuario final)
+
+### Opción 1: Pre-built binary (recomendado)
+
+Publicar un release con tag `v*` en GitHub. El workflow `.github/workflows/release.yml` compila `bridge-go` para 6 plataformas (Windows/macOS/Linux × amd64/arm64) y los sube como release assets.
+
+El `postinstall.mjs` descarga automáticamente el binario correcto para la plataforma del usuario desde:
+```
+https://github.com/Deury08/pi-free-bridge/releases/download/v0.1.0/bridge-go_v0.1.0_<platform>.zip (o .tar.gz)
+```
+
+Para publicar un release:
+```bash
+# Desde la rama go-native:
+git tag v0.1.0
+git push origin v0.1.0
+go-native
+# El workflow de GitHub Actions se dispara solo y crea el release
+```
+
+### Opción 2: Compilar desde código fuente (requiere Go)
+
+Si no hay release disponible, el postinstall intenta compilar bridge-go desde `bridge-go/`:
+```bash
+# Instalar Go (si no está)
+# Windows: https://go.dev/dl/
+# Luego instalar la extensión
+pi install git:github.com/Deury08/pi-free-bridge#go-native
+# postinstall detecta que no hay binario y ejecuta 'go build'
+```
+
+### Opción 3: Compilar y copiar manualmente
+
+```bash
+git clone -b go-native https://github.com/Deury08/pi-free-bridge.git
+cd pi-free-bridge/bridge-go
+go build -o bridge-go.exe ./cmd/bridge-go
+cd ..
+pi install C:\ruta\a\pi-free-bridge
+```
+
+### Opción 4: Usar un binario ya compilado
+
+Si ya tenés `bridge-go.exe` (o el equivalente para tu OS), copialo a:
+- `node_modules/.bin/bridge-go.exe` (si instalaste con npm)
+- O `bridge-go/bridge-go.exe` (si instalaste por ruta local)
+
+El postinstall y la extensión buscan el binario en ambos lugares.
+
 ## Variables de entorno relevantes
 
 | Variable | Default | Descripción |
