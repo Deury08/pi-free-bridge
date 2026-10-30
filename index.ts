@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -324,6 +324,36 @@ function writeBridgeConfig(patch: BridgeConfig): void {
 	}
 }
 
+/** Harvest the most recent OpenCode session id from
+ *  ~/.local/share/opencode/storage/session_diff/ses_*.json (by mtime). */
+function harvestSessionId(): string | undefined {
+	const diffDir = join(homedir(), ".local", "share", "opencode", "storage", "session_diff");
+	if (!existsSync(diffDir)) return undefined;
+	let entries: string[];
+	try {
+		entries = readdirSync(diffDir);
+	} catch {
+		return undefined;
+	}
+	let newestId: string | undefined;
+	let newestMtime = 0;
+	for (const name of entries) {
+		if (!name.startsWith("ses_") || !name.endsWith(".json")) continue;
+		const id = name.slice(0, -".json".length);
+		let mtime: number;
+		try {
+			mtime = statSync(join(diffDir, name)).mtimeMs;
+		} catch {
+			continue;
+		}
+		if (newestId === undefined || mtime > newestMtime) {
+			newestId = id;
+			newestMtime = mtime;
+		}
+	}
+	return newestId;
+}
+
 /** S30/S34: the package ships no session id. Only an explicit override is
  *  resolved here; otherwise bridge-go harvests one from the OpenCode store at
  *  startup. */
@@ -333,6 +363,9 @@ function resolveSessionId(): { sessionId?: string; source: string } {
 
 	const fromConfig = readBridgeConfig().sessionId?.trim();
 	if (fromConfig) return { sessionId: fromConfig, source: "config" };
+
+	const harvested = harvestSessionId();
+	if (harvested) return { sessionId: harvested, source: "harvested" };
 
 	return { source: "none" };
 }
@@ -575,6 +608,8 @@ function bridgeGoEnv(options: BridgeGoOptions): Record<string, string | undefine
 	if (options.sessionId) {
 		env.BRIDGE_GO_SESSION = options.sessionId;
 		env.BRIDGE_GO_SESSION_SOURCE = options.sessionSource ?? "env";
+		// Pass harvested id via the env var bridge-go reads as priority 1.
+		env.PI_FREE_BRIDGE_SESSION_ID = options.sessionId;
 	} else {
 		delete env.BRIDGE_GO_SESSION;
 		delete env.BRIDGE_GO_SESSION_SOURCE;
@@ -959,10 +994,11 @@ const gateStreamSimple = (async (
 	// composer runs this handler behind lazyStream, which awaits the result
 	// before forwarding events, so starting bridge-go asynchronously is safe.
 	try {
+		const session = resolveSessionId();
 		await ensureBridgeGo({
 			port: BRIDGE_GO_PORT,
-			sessionId: undefined,
-			sessionSource: undefined,
+			sessionId: session.sessionId,
+			sessionSource: session.source,
 			upstream: UPSTREAM_URL,
 			cwd: process.cwd(),
 			proxy: bridgeGoProxyOptions(),
