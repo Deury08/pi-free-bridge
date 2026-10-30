@@ -18,17 +18,26 @@ type Session struct {
 	Holder    string
 }
 
-// SessionManager manages synthetic sessions with 30min TTL.
+// SessionManager manages sessions with 30min TTL.
+// When seedID is set (harvested from OpenCode's local store), it is used as
+// the session ID instead of minting a synthetic one. The gate only trusts IDs
+// that the official OpenCode client created.
 type SessionManager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	ttl      time.Duration
+	seedID   string
 }
 
-func NewSessionManager(ttl time.Duration) *SessionManager {
+func NewSessionManager(ttl time.Duration, seedID ...string) *SessionManager {
+	var id string
+	if len(seedID) > 0 {
+		id = seedID[0]
+	}
 	return &SessionManager{
 		sessions: make(map[string]*Session),
 		ttl:      ttl,
+		seedID:   id,
 	}
 }
 
@@ -39,7 +48,10 @@ func (m *SessionManager) GetOrCreate(holder string) *Session {
 	if s, ok := m.sessions[holder]; ok && now.Sub(s.CreatedAt) < m.ttl {
 		return s
 	}
-	id := newSessionID()
+	id := m.seedID
+	if id == "" {
+		id = newSessionID()
+	}
 	s := &Session{ID: id, CreatedAt: now, Holder: holder}
 	m.sessions[holder] = s
 	return s
