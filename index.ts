@@ -2,7 +2,7 @@ import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-age
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
@@ -432,8 +432,12 @@ function resolveBridgeGoBin(): string | undefined {
 	const moduleBin = join(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", ".bin", binary);
 	if (existsSync(moduleBin)) return moduleBin;
 
+	// Check bridge-go/ directory (built locally)
+	const localBin = join(dirname(fileURLToPath(import.meta.url)), "bridge-go", binary);
+	if (existsSync(localBin)) return localBin;
+
 	// Check PATH
-	for (const entry of (process.env.PATH ?? "").split(";")) {
+	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
 		const directory = entry.replace(/^"|"$/g, "");
 		if (!directory) continue;
 		const candidate = join(directory, binary);
@@ -951,6 +955,23 @@ const gateStreamSimple = (async (
 	context: GateContext,
 	options?: Record<string, unknown>,
 ) => {
+	// Ensure bridge-go is running before the first request. Pi's provider
+	// composer runs this handler behind lazyStream, which awaits the result
+	// before forwarding events, so starting bridge-go asynchronously is safe.
+	try {
+		await ensureBridgeGo({
+			port: BRIDGE_GO_PORT,
+			sessionId: undefined,
+			sessionSource: undefined,
+			upstream: UPSTREAM_URL,
+			cwd: process.cwd(),
+			proxy: bridgeGoProxyOptions(),
+		});
+	} catch (err) {
+		console.error(`pi-free-bridge: bridge-go not ready — ${(err as Error).message}`);
+		throw err;
+	}
+
 	const compat = await loadCompat();
 	if (!compat) {
 		throw new Error(
@@ -1027,19 +1048,20 @@ export default function (pi: ExtensionAPI) {
 
 	g[REG_KEY] = true;
 
-	// Probe bridge-go early so the first request gets a clear diagnostic if it
-	// isn't running. A failure is reported once and does not take Pi down.
+	// Start bridge-go early so the first request does not pay the spawn cost.
+	// A failure is reported once and retried by gateStreamSimple on the first
+	// real request; it must never take Pi down at startup.
 	if (process.env.PI_FREE_BRIDGE_DRY_RUN !== "1") {
-		void (async () => {
-			const healthy = await probeBridgeGo(BRIDGE_GO_PORT);
-			if (healthy !== "healthy") {
-				console.error(
-					`pi-free-bridge: bridge-go is not reachable on ${BRIDGE_GO_URL}. ` +
-						`Start it (e.g. from bridge-go/ with 'go run ./cmd/bridge-go') ` +
-						"or set PI_FREE_BRIDGE_BRIDGE_GO_PORT to a running instance.",
-				);
-			}
-		})();
+		void ensureBridgeGo({
+			port: BRIDGE_GO_PORT,
+			sessionId: session.sessionId,
+			sessionSource: session.source,
+			upstream: UPSTREAM_URL,
+			cwd: process.cwd(),
+			proxy: bridgeGoProxyOptions(),
+		}).catch((err) => {
+			console.error(`pi-free-bridge: bridge-go not ready — ${(err as Error).message}`);
+		});
 	}
 
 	// Keep the picker able to see the models this bridge just registered.
@@ -1130,6 +1152,27 @@ export default function (pi: ExtensionAPI) {
 				`pi-free-bridge: ${discovered.models.length} free models from ${discovered.source}`,
 				...discovered.models.map((m) => `  ${PROVIDER}/${m.id}`),
 			];
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("free-bridge-proxy", {
+		description: "Test bridge-go connectivity: reachability, latency",
+		handler: async (_args: string, ctx) => {
+			const lines = ["pi-free-bridge proxy (bridge-go)"];
+			const start = Date.now();
+			const health = await fetchBridgeGoHealth(BRIDGE_GO_PORT);
+			const latency = Date.now() - start;
+			if (!health) {
+				lines.push(`  bridge-go: DEAD — could not reach http://${BRIDGE_GO_HOST}:${BRIDGE_GO_PORT}/health`);
+				ctx.ui.notify(lines.join("\n"), "error");
+				return;
+			}
+			lines.push(`  bridge-go: ok (HTTP 200, ${latency} ms)`);
+			lines.push(`  service:   ${health.sessionId ? "bridge-go" : "unknown"}`);
+			lines.push(`  session:   ${health.sessionId ?? "MISSING"}`);
+			lines.push(`  source:    ${health.sessionSource ?? "unknown"}`);
+			lines.push(`  url:       ${BRIDGE_GO_URL}`);
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});

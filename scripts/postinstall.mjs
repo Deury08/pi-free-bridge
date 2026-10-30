@@ -170,8 +170,22 @@ async function main() {
       }
       console.log("[postinstall] Using locally built binary");
     } else {
-      console.warn("[postinstall] No bridge-go binary available. Run 'go build -o bridge-go ./cmd/bridge-go' in bridge-go/");
-      process.exit(1);
+      // Try to build from source if Go is available.
+      console.log("[postinstall] Attempting to build bridge-go from source...");
+      const buildResult = spawnSync("go", ["build", "-o", localBinary, "./cmd/bridge-go"], {
+        cwd: BRIDGE_GO_DIR,
+        stdio: "inherit",
+      });
+      if (!buildResult.error && buildResult.status === 0 && existsSync(localBinary)) {
+        copyFileSync(localBinary, binaryPath);
+        if (process.platform !== "win32") {
+          chmodSync(binaryPath, 0o755);
+        }
+        console.log("[postinstall] Built bridge-go from source");
+      } else {
+        console.warn("[postinstall] No bridge-go binary available. Install Go and run 'go build -o bridge-go ./cmd/bridge-go' in bridge-go/");
+        process.exit(1);
+      }
     }
   }
 }
