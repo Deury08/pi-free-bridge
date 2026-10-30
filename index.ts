@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, chmodSync, unlinkSync } from "node:fs";
+import https from "node:https";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -390,12 +391,14 @@ function resolveLiveIds(): { liveIds: Set<string>; source: string } {
 // separately. The extension only probes its /health endpoint to report a clear
 // error if it isn't running.
 
+const PACKAGE_VERSION = "0.1.0";
+
 const BRIDGE_GO_DEFAULT_PORT = 8790;
 const BRIDGE_GO_HOST = "127.0.0.1";
-const BRIDGE_GO_SERVICE = "bridge-go";
+const BRIDGE_GO_SERVICE = "pi-free-bridge";
 
 /** The bridge-go binary ships next to this file (see `package.json → files`). */
-const BRIDGE_GO_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "bridge-go", "bridge-go");
+const BRIDGE_GO_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "bridge-go", "pi-free-bridge");
 
 /** How long bridge-go may take to print its listening line. */
 const BRIDGE_GO_START_TIMEOUT_MS = 5000;
@@ -453,32 +456,120 @@ function bridgeGoHealthUrl(port: number): string {
 	return `http://${BRIDGE_GO_HOST}:${port}/health`;
 }
 
-/** Resolve the bridge-go binary: PI_FREE_BRIDGE_BINARY, then node_modules/.bin,
- *  then PATH. */
-function resolveBridgeGoBin(): string | undefined {
-	const override = process.env.PI_FREE_BRIDGE_BINARY?.trim();
-	if (override && existsSync(override)) return override;
+/** Detect OS and arch for download. */
+function detectPlatform(): { os: string; arch: string } {
+	const osMap: Record<string, string> = { win32: "windows", linux: "linux", darwin: "darwin" };
+	const archMap: Record<string, string> = { x64: "amd64", arm64: "arm64" };
+	return { os: osMap[process.platform] ?? process.platform, arch: archMap[process.arch] ?? process.arch };
+}
 
-	const binary = process.platform === "win32" ? "bridge-go.exe" : "bridge-go";
+/** Resolve the persistent binary directory. */
+function binaryDir(): string {
+	return join(homedir(), ".pi", "agent", "pi-free-bridge", "bin");
+}
 
-	// Check node_modules/.bin first (postinstall location)
+/** Resolve the bridge-go binary path (preferred persistent location first). */
+function resolveBinaryPath(): string | undefined {
+	const binary = process.platform === "win32" ? "pi-free-bridge.exe" : "pi-free-bridge";
+	const persistent = join(binaryDir(), binary);
+	if (existsSync(persistent)) return persistent;
+
 	const moduleBin = join(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", ".bin", binary);
 	if (existsSync(moduleBin)) return moduleBin;
 
-	// Check bridge-go/ directory (built locally)
 	const localBin = join(dirname(fileURLToPath(import.meta.url)), "bridge-go", binary);
 	if (existsSync(localBin)) return localBin;
 
-	// Check PATH
 	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
 		const directory = entry.replace(/^"|"$/g, "");
 		if (!directory) continue;
 		const candidate = join(directory, binary);
 		if (existsSync(candidate)) return candidate;
 	}
-
 	return undefined;
 }
+
+/** Resolve the bridge-go binary: PI_FREE_BRIDGE_BINARY, then resolveBinaryPath. */
+function resolveBridgeGoBin(): string | undefined {
+	const override = process.env.PI_FREE_BRIDGE_BINARY?.trim();
+	if (override && existsSync(override)) return override;
+	return resolveBinaryPath();
+}
+
+/** Get binary version by running --version. */
+function getBinaryVersion(binaryPath: string): string | undefined {
+	try {
+		const out = execFileSync(binaryPath, ["--version"], { encoding: "utf-8", timeout: 5000 });
+		const m = out.match(/v[0-9]+\.[0-9]+\.[0-9]+/);
+		return m ? m[0] : out.trim();
+	} catch {
+		return undefined;
+	}
+}
+
+/** Download binary from GitHub Releases. */
+async function downloadBinary(targetPath: string, version: string, ctx?: any): Promise<void> {
+	const { os, arch } = detectPlatform();
+	const platformKey = `${os}_${arch}`;
+	const ext = process.platform === "win32" ? "zip" : "tar.gz";
+	const assetName = `pi-free-bridge_v${version}_${platformKey}.${ext}`;
+	const url = `https://github.com/Deury08/pi-free-bridge/releases/download/v${version}/${assetName}`;
+	const dir = dirname(targetPath);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	const archivePath = join(dir, assetName);
+
+	ctx?.ui?.notify?.(`Downloading pi-free-bridge ${version}...`, "info");
+
+	await new Promise<void>((resolve, reject) => {
+		https.get(url, (res) => {
+			if (res.statusCode !== 200) {
+				reject(new Error(`HTTP ${res.statusCode}: ${url}`));
+				return;
+			}
+			const chunks: Buffer[] = [];
+			res.on("data", (c: Buffer) => chunks.push(c));
+			res.on("end", () => {
+				writeFileSync(archivePath, Buffer.concat(chunks));
+				resolve();
+			});
+		}).on("error", reject);
+	});
+
+	// extract
+	if (ext === "zip") {
+		execFileSync("powershell", ["-Command", `Expand-Archive -Path "${archivePath}" -DestinationPath "${dir}" -Force`], { stdio: "inherit" });
+	} else {
+		execFileSync("tar", ["-xzf", archivePath, "-C", dir], { stdio: "inherit" });
+	}
+
+	// move binary if needed
+	const extracted = join(dir, process.platform === "win32" ? "pi-free-bridge.exe" : "pi-free-bridge");
+	if (extracted !== targetPath && existsSync(extracted)) {
+		// rename
+		const fs = await import("node:fs");
+		fs.renameSync(extracted, targetPath);
+	}
+	if (process.platform !== "win32") chmodSync(targetPath, 0o755);
+	try { unlinkSync(archivePath); } catch {}
+	ctx?.ui?.notify?.(`pi-free-bridge ${version} installed to ${targetPath}`, "info");
+}
+
+/** Ensure binary exists, downloading on demand. */
+async function ensureBinary(pi?: any, ctx?: any): Promise<string> {
+	let path = resolveBinaryPath();
+	const version = PACKAGE_VERSION;
+	if (path) {
+		const v = getBinaryVersion(path);
+		if (v && v.includes(version)) return path;
+		const ok = await ctx.ui.confirm?.(`Update pi-free-bridge? (current ${v ?? "unknown"}, target v${version})`);
+		if (!ok) return path;
+	}
+	const targetPath = join(binaryDir(), process.platform === "win32" ? "pi-free-bridge.exe" : "pi-free-bridge");
+	await downloadBinary(targetPath, version, ctx);
+	return targetPath;
+}
+
+/** Update ensureBridgeGo to use ensureBinary before spawn is handled in startBridgeGo */
 
 function describeBridgeGoBin(): string {
 	const path = resolveBridgeGoBin();
@@ -631,7 +722,7 @@ async function startBridgeGo(options: BridgeGoOptions, key: string): Promise<Bri
 		);
 	}
 
-	const bin = resolveBridgeGoBin();
+	const bin = (await ensureBinary().catch(() => undefined)) ?? resolveBridgeGoBin();
 	if (!bin) {
 		throw new Error(
 			"pi-free-bridge: bridge-go binary not found. " +

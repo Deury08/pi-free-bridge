@@ -18,6 +18,9 @@ import (
 	"github.com/Deury08/pi-free-bridge/bridge-go/internal/gate"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=v0.1.0".
+var Version = "dev"
+
 // gateToolNames are the two tool names the OpenCode free-tier gate requires.
 var gateToolNames = []string{"read", "bash"}
 
@@ -87,11 +90,11 @@ type Config struct {
 
 func main() {
 	configPath := flag.String("config", "config.json", "Path to config file")
-	version := flag.Bool("version", false, "Print version and exit")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
-	if *version {
-		fmt.Println("bridge-go v0.1.0")
+	if *versionFlag {
+		fmt.Printf("pi-free-bridge %s\n", Version)
 		return
 	}
 
@@ -177,7 +180,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("bridge-go listening on %s", cfg.Listen)
+	log.Printf("pi-free-bridge listening on %s", cfg.Listen)
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}
@@ -212,7 +215,7 @@ func healthHandler(coordinator *egress.Coordinator) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		status := coordinator.HealthStatus()
 		status["ok"] = true
-		status["service"] = "bridge-go"
+		status["service"] = "pi-free-bridge"
 		json.NewEncoder(w).Encode(status)
 	}
 }
