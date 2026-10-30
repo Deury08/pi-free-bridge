@@ -6,3 +6,7 @@ node_modules/
 # not part of the package.
 big.txt
 raw_*.txt
+# Compiled binaries (built by postinstall or manually)
+bridge-go/bridge-go.exe
+bridge-go/pi-free-bridge.exe
+*.exe
