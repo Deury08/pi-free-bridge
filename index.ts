@@ -290,6 +290,14 @@ type BridgeConfig = {
 	sessionId?: string;
 	liveIds?: string[];
 	relayPort?: number;
+	/** Proxy failover pool (odd/tasks/proxy-failover.md S6). */
+	proxy?: {
+		static?: string[];
+		source?: string;
+		refreshMinutes?: number;
+		/** S12: prefer the pool even when the direct path still works. */
+		force?: boolean;
+	};
 };
 
 function readBridgeConfig(): BridgeConfig {
@@ -363,6 +371,13 @@ type RelayOptions = {
 	sessionSource?: string;
 	upstream: string;
 	cwd: string;
+	/** Proxy pool for the egress failover (S6). Explicit env wins over config. */
+	proxy?: {
+		static?: string[];
+		source?: string;
+		refreshMinutes?: number;
+		force?: boolean;
+	};
 };
 
 type RelayResult = {
@@ -420,6 +435,35 @@ function resolveBunPath(): string | undefined {
 }
 
 /** Probe a port for our own relay. `absent` means nothing is listening there. */
+
+function resolveBridgeGoPath(): string | undefined {
+	const override = process.env.PI_FREE_BRIDGE_BINARY?.trim();
+	if (override && existsSync(override)) return override;
+
+	const binary = process.platform === "win32" ? "bridge-go.exe" : "bridge-go";
+	
+	// Check node_modules/.bin first (postinstall location)
+	const moduleBin = join(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", ".bin", binary);
+	if (existsSync(moduleBin)) return moduleBin;
+
+	// Check PATH
+	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+		const directory = entry.replace(/^"|"$/g, "");
+		if (!directory) continue;
+		const candidate = join(directory, binary);
+		if (existsSync(candidate)) return candidate;
+	}
+
+	return undefined;
+}
+
+function describeBridgeGo(): string {
+	const path = resolveBridgeGoPath();
+	if (!path) return "MISSING u2014 run `npm install` or build from bridge-go/";
+	const rel = path.includes("node_modules") ? "installed" : "from PATH";
+	return `${path} (${rel})`;
+}
+
 async function probeRelay(port: number): Promise<"healthy" | "foreign" | "absent"> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 750);
@@ -527,6 +571,18 @@ function relayEnv(options: RelayOptions): Record<string, string | undefined> {
 		RELAY_CWD: options.cwd,
 	};
 
+	const proxy = options.proxy;
+	if (proxy) {
+		if (Array.isArray(proxy.static) && proxy.static.length > 0) {
+			env.RELAY_PROXY_STATIC = proxy.static.join(",");
+		}
+		if (proxy.source) env.RELAY_PROXY_SOURCE = proxy.source;
+		if (typeof proxy.refreshMinutes === "number" && proxy.refreshMinutes > 0) {
+			env.RELAY_PROXY_REFRESH_MINUTES = String(proxy.refreshMinutes);
+		}
+		if (proxy.force === true) env.RELAY_PROXY_FORCE = "1";
+	}
+
 	if (options.sessionId) {
 		env.RELAY_SESSION = options.sessionId;
 		env.RELAY_SESSION_SOURCE = options.sessionSource ?? "env";
@@ -596,8 +652,36 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 }
 
 /** Ensure a healthy relay for this port + session id, spawning one if needed. */
+/** Proxy pool from the persisted config (S6). Env already set by the user wins
+ *  at the relay, so this only forwards what the config declares. */
+function relayProxyOptions(): RelayOptions["proxy"] {
+	const proxy = readBridgeConfig().proxy;
+	if (!proxy || typeof proxy !== "object") return undefined;
+
+	const staticPool = Array.isArray(proxy.static)
+		? proxy.static.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "")
+		: undefined;
+	const source = typeof proxy.source === "string" && proxy.source.trim() !== "" ? proxy.source.trim() : undefined;
+	const refreshMinutes =
+		typeof proxy.refreshMinutes === "number" && proxy.refreshMinutes > 0 ? proxy.refreshMinutes : undefined;
+	const force = proxy.force === true;
+
+	if (!staticPool?.length && !source) return undefined;
+	return { static: staticPool, source, refreshMinutes, force };
+}
+
 async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
-	const key = `${options.port}\u0000${options.sessionId ?? ""}`;
+	// The proxy pool is part of the identity: a changed pool must not keep talking
+	// to a relay spawned with the previous one.
+	const proxyKey = options.proxy
+		? JSON.stringify([
+				options.proxy.static ?? [],
+				options.proxy.source ?? "",
+				options.proxy.refreshMinutes ?? 0,
+				options.proxy.force === true,
+			])
+		: "";
+	const key = `${options.port}\u0000${options.sessionId ?? ""}\u0000${proxyKey}`;
 
 	if (relayState?.key === key) {
 		// A relay we spawned is trusted; one we only reused may belong to another
@@ -959,6 +1043,7 @@ const gateStreamSimple = (async (
 		sessionSource: session.source,
 		upstream: UPSTREAM_URL,
 		cwd: process.cwd(),
+		proxy: relayProxyOptions(),
 	});
 
 	const compat = await loadCompat();
@@ -985,7 +1070,8 @@ function printDryRun(
 		`  registry:    ${discovered.source}`,
 		`  upstream:    ${UPSTREAM_URL}`,
 		`  relay:       ${RELAY_URL} (port ${RELAY_PORT})`,
-		`  bun:         ${resolveBunPath() ?? "MISSING"}`,
+		`  bun:         ${resolveBunPath() ?? "MISSING"}`
+`  bridge-go:   ${describeBridgeGo()}`,
 		`  api:         ${API}   apiKey: ${API_KEY}`,
 		`  session id:  ${
 			session.sessionId
@@ -1049,6 +1135,7 @@ export default function (pi: ExtensionAPI) {
 			sessionSource: session.source,
 			upstream: UPSTREAM_URL,
 			cwd: process.cwd(),
+			proxy: relayProxyOptions(),
 		}).catch((err) => {
 			console.error(`pi-free-bridge: relay not ready — ${(err as Error).message}`);
 		});
@@ -1106,6 +1193,7 @@ export default function (pi: ExtensionAPI) {
 					sessionSource: persisted ? "config" : "env",
 					upstream: UPSTREAM_URL,
 					cwd: process.cwd(),
+					proxy: relayProxyOptions(),
 				});
 			} catch (err) {
 				relayNote = ` Relay restart failed: ${(err as Error).message}`;
@@ -1175,6 +1263,55 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("free-bridge-proxy", {
+		description: "Test the proxy pool: reachability, latency and the effective egress order",
+		handler: async (_args: string, ctx) => {
+			const proxyConfig = relayProxyOptions();
+			if (!proxyConfig) {
+				ctx.ui.notify(
+					[
+						"pi-free-bridge proxy: no pool configured — egress is direct only.",
+						`  add \"proxy\" to ${BRIDGE_CONFIG_PATH}, for example:`,
+						'    { "proxy": { "static": ["http://1.2.3.4:8080"], "refreshMinutes": 30 } }',
+						"  proxies are only used when the direct path fails.",
+					].join("\n"),
+					"info",
+				);
+				return;
+			}
+
+			let payload;
+			try {
+				const res = await fetch(`http://${RELAY_HOST}:${RELAY_PORT}/proxies`, {
+					signal: AbortSignal.timeout(30_000),
+				});
+				if (!res.ok) throw new Error(`relay answered HTTP ${res.status}`);
+				payload = await res.json();
+			} catch (err) {
+				ctx.ui.notify(
+					`pi-free-bridge proxy: the relay did not answer — ${(err as Error).message}\n` +
+						"  the pool lives in the relay, so it has to be running to be tested.",
+					"error",
+				);
+				return;
+			}
+
+			const lines = [
+				"pi-free-bridge proxy",
+				`  preference: ${(payload.preference ?? []).join(" -> ")}`,
+				`  forced:     ${payload.forced ? "yes — the pool is preferred over direct" : "no — direct first"}`,
+				`  last egress: ${payload.lastEgress ?? "direct (nothing proxied yet)"}`,
+			];
+			for (const candidate of payload.candidates ?? []) {
+				const verdict = candidate.ok
+					? `ok (HTTP ${candidate.status}, ${candidate.latencyMs} ms)`
+					: `DEAD — ${candidate.error}`;
+				lines.push(`  ${candidate.candidate}: ${verdict}`);
+			}
+			ctx.ui.notify(lines.join("\n"), (payload.candidates ?? []).some((c: { ok: boolean }) => c.ok) ? "info" : "warning");
+		},
+	});
+
 	pi.registerCommand("free-bridge-doctor", {
 		description: "Diagnose and repair why the free OpenCode models are missing from the picker",
 		handler: async (_args: string, ctx) => {
@@ -1189,7 +1326,8 @@ export default function (pi: ExtensionAPI) {
 						? `${health.sessionId} (from ${health.sessionSource})`
 						: "MISSING — run OpenCode once, or set PI_FREE_BRIDGE_SESSION_ID"
 				}`,
-				`  bun:        ${resolveBunPath() ?? "MISSING"}`,
+				`  bun:        ${resolveBunPath() ?? "MISSING"}`
+`  bridge-go:   ${describeBridgeGo()}`,
 				`  relay port: ${RELAY_PORT}`,
 				`  relay:      ${describeRelay()}`,
 				`  upstream:   ${UPSTREAM_URL}`,

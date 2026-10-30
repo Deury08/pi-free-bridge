@@ -81,6 +81,7 @@ se toca.
 
 ```bash
 node --test test/relay.test.mjs          # helpers del relay — offline
+bun test/proxy-failover.e2e.mjs          # failover directo→proxy con un proxy mock
 curl http://127.0.0.1:8788/health        # relay vivo
 pi -p --no-session --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 ```
@@ -161,6 +162,12 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `PI_FREE_BRIDGE_RELAY_PORT` | Pisa el puerto del relay |
 | `PI_FREE_BRIDGE_BUN` | Ruta explícita al ejecutable de Bun |
 | `PI_FREE_BRIDGE_DRY_RUN=1` | Diagnóstico de arranque |
+| `~/.pi/agent/pi-free-bridge.json` → `proxy` | Pool de proxies del failover (ver abajo) |
+| `RELAY_PROXY_STATIC` | Lista de proxies separada por comas (pisa el config) |
+| `RELAY_PROXY_SOURCE` | URL de una lista cruda de proxies (una por línea) |
+| `RELAY_PROXY_MAX` | Tamaño máximo del pool (por defecto `5`) |
+| `RELAY_PROXY_REFRESH_MINUTES` | Cada cuánto se re-pide `RELAY_PROXY_SOURCE` (por defecto `30`) |
+| `RELAY_PROXY_TIMEOUT_MS` | Tope hasta las cabeceras de cada intento (por defecto `15000`) |
 
 Forma del archivo de config:
 
@@ -168,7 +175,12 @@ Forma del archivo de config:
 {
   "sessionId": "ses_…",
   "liveIds": ["big-pickle", "…"],
-  "relayPort": 8788
+  "relayPort": 8788,
+  "proxy": {
+    "static": ["http://1.2.3.4:8080"],
+    "source": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "refreshMinutes": 30
+  }
 }
 ```
 
@@ -347,6 +359,82 @@ porque `@earendil-works/pi-ai` lo provee el host y no se resuelve desde la
 carpeta de este paquete (un import estático falla con `ERR_MODULE_NOT_FOUND` y
 rompe los tests independientes), así que el puente no le agrega ninguna
 dependencia en runtime.
+
+## Failover por proxy (opcional)
+
+El relay sale **directo** a OpenCode como siempre. Los proxies existen solo para
+cuando la IP directa deja de servir: es un salvavidas, no el camino normal.
+
+```text
+preferencia:  directo → proxy1 → proxy2 → …
+
+1. arranque:            sale directo
+2. directo falla:       rota al primer proxy del pool
+3. un proxy anda:       se queda en ese proxy (no rota por request)
+4. ese proxy falla:     se lo descarta y pasa al siguiente
+5. todos descartados:   vuelve a probar directo
+```
+
+Reglas del pool:
+
+- Solo `http`/`https`: Bun rechaza `socks5://` con `UnsupportedProxyProtocol`
+  (medido). Una línea `host:puerto` se interpreta como `http`.
+- Un proxy que falla (error de red, HTTP 429) se descarta por una ventana igual al
+  ciclo de refresco y vuelve solo cuando el pool se refresca.
+- Los reintentos ocurren **antes** de mandar la primera cabecera al cliente: un
+  stream ya empezado nunca se reenvía.
+- Sin `proxy` configurado, el camino es exactamente el de antes (sin overhead).
+
+### Modo forzado (probar los proxies sin quemar la IP)
+
+Por defecto el pool es un salvavidas. Si querés que los proxies salgan **primero**
+aunque tu IP directa todavía tenga cuota — por ejemplo para e2e, o porque sospechás
+que te marcaron — activá el modo forzado. `directo` queda **último**, así un pool
+muerto degrada al comportamiento normal en vez de dejarte sin servicio:
+
+```text
+forzado:  proxy1 → proxy2 → … → directo
+```
+
+Tres formas de prenderlo, de más estable a más quirúrgica:
+
+| Alcance | Cómo |
+| --- | --- |
+| Relay entero (config) | `"proxy": { "force": true }` en `pi-free-bridge.json` |
+| Relay entero (env) | `RELAY_PROXY_FORCE=1` |
+| Un solo request | header `x-free-bridge-force-proxy: 1` |
+
+El header no toca estado compartido, así que es el que conviene para tests: fuerza
+el pool en esa llamada y las concurrentes quedan como estaban.
+
+### Modo test: `/free-bridge-proxy`
+
+```
+pi-free-bridge proxy
+  preference: http://1.2.3.4:8080 -> direct
+  forced:     yes — the pool is preferred over direct
+  last egress: http://1.2.3.4:8080
+  direct: ok (HTTP 200, 180 ms)
+  http://1.2.3.4:8080: ok (HTTP 200, 640 ms)
+  http://5.6.7.8:3128: DEAD — ConnectionRefused
+```
+
+Sondea `directo` y cada proxy en paralelo contra `<upstream>/models`: **cualquier**
+respuesta HTTP (aunque sea 404) prueba que el túnel anda, así no confundís un proxy
+sano con el gate enojado. `lastEgress` te dice quién sirvió la última request, que
+es la evidencia dura de que el proxy se usó de verdad.
+
+Por HTTP directo, para scripts:
+
+```bash
+curl -s http://127.0.0.1:8788/proxies | python -m json.tool
+```
+
+Verificación local del camino completo (proxy mock, sin red real):
+
+```bash
+bun test/proxy-failover.e2e.mjs
+```
 
 ## Pruebas
 
