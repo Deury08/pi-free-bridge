@@ -73,14 +73,6 @@ Una sola imagen con `pi-free-bridge` + `warp-minimal`. Solo documentar por ahora
 
 Tag `v*` en la rama `go-native` dispara `.github/workflows/release.yml` que compila `pi-free-bridge` para 6 plataformas y crea el release.
 
-## Para el próximo agente
-
-1. Limpiar la rama `go-native` (eliminar archivos innecesarios)
-2. Crear directorio `bin/` con subdirectorios por OS
-3. Actualizar `postinstall.mjs` para buscar binario en `bin/<os>/` primero
-4. Publicar tag `v0.1.0` para disparar el release
-5. Actualizar `GO-NATIVE.md` con las instrucciones finales
-
 ## Comandos Pi (sin cambios)
 
 Los comandos del usuario en Pi deben ser exactamente los mismos:
@@ -104,8 +96,8 @@ Los comandos del usuario en Pi deben ser exactamente los mismos:
 **Quién cosecha:** Pi (máquina del usuario) con fallback en bridge-go (si está en la misma máquina).
 
 **Flujo:**
-1. Pi cosecha el session ID de `~/.local/share/opencode/storage/session_diff/` (más reciente por mtime)
-2. Pi pasa el ID a bridge-go vía variable de entorno `PI_FREE_BRIDGE_SESSION_ID` al hacer spawn
+1. Pi cosecha el session ID de ~/.local/share/opencode/storage/session_diff/ (más reciente por mtime)
+2. Pi pasa el ID a bridge-go vía variable de entorno PI_FREE_BRIDGE_SESSION_ID al hacer spawn
 3. bridge-go revisa la env var primero; si no hay, intenta cosechar localmente (fallback para misma máquina)
 4. Si no hay ID en ningún lado → error con instrucciones claras
 
@@ -113,14 +105,22 @@ Los comandos del usuario en Pi deben ser exactamente los mismos:
 
 **Pool de IDs:** No se contempla. Los IDs de OpenCode no expiran (confianza permanente). Un solo ID cosechado es suficiente. Mintear IDs sintéticos no funciona (el gate los rechaza ~83% de las veces).
 
-## TODO: Rutas de cosecho multi-OS
+## Rutas de cosecho multi-OS (verificado en Windows)
 
-Las rutas actuales de cosecho son específicas de Linux/macOS:
-- `~/.local/share/opencode/storage/session_diff/`
-- `~/.local/share/opencode/opencode.db`
+Las rutas de OpenCode son iguales en todos los OS porque OpenCode usa el home directory del usuario (~ / $HOME / %USERPROFILE%):
 
-En Windows, OpenCode puede guardar en:
-- `%APPDATA%\opencode\` o `%LOCALAPPDATA%\opencode\`
-- `C:\Users\<user>\.local\share\opencode\` (si usa paths estilo Unix)
+- ~/.local/share/opencode/storage/session_diff/ (Linux, macOS, Windows)
+- ~/.local/share/opencode/opencode.db (Linux, macOS, Windows)
 
-**Pendiente:** Verificar las rutas reales de OpenCode en Windows y hacer el cosecho multi-plataforma en ambas capas (Pi en TS y bridge-go en Go). Esto se trabajará después, cuando se implemente la limpieza de la rama.
+Verificado en Windows: C:\Users\Polanco\.local\share\opencode\ existe y contiene opencode.db, storage/session_diff/, auth.json, etc.
+
+Conclusión: No se necesita lógica multi-OS. La ruta ~/.local/share/opencode/ funciona en todos los sistemas operativos. Tanto Pi (TS) como bridge-go (Go) pueden usar os.UserHomeDir() / homedir() para resolver la ruta.
+
+## Para el próximo agente
+
+1. Limpiar la rama go-native (eliminar archivos innecesarios)
+2. Crear directorio bin/ con subdirectorios por OS
+3. Actualizar postinstall.mjs para buscar binario en bin/<os>/ primero
+4. Implementar cosecho híbrido: Pi cosecha + pasa via env var, bridge-go fallback
+5. Publicar tag v0.1.0 para disparar el release
+6. Actualizar GO-NATIVE.md con las instrucciones finales
