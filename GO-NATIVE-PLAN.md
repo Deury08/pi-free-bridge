@@ -164,3 +164,73 @@ La prioridad de override es:
 1. `OPENCODE_DATA_DIR` (override completo)
 2. `XDG_DATA_HOME` + `/opencode`
 3. `~/.local/share/opencode` (default, todos los OS)
+
+## Estrategia de descarga y actualización (binario)
+
+### Principios
+- Auto-update **OFF por defecto**. El usuario debe activarlo explícitamente.
+- Siempre se **pregunta** antes de descargar o actualizar. Nunca se fuerza.
+- Variable de entorno: `PI_FREE_BRIDGE_AUTO_UPDATE=1` para activar.
+- Comando `/free-bridge-auto-update` para togglear desde Pi.
+- Comando `/free-bridge-update` para forzar check manual.
+
+### Nombre del binario
+- Siempre `pi-free-bridge` (con `.exe` en Windows). Sin versión en el nombre.
+- Versión embebida via ldflags: `pi-free-bridge --version` → `v0.1.0`
+
+### Ubicación del binario
+- `~/.pi/agent/pi-free-bridge/bin/pi-free-bridge` (persistente, no se borra con npm clean)
+
+### Flujo de arranque
+```
+Pi arranca
+  └─ index.ts se carga
+     └─ ¿Existe pi-free-bridge?
+        ├─ Sí → ¿Auto-update activo?
+        │       ├─ No → saltar (usar binario actual)
+        │       └─ Sí → ¿Pasaron más de 24h desde último check?
+        │              ├─ No → saltar
+        │              └─ Sí → verificar GitHub Releases
+        │                     ├─ Sin cambios → guardar timestamp → listo
+        │                     └─ Versión nueva → "¿Actualizar?" → [Sí/No]
+        └─ No → "¿Descargar? (~12 MB)" → [Sí/No]
+               ├─ Sí → descargar → verificar → guardar → arrancar
+               └─ No → error con instrucciones manuales
+```
+
+### Variables de entorno
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `PI_FREE_BRIDGE_AUTO_UPDATE` | `0` (off) | Activa/desactiva auto-update |
+| `PI_FREE_BRIDGE_AUTO_UPDATE_INTERVAL` | `86400` (24h) | Intervalo de verificación en segundos |
+
+### Estado persistido
+En `~/.pi/agent/pi-free-bridge.json`:
+```json
+{
+  "autoUpdate": false,
+  "lastUpdateCheck": 1730000000,
+  "lastKnownVersion": "v0.1.0"
+}
+```
+
+### Comandos Pi
+| Comando | Descripción |
+|---------|-------------|
+| `/free-bridge-session` | Ver o setear session ID |
+| `/free-bridge-refresh` | Re-fetch de modelos libres |
+| `/free-bridge-models` | Listar modelos registrados |
+| `/free-bridge-doctor` | Diagnóstico completo |
+| `/free-bridge-proxy` | Test de conectividad bridge-go |
+| `/free-bridge-update` | Forzar check de actualización ahora |
+| `/free-bridge-auto-update` | Activar/desactivar auto-update |
+
+### Resumen de responsabilidades
+
+| Componente | Responsabilidad |
+|------------|-----------------|
+| `index.ts` (Pi extensión) | Registrar provider, descubrir modelos, supervisar binario Go, comandos Pi, cosechar session ID, auto-update |
+| `pi-free-bridge` (binario Go) | Servidor HTTP, gate injection (TLS, headers, `<env>`, tools, stream), session ID harvest (fallback), fallback chain, `/health` |
+| `postinstall.mjs` | Descargar binario por OS (optimización, no obligatorio) |
+| `.github/workflows/release.yml` | Compilar binarios por plataforma, crear GitHub Release |
+| `warp-minimal` (binario separado) | Proxy HTTP CONNECT con uTLS Bun + WARP (opcional, apagado por ahora) |
