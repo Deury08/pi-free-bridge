@@ -1,11 +1,11 @@
 {
-  "listen": "127.0.0.1:8788",
+  "listen": "127.0.0.1:8790",
   "upstream": "https://opencode.ai/inference/v1",
   "health_path": "/health",
   "egress_strategy": "local_warp_local",
   "local_cooldown_minutes": 30,
   "max_attempts": 6,
-  "warp_enabled": true,
+  "warp_enabled": false,
   "warp_pool_size": 2,
   "warp_stack": "ipv6",
   "warp_proxy": "http://127.0.0.1:8789"
