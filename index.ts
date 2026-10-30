@@ -2,7 +2,7 @@ import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-age
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
@@ -16,9 +16,11 @@ const PROVIDER = "oc-sdk-zen";
 /** The free tier moved here from the retired Zen surface, which is now hard-403
  *  for every client outside the official CLI (HANDOFF §4.1).
  *
- *  This is the upstream the relay calls, not the URL Pi talks to: the gate now
- *  rejects every Node TLS client, so Pi points at the local Bun relay instead
- *  (GATE-DIAGNOSIS.md §3.1, §5). */
+ *  This is the upstream bridge-go calls. Pi points at the local bridge-go
+ *  server instead (GATE-DIAGNOSIS.md §3.1, §5). bridge-go is a Go-native
+ *  replacement for the Bun relay: it emulates Bun's TLS ClientHello (uTLS),
+ *  injects the gate-mandated headers, session id, `<env>` block and tools on
+ *  the wire. */
 const UPSTREAM_URL = "https://opencode.ai/inference/v1";
 const API = "openai-completions" as const;
 
@@ -27,7 +29,7 @@ const API = "openai-completions" as const;
 const API_KEY = "public";
 
 /** User-agent must contain "opencode/" or the gate answers 403 (HANDOFF §4.2).
- *  The Pi path uses the relay's copy; this one stays for the registry refresh. */
+ *  bridge-go sends its own copy; this one stays for the registry refresh. */
 const USER_AGENT = "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
 const REGISTRY_PATHS = [
@@ -43,7 +45,7 @@ const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json"
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 
 /** The scope entry the bridge needs. A glob, not literal ids: the bridge
- *  registers its models at runtime, so literal ids hide anything new. */
+ *  registers `oc-sdk-zen/*` at runtime, so literal ids hide anything new. */
 const SCOPE_PATTERN = `${PROVIDER}/*`;
 
 /** Free ids the surface actually advertised on 2026-10-25.
@@ -323,7 +325,7 @@ function writeBridgeConfig(patch: BridgeConfig): void {
 }
 
 /** S30/S34: the package ships no session id. Only an explicit override is
- *  resolved here; otherwise the relay harvests one from the OpenCode store at
+ *  resolved here; otherwise bridge-go harvests one from the OpenCode store at
  *  startup. */
 function resolveSessionId(): { sessionId?: string; source: string } {
 	const fromEnv = process.env.PI_FREE_BRIDGE_SESSION_ID?.trim();
@@ -344,29 +346,32 @@ function resolveLiveIds(): { liveIds: Set<string>; source: string } {
 }
 
 // ---------------------------------------------------------------------------
-// Relay supervisor
+// bridge-go supervisor
 // ---------------------------------------------------------------------------
 //
-// Pi runs on Node, and the `/inference/v1` gate now only accepts a Bun TLS
-// client (GATE-DIAGNOSIS.md §3.1). The extension therefore points the provider
-// at a loopback relay executed by Bun; the relay owns the gate headers, the
-// `<env>` block, the tools gate and the raw response pipe.
+// bridge-go is a Go-native replacement for the Bun relay. It runs as a
+// standalone HTTP server on loopback and owns all gate injection (headers,
+// session id, `<env>` block, tools gate, Bun TLS fingerprint via uTLS).
+//
+// The extension does NOT spawn bridge-go: the user (or postinstall) starts it
+// separately. The extension only probes its /health endpoint to report a clear
+// error if it isn't running.
 
-const RELAY_DEFAULT_PORT = 8788;
-const RELAY_HOST = "127.0.0.1";
-const RELAY_SERVICE = "pi-free-bridge-relay";
+const BRIDGE_GO_DEFAULT_PORT = 8790;
+const BRIDGE_GO_HOST = "127.0.0.1";
+const BRIDGE_GO_SERVICE = "bridge-go";
 
-/** The relay ships next to this file (see `package.json → files`). */
-const RELAY_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "relay.mjs");
+/** The bridge-go binary ships next to this file (see `package.json → files`). */
+const BRIDGE_GO_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "bridge-go", "bridge-go");
 
-/** How long the relay may take to print its listening line. */
-const RELAY_START_TIMEOUT_MS = 5000;
+/** How long bridge-go may take to print its listening line. */
+const BRIDGE_GO_START_TIMEOUT_MS = 5000;
 
-type RelayMode = "spawned" | "reused";
+type BridgeGoMode = "spawned" | "reused";
 
-type RelayOptions = {
+type BridgeGoOptions = {
 	port: number;
-	/** Only an explicit user override; when absent the relay harvests one. */
+	/** Only an explicit user override; when absent bridge-go harvests one. */
 	sessionId?: string;
 	sessionSource?: string;
 	upstream: string;
@@ -380,18 +385,18 @@ type RelayOptions = {
 	};
 };
 
-type RelayResult = {
+type BridgeGoResult = {
 	url: string;
-	mode: RelayMode;
+	mode: BridgeGoMode;
 };
 
-type RelayState = RelayResult & {
+type BridgeGoState = BridgeGoResult & {
 	key: string;
 	child?: ChildProcess;
 };
 
-let relayState: RelayState | undefined;
-let relayPending: { key: string; promise: Promise<RelayResult> } | undefined;
+let bridgeGoState: BridgeGoState | undefined;
+let bridgeGoPending: { key: string; promise: Promise<BridgeGoResult> } | undefined;
 
 function parsePort(value: unknown): number | undefined {
 	const port = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
@@ -399,55 +404,36 @@ function parsePort(value: unknown): number | undefined {
 }
 
 /** S26: env override, then the persisted config key, then the default. */
-function resolveRelayPort(): number {
+function resolveBridgeGoPort(): number {
 	return (
-		parsePort(process.env.PI_FREE_BRIDGE_RELAY_PORT) ??
+		parsePort(process.env.PI_FREE_BRIDGE_BRIDGE_GO_PORT) ??
 		parsePort(readBridgeConfig().relayPort) ??
-		RELAY_DEFAULT_PORT
+		BRIDGE_GO_DEFAULT_PORT
 	);
 }
 
-function relayUrl(port: number): string {
-	return `http://${RELAY_HOST}:${port}/v1`;
+function bridgeGoUrl(port: number): string {
+	return `http://${BRIDGE_GO_HOST}:${port}/v1`;
 }
 
-function relayHealthUrl(port: number): string {
-	return `http://${RELAY_HOST}:${port}/health`;
+function bridgeGoHealthUrl(port: number): string {
+	return `http://${BRIDGE_GO_HOST}:${port}/health`;
 }
 
-/** S27: `PI_FREE_BRIDGE_BUN`, then `bun` on PATH, then `~/.bun/bin/bun.exe`.
- *  PATH is split by hand instead of shelled out, so this stays synchronous and
- *  side-effect free. */
-function resolveBunPath(): string | undefined {
-	const override = process.env.PI_FREE_BRIDGE_BUN?.trim();
-	if (override && existsSync(override)) return override;
-
-	const binary = process.platform === "win32" ? "bun.exe" : "bun";
-	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
-		const directory = entry.replace(/^"|"$/g, "");
-		if (!directory) continue;
-		const candidate = join(directory, binary);
-		if (existsSync(candidate)) return candidate;
-	}
-
-	const fallback = join(homedir(), ".bun", "bin", binary);
-	return existsSync(fallback) ? fallback : undefined;
-}
-
-/** Probe a port for our own relay. `absent` means nothing is listening there. */
-
-function resolveBridgeGoPath(): string | undefined {
+/** Resolve the bridge-go binary: PI_FREE_BRIDGE_BINARY, then node_modules/.bin,
+ *  then PATH. */
+function resolveBridgeGoBin(): string | undefined {
 	const override = process.env.PI_FREE_BRIDGE_BINARY?.trim();
 	if (override && existsSync(override)) return override;
 
 	const binary = process.platform === "win32" ? "bridge-go.exe" : "bridge-go";
-	
+
 	// Check node_modules/.bin first (postinstall location)
 	const moduleBin = join(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", ".bin", binary);
 	if (existsSync(moduleBin)) return moduleBin;
 
 	// Check PATH
-	for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+	for (const entry of (process.env.PATH ?? "").split(";")) {
 		const directory = entry.replace(/^"|"$/g, "");
 		if (!directory) continue;
 		const candidate = join(directory, binary);
@@ -457,21 +443,22 @@ function resolveBridgeGoPath(): string | undefined {
 	return undefined;
 }
 
-function describeBridgeGo(): string {
-	const path = resolveBridgeGoPath();
-	if (!path) return "MISSING u2014 run `npm install` or build from bridge-go/";
+function describeBridgeGoBin(): string {
+	const path = resolveBridgeGoBin();
+	if (!path) return "MISSING — run `npm install` or build from bridge-go/";
 	const rel = path.includes("node_modules") ? "installed" : "from PATH";
 	return `${path} (${rel})`;
 }
 
-async function probeRelay(port: number): Promise<"healthy" | "foreign" | "absent"> {
+/** Probe a port for our own bridge-go. `absent` means nothing is listening there. */
+async function probeBridgeGo(port: number): Promise<"healthy" | "foreign" | "absent"> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 750);
 	try {
-		const res = await fetch(relayHealthUrl(port), { signal: controller.signal });
+		const res = await fetch(bridgeGoHealthUrl(port), { signal: controller.signal });
 		if (!res.ok) return "foreign";
 		const payload = (await res.json()) as { service?: unknown };
-		return payload?.service === RELAY_SERVICE ? "healthy" : "foreign";
+		return payload?.service === BRIDGE_GO_SERVICE ? "healthy" : "foreign";
 	} catch {
 		return "absent";
 	} finally {
@@ -479,9 +466,9 @@ async function probeRelay(port: number): Promise<"healthy" | "foreign" | "absent
 	}
 }
 
-function waitForListening(child: ChildProcess, port: number): Promise<void> {
+function waitForBridgeGoListening(child: ChildProcess, port: number): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const expected = `pi-free-bridge relay listening on http://${RELAY_HOST}:${port}/v1`;
+		const expected = `bridge-go listening on ${BRIDGE_GO_HOST}:${port}`;
 		let stdout = "";
 		let stderr = "";
 
@@ -500,10 +487,10 @@ function waitForListening(child: ChildProcess, port: number): Promise<void> {
 		const timer = setTimeout(() => {
 			child.kill();
 			fail(
-				`pi-free-bridge: the relay did not start within ${RELAY_START_TIMEOUT_MS / 1000}s` +
+				`pi-free-bridge: bridge-go did not start within ${BRIDGE_GO_START_TIMEOUT_MS / 1000}s` +
 					(stderr.trim() ? ` — ${stderr.trim()}` : ""),
 			);
-		}, RELAY_START_TIMEOUT_MS);
+		}, BRIDGE_GO_START_TIMEOUT_MS);
 
 		const onStdout = (chunk: Buffer | string) => {
 			stdout += String(chunk);
@@ -516,12 +503,12 @@ function waitForListening(child: ChildProcess, port: number): Promise<void> {
 		};
 		const onExit = (code: number | null) => {
 			fail(
-				`pi-free-bridge: the relay exited before listening (code ${code})` +
+				`pi-free-bridge: bridge-go exited before listening (code ${code})` +
 					(stderr.trim() ? ` — ${stderr.trim()}` : ""),
 			);
 		};
 		const onError = (err: Error) => {
-			fail(`pi-free-bridge: could not start bun — ${err.message}`);
+			fail(`pi-free-bridge: could not start bridge-go — ${err.message}`);
 		};
 
 		child.stdout?.on("data", onStdout);
@@ -533,7 +520,7 @@ function waitForListening(child: ChildProcess, port: number): Promise<void> {
 
 /** Kill the child when Pi exits. Signals are handled only when no one else owns
  *  them, so Pi's own Ctrl+C handling keeps working. */
-function installRelayExitHooks(child: ChildProcess): void {
+function installBridgeGoExitHooks(child: ChildProcess): void {
 	const kill = () => {
 		if (!child.killed) child.kill();
 	};
@@ -542,8 +529,6 @@ function installRelayExitHooks(child: ChildProcess): void {
 	for (const signal of ["SIGINT", "SIGTERM"] as const) {
 		process.once(signal, () => {
 			kill();
-			// `once` removes this listener before invoking it, so a non-zero count
-			// here means the host (Pi) has its own handler and owns the decision.
 			if (process.listenerCount(signal) === 0) {
 				process.exit(signal === "SIGINT" ? 130 : 143);
 			}
@@ -551,110 +536,101 @@ function installRelayExitHooks(child: ChildProcess): void {
 	}
 }
 
-/** A piped child keeps the parent's event loop alive. The relay is a helper, not
- *  a reason for Pi to stay running, so its handles are detached once it is up;
- *  the exit hooks above still take it down. */
-function detachRelayHandles(child: ChildProcess): void {
+/** A piped child keeps the parent's event loop alive. bridge-go is a helper,
+ *  not a reason for Pi to stay running, so its handles are detached once it is
+ *  up; the exit hooks above still take it down. */
+function detachBridgeGoHandles(child: ChildProcess): void {
 	for (const stream of [child.stdin, child.stdout, child.stderr]) {
 		(stream as unknown as { unref?: () => void } | null)?.unref?.();
 	}
 	child.unref();
 }
 
-/** Child environment. RELAY_SESSION is only set for an explicit override; when
- *  it is absent the relay harvests an id from the OpenCode store (S31). */
-function relayEnv(options: RelayOptions): Record<string, string | undefined> {
+/** Child environment. BRIDGE_GO_SESSION is only set for an explicit override;
+ *  when it is absent bridge-go harvests an id from the OpenCode store (S31). */
+function bridgeGoEnv(options: BridgeGoOptions): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...process.env,
 		PORT: String(options.port),
-		RELAY_UPSTREAM: options.upstream,
-		RELAY_CWD: options.cwd,
+		UPSTREAM: options.upstream,
+		CWD: options.cwd,
 	};
 
 	const proxy = options.proxy;
 	if (proxy) {
 		if (Array.isArray(proxy.static) && proxy.static.length > 0) {
-			env.RELAY_PROXY_STATIC = proxy.static.join(",");
+			env.WARP_PROXY_STATIC = proxy.static.join(",");
 		}
-		if (proxy.source) env.RELAY_PROXY_SOURCE = proxy.source;
+		if (proxy.source) env.WARP_PROXY_SOURCE = proxy.source;
 		if (typeof proxy.refreshMinutes === "number" && proxy.refreshMinutes > 0) {
-			env.RELAY_PROXY_REFRESH_MINUTES = String(proxy.refreshMinutes);
+			env.WARP_PROXY_REFRESH_MINUTES = String(proxy.refreshMinutes);
 		}
-		if (proxy.force === true) env.RELAY_PROXY_FORCE = "1";
+		if (proxy.force === true) env.WARP_PROXY_FORCE = "1";
 	}
 
 	if (options.sessionId) {
-		env.RELAY_SESSION = options.sessionId;
-		env.RELAY_SESSION_SOURCE = options.sessionSource ?? "env";
+		env.BRIDGE_GO_SESSION = options.sessionId;
+		env.BRIDGE_GO_SESSION_SOURCE = options.sessionSource ?? "env";
 	} else {
-		// Never leak an inherited override into a relay that must harvest.
-		delete env.RELAY_SESSION;
-		delete env.RELAY_SESSION_SOURCE;
+		delete env.BRIDGE_GO_SESSION;
+		delete env.BRIDGE_GO_SESSION_SOURCE;
 	}
 	return env;
 }
 
-async function startRelay(options: RelayOptions, key: string): Promise<RelayState> {
-	const url = relayUrl(options.port);
-	const probe = await probeRelay(options.port);
+async function startBridgeGo(options: BridgeGoOptions, key: string): Promise<BridgeGoState> {
+	const url = bridgeGoUrl(options.port);
+	const probe = await probeBridgeGo(options.port);
 
 	if (probe === "healthy") {
 		return { key, url, mode: "reused" };
 	}
 	if (probe === "foreign") {
-		// S26: a foreign service on the port is a hard error with actionable text.
 		throw new Error(
 			`pi-free-bridge: port ${options.port} is already used by another service; ` +
-				`set PI_FREE_BRIDGE_RELAY_PORT (or "relayPort" in ${BRIDGE_CONFIG_PATH}) to a free port.`,
+				`set PI_FREE_BRIDGE_BRIDGE_GO_PORT (or "relayPort" in ${BRIDGE_CONFIG_PATH}) to a free port.`,
 		);
 	}
 
-	const bun = resolveBunPath();
-	if (!bun) {
-		// S27: never degrade into a silent 429.
+	const bin = resolveBridgeGoBin();
+	if (!bin) {
 		throw new Error(
-			"pi-free-bridge: bun is required for the free-tier relay but was not found. " +
-				"Install Bun (https://bun.sh) or set PI_FREE_BRIDGE_BUN to the bun executable.",
+			"pi-free-bridge: bridge-go binary not found. " +
+				"Run `npm install` (postinstall downloads it) or build from bridge-go/, " +
+				"or set PI_FREE_BRIDGE_BINARY to the bridge-go executable.",
 		);
 	}
 
-	const child = spawn(bun, [RELAY_SCRIPT], {
+	const child = spawn(bin, ["-config", "config.json"], {
 		stdio: ["pipe", "pipe", "pipe"],
-		env: relayEnv(options),
+		env: bridgeGoEnv(options),
+		cwd: join(dirname(fileURLToPath(import.meta.url)), "bridge-go"),
 	});
 
 	try {
-		await waitForListening(child, options.port);
-		// Keep draining both pipes; the relay never writes again, but a blocked
-		// pipe would still stall it.
+		await waitForBridgeGoListening(child, options.port);
 		child.stdout?.resume();
 		child.stderr?.resume();
 
-		if ((await probeRelay(options.port)) !== "healthy") {
-			throw new Error(`pi-free-bridge: the relay started but did not answer /health on ${url}`);
+		if ((await probeBridgeGo(options.port)) !== "healthy") {
+			throw new Error(`pi-free-bridge: bridge-go started but did not answer /health on ${url}`);
 		}
 	} catch (err) {
 		if (!child.killed) child.kill();
 		throw err;
 	}
 
-	// Keep the child's stdin open: closing it is the relay's shutdown signal.
-	// Detach its handles so the relay never keeps Pi's event loop alive.
-	installRelayExitHooks(child);
-	detachRelayHandles(child);
+	installBridgeGoExitHooks(child);
+	detachBridgeGoHandles(child);
 
-	// A relay that dies on its own must not leave a stale "ready" state behind.
 	child.once("exit", () => {
-		if (relayState?.child === child) relayState = undefined;
+		if (bridgeGoState?.child === child) bridgeGoState = undefined;
 	});
 
 	return { key, url, mode: "spawned", child };
 }
 
-/** Ensure a healthy relay for this port + session id, spawning one if needed. */
-/** Proxy pool from the persisted config (S6). Env already set by the user wins
- *  at the relay, so this only forwards what the config declares. */
-function relayProxyOptions(): RelayOptions["proxy"] {
+function bridgeGoProxyOptions(): BridgeGoOptions["proxy"] {
 	const proxy = readBridgeConfig().proxy;
 	if (!proxy || typeof proxy !== "object") return undefined;
 
@@ -670,9 +646,7 @@ function relayProxyOptions(): RelayOptions["proxy"] {
 	return { static: staticPool, source, refreshMinutes, force };
 }
 
-async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
-	// The proxy pool is part of the identity: a changed pool must not keep talking
-	// to a relay spawned with the previous one.
+async function ensureBridgeGo(options: BridgeGoOptions): Promise<BridgeGoResult> {
 	const proxyKey = options.proxy
 		? JSON.stringify([
 				options.proxy.static ?? [],
@@ -683,35 +657,31 @@ async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 		: "";
 	const key = `${options.port}\u0000${options.sessionId ?? ""}\u0000${proxyKey}`;
 
-	if (relayState?.key === key) {
-		// A relay we spawned is trusted; one we only reused may belong to another
-		// Pi that has since exited, so its liveness is re-checked.
-		if (relayState.mode === "spawned" || (await probeRelay(options.port)) === "healthy") {
-			return { url: relayState.url, mode: relayState.mode };
+	if (bridgeGoState?.key === key) {
+		if (bridgeGoState.mode === "spawned" || (await probeBridgeGo(options.port)) === "healthy") {
+			return { url: bridgeGoState.url, mode: bridgeGoState.mode };
 		}
-		relayState = undefined;
+		bridgeGoState = undefined;
 	}
-	if (relayPending?.key === key) return relayPending.promise;
+	if (bridgeGoPending?.key === key) return bridgeGoPending.promise;
 
-	const promise = startRelay(options, key)
+	const promise = startBridgeGo(options, key)
 		.then((state) => {
-			relayState = state;
+			bridgeGoState = state;
 			return { url: state.url, mode: state.mode };
 		})
 		.finally(() => {
-			if (relayPending?.promise === promise) relayPending = undefined;
+			if (bridgeGoPending?.promise === promise) bridgeGoPending = undefined;
 		});
 
-	relayPending = { key, promise };
+	bridgeGoPending = { key, promise };
 	return promise;
 }
 
-/** Stop the relay this process spawned, and wait for the port to be released.
- *  A relay that was only reused belongs to another Pi instance and is left alone. */
-async function stopRelay(): Promise<void> {
-	const state = relayState;
-	relayState = undefined;
-	relayPending = undefined;
+async function stopBridgeGo(): Promise<void> {
+	const state = bridgeGoState;
+	bridgeGoState = undefined;
+	bridgeGoPending = undefined;
 
 	const child = state?.child;
 	if (!child || child.exitCode !== null || child.killed) return;
@@ -726,28 +696,28 @@ async function stopRelay(): Promise<void> {
 	});
 }
 
-const RELAY_PORT = resolveRelayPort();
-const RELAY_URL = relayUrl(RELAY_PORT);
+const BRIDGE_GO_PORT = resolveBridgeGoPort();
+const BRIDGE_GO_URL = bridgeGoUrl(BRIDGE_GO_PORT);
 
 /** S29: one line for `/free-bridge-doctor`. */
-function describeRelay(): string {
-	if (!relayState) return "not started";
-	return relayState.mode === "spawned"
-		? `running on ${relayState.url} (spawned)`
-		: `reused on ${relayState.url}`;
+function describeBridgeGoProcess(): string {
+	if (!bridgeGoState) return "not started";
+	return bridgeGoState.mode === "spawned"
+		? `running on ${bridgeGoState.url} (spawned)`
+		: `reused on ${bridgeGoState.url}`;
 }
 
-type RelayHealth = {
+type BridgeGoHealth = {
 	sessionId?: string;
 	sessionSource?: string;
 };
 
-/** The relay's `/health` payload, or undefined when it is not answering. */
-async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> {
+/** bridge-go's `/health` payload, or undefined when it is not answering. */
+async function fetchBridgeGoHealth(port: number): Promise<BridgeGoHealth | undefined> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 750);
 	try {
-		const res = await fetch(relayHealthUrl(port), { signal: controller.signal });
+		const res = await fetch(bridgeGoHealthUrl(port), { signal: controller.signal });
 		if (!res.ok) return undefined;
 		const payload = (await res.json()) as {
 			service?: unknown;
@@ -755,7 +725,7 @@ async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> 
 			sessionId?: unknown;
 			sessionSource?: unknown;
 		};
-		if (payload?.service !== RELAY_SERVICE || payload.ok !== true) return undefined;
+		if (payload?.service !== BRIDGE_GO_SERVICE || payload.ok !== true) return undefined;
 		return {
 			sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
 			sessionSource: typeof payload.sessionSource === "string" ? payload.sessionSource : undefined,
@@ -781,10 +751,6 @@ function resolveRegistryPath(): string | undefined {
 	return REGISTRY_PATHS.find((p) => existsSync(p));
 }
 
-/** A model is free when every cost field it actually declares is zero.
- *
- *  The registry omits `cache_write` on most free models, so testing all four
- *  fields with `=== 0` classifies 36 of 39 free models as paid (HANDOFF §4.4). */
 function isFree(meta: Record<string, unknown>): boolean {
 	const cost = (meta.cost ?? {}) as Record<string, unknown>;
 	const declared = Object.values(cost).filter(
@@ -818,8 +784,6 @@ function discoverFreeModels(liveIds: Set<string>): { models: RegistryModel[]; so
 			continue;
 		}
 		if (!isFree(meta)) continue;
-		// Free in the registry but not advertised by the surface: registering it
-		// would put a permanently broken entry in the picker.
 		if (!liveIds.has(id)) {
 			skipped.push(id);
 			continue;
@@ -831,7 +795,6 @@ function discoverFreeModels(liveIds: Set<string>): { models: RegistryModel[]; so
 	return { models, source: path, skipped };
 }
 
-/** Ask the surface which models it advertises, then keep the free ones. */
 async function fetchLiveFreeIds(registryFree: Set<string>): Promise<string[]> {
 	const res = await fetch(`${UPSTREAM_URL}/models`, {
 		headers: { "user-agent": USER_AGENT, authorization: `Bearer ${API_KEY}` },
@@ -851,8 +814,6 @@ function buildPiModels(raw: RegistryModel[]) {
 		const modalities = (m.meta.modalities ?? {}) as Record<string, string[]>;
 		const family = (m.meta.family as string) || "";
 
-		// Pi accepts only "text" | "image" inputs; the registry also lists
-		// video/pdf/audio.
 		const declaredInput = (modalities.input ?? ["text"]).filter(
 			(x) => x === "text" || x === "image",
 		);
@@ -862,7 +823,7 @@ function buildPiModels(raw: RegistryModel[]) {
 			name: m.name,
 			api: API,
 			provider: PROVIDER,
-			baseUrl: RELAY_URL,
+			baseUrl: BRIDGE_GO_URL,
 			contextWindow: limit.context ?? 200000,
 			maxTokens: limit.output ?? 32000,
 			reasoning: (m.meta.reasoning as boolean) ?? false,
@@ -875,7 +836,6 @@ function buildPiModels(raw: RegistryModel[]) {
 			input: declaredInput.length > 0 ? declaredInput : ["text"],
 		};
 
-		// DeepSeek and Kimi need reasoning_content replayed on tool-call turns.
 		if (family.includes("deepseek")) {
 			model.compat = { allowsSyntheticReasoningContentForToolCalls: false };
 		} else if (family.includes("kimi")) {
@@ -893,33 +853,20 @@ function buildPiModels(raw: RegistryModel[]) {
 // Free-tier gate: tools-less requests
 // ---------------------------------------------------------------------------
 //
-// The Pi path no longer uses this module: `gateStreamSimple` forwards the
-// context untouched and `relay.mjs` injects the tool names on the wire (S22).
+// bridge-go owns all gate mutation on the wire (headers, session, `<env>`,
+// tools). The Pi path is a pass-through: `gateStreamSimple` delegates to
+// pi-ai's compat.streamSimple with baseUrl pointing at bridge-go.
 // `gateRequestContext` is kept as the context-level reference implementation
-// that `test/gate-tools.mjs` exercises, so a future relay change cannot quietly
-// break the transcript-level contract.
+// that `test/gate-tools.mjs` exercises.
 
-/** The gate rejects any request whose `tools` array does not carry BOTH `read`
- *  and `bash` (HANDOFF §4.2). Pi's one-off calls — the auto-compaction,
- *  `/compact` and the branch summarization — build their request context from a
- *  system prompt plus a user message with NO tools at all
- *  (pi-coding-agent dist/core/compaction/compaction.js:498 and
- *  dist/core/compaction/branch-summarization.js:224), and pi-ai only sets
- *  `params.tools` when the resolved transcript has tools
- *  (pi-ai dist/api/openai-completions.js:600), so those requests answered
- *  `403 FreeTierError`. */
 const GATE_TOOL_NAMES = ["read", "bash"];
 
-/** Minimal tool declarations. The gate only inspects the names; `toolChoice:
- *  "none"` keeps the model from calling them. */
 type GateTool = {
 	name: string;
 	description: string;
 	parameters: { type: "object"; properties: Record<string, never> };
 };
 
-/** The subset of Pi's message shape this module needs. Deliberately loose: the
- *  real messages come from pi-ai, which this package does not depend on. */
 type GateMessage = {
 	role: string;
 	content?: unknown;
@@ -936,19 +883,9 @@ export type GateContext = {
 
 export type GateRequestContext = {
 	messages: GateMessage[];
-	/** Present only when the gate tools had to be injected. */
 	toolChoice?: "none";
 };
 
-/** Resolve the tool set Pi would send for this transcript.
- *
- *  Pi resolves it by replaying every system message's `toolsAdded` /
- *  `toolsRemoved` deltas in order (`getCurrentTools`, pi-ai
- *  dist/utils/transcript.js:41). The replay is replicated here on purpose:
- *  `@earendil-works/pi-ai` is supplied by the host and is NOT resolvable from
- *  this package's folder — `import("@earendil-works/pi-ai")` fails with
- *  ERR_MODULE_NOT_FOUND here — and the tests run the extension under plain
- *  node. Importing it would add a runtime dependency the bridge does not need. */
 function resolveToolNames(messages: GateMessage[]): Set<string> {
 	const tools = new Map<string, { name: string }>();
 	for (const message of messages) {
@@ -959,17 +896,6 @@ function resolveToolNames(messages: GateMessage[]): Set<string> {
 	return new Set(tools.keys());
 }
 
-/** Make a request context acceptable to the free-tier gate.
- *
- *  A context that already resolves both gate tools is returned untouched: the
- *  normal conversation path must not change. Otherwise the missing names are
- *  injected as a TRAILING system message and `toolChoice` is pinned to `none`.
- *
- *  The injection is appended, not patched into the leading system message,
- *  because Pi resolves every delta: an earlier `toolsRemoved` would otherwise
- *  drop the injected tool again (pi-ai
- *  dist/utils/transcript.js:41-51). Only the names that are actually missing
- *  are added, so a partial tool set is unioned instead of duplicated. */
 export function gateRequestContext(context: GateContext): GateRequestContext {
 	const present = resolveToolNames(context.messages);
 	const missing = GATE_TOOL_NAMES.filter((name) => !present.has(name));
@@ -993,11 +919,6 @@ export function gateRequestContext(context: GateContext): GateRequestContext {
 	return { messages: [...context.messages, injected], toolChoice: "none" };
 }
 
-/** Pi hands extensions its own copy of pi-ai — as a virtual module
- *  (pi-coding-agent dist/core/extensions/virtual-modules.js) and as a jiti
- *  alias — so the module is importable at runtime. It is not resolvable from
- *  this package's own folder, so it is imported lazily on the first request
- *  instead of statically at module load. */
 const COMPAT_MODULE = "@earendil-works/pi-ai/compat";
 
 type CompatModule = {
@@ -1020,32 +941,16 @@ function loadCompat(): Promise<CompatModule | undefined> {
 
 /** Stream handler for the provider.
  *
- *  Pi routes every request for this provider — the normal conversation turn as
- *  well as the one-off calls — through the provider's `streamSimple`
- *  (pi-coding-agent dist/core/provider-composer.js:374). Its only job now is to
- *  make sure the Bun relay is listening before the host opens the request; the
- *  relay owns every mutation the gate requires (headers, session, `<env>`,
- *  tools) and the context is passed through untouched.
- *
- *  Pi's provider composer runs this handler behind `lazyStream`
- *  (dist/core/provider-composer.js:428), which awaits the result before
- *  forwarding events, so starting the relay asynchronously is safe; the cast
- *  keeps the provider config assignable to Pi's synchronous type. */
+ *  Pi routes every request for this provider through the provider's
+ *  `streamSimple`. bridge-go (reached at BRIDGE_GO_URL) owns every mutation
+ *  the gate requires (headers, session, `<env>`, tools, Bun TLS fingerprint).
+ *  The context is passed through untouched; the only job here is to delegate
+ *  to pi-ai's compat.streamSimple. */
 const gateStreamSimple = (async (
 	model: unknown,
 	context: GateContext,
 	options?: Record<string, unknown>,
 ) => {
-	const session = resolveSessionId();
-	await ensureRelay({
-		port: RELAY_PORT,
-		sessionId: session.sessionId,
-		sessionSource: session.source,
-		upstream: UPSTREAM_URL,
-		cwd: process.cwd(),
-		proxy: relayProxyOptions(),
-	});
-
 	const compat = await loadCompat();
 	if (!compat) {
 		throw new Error(
@@ -1067,19 +972,18 @@ function printDryRun(
 ): void {
 	const lines = [
 		"pi-free-bridge dry run",
-		`  registry:    ${discovered.source}`,
-		`  upstream:    ${UPSTREAM_URL}`,
-		`  relay:       ${RELAY_URL} (port ${RELAY_PORT})`,
-		`  bun:         ${resolveBunPath() ?? "MISSING"}`
-`  bridge-go:   ${describeBridgeGo()}`,
-		`  api:         ${API}   apiKey: ${API_KEY}`,
-		`  session id:  ${
+		`  registry:   ${discovered.source}`,
+		`  upstream:   ${UPSTREAM_URL}`,
+		`  bridge-go:  ${BRIDGE_GO_URL} (port ${BRIDGE_GO_PORT})`,
+		`  bridge-go bin: ${describeBridgeGoBin()}`,
+		`  api:        ${API}   apiKey: ${API_KEY}`,
+		`  session id: ${
 			session.sessionId
 				? `${session.sessionId} (from ${session.source})`
-				: "harvested by the relay from the OpenCode store"
+				: "harvested by bridge-go from the OpenCode store"
 		}`,
-		`  live ids:    ${live.source}`,
-		`  excluded:    ${[...EXCLUDED_MODELS].join(", ")}`,
+		`  live ids:   ${live.source}`,
+		`  excluded:   ${[...EXCLUDED_MODELS].join(", ")}`,
 		`  models (${discovered.models.length}):`,
 		...discovered.models.map((m) => `    - ${m.id}`),
 		`  skipped (${discovered.skipped.length}):`,
@@ -1105,8 +1009,6 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	if (discovered.models.length === 0) {
-		// Fail closed: registering an empty model list would silently blank the
-		// provider instead of surfacing a readable diagnostic.
 		console.error(
 			`pi-free-bridge: no free models discovered (${discovered.source}); ` +
 				"provider not registered.",
@@ -1117,7 +1019,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerProvider(PROVIDER, {
 		apiKey: API_KEY,
 		api: API,
-		baseUrl: RELAY_URL,
+		baseUrl: BRIDGE_GO_URL,
 		authHeader: true,
 		models: buildPiModels(discovered.models),
 		streamSimple: gateStreamSimple,
@@ -1125,27 +1027,22 @@ export default function (pi: ExtensionAPI) {
 
 	g[REG_KEY] = true;
 
-	// Start the relay early so the first request does not pay the spawn cost.
-	// A failure is reported once and retried by gateStreamSimple on the first
-	// real request; it must never take Pi down at startup.
+	// Probe bridge-go early so the first request gets a clear diagnostic if it
+	// isn't running. A failure is reported once and does not take Pi down.
 	if (process.env.PI_FREE_BRIDGE_DRY_RUN !== "1") {
-		void ensureRelay({
-			port: RELAY_PORT,
-			sessionId: session.sessionId,
-			sessionSource: session.source,
-			upstream: UPSTREAM_URL,
-			cwd: process.cwd(),
-			proxy: relayProxyOptions(),
-		}).catch((err) => {
-			console.error(`pi-free-bridge: relay not ready — ${(err as Error).message}`);
-		});
+		void (async () => {
+			const healthy = await probeBridgeGo(BRIDGE_GO_PORT);
+			if (healthy !== "healthy") {
+				console.error(
+					`pi-free-bridge: bridge-go is not reachable on ${BRIDGE_GO_URL}. ` +
+						`Start it (e.g. from bridge-go/ with 'go run ./cmd/bridge-go') ` +
+						"or set PI_FREE_BRIDGE_BRIDGE_GO_PORT to a running instance.",
+				);
+			}
+		})();
 	}
 
-	// Keep the picker able to see the models this bridge just registered. Silent
-	// when the scope is already healthy; this is a repair, not a notification.
-	// See ensureEnabledPattern for why this cannot fix the running session.
-	// The kill switch lives inside repairEnabledModels, not here, so every caller
-	// is covered.
+	// Keep the picker able to see the models this bridge just registered.
 	const scope = repairEnabledModels();
 	if (scope.status === "added") {
 		console.error(
@@ -1165,13 +1062,11 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args: string, ctx) => {
 			const next = args.trim();
 			if (!next) {
-				// S34: report the id actually on the wire, which may have been
-				// harvested by the relay rather than set here.
-				const health = await fetchRelayHealth(RELAY_PORT);
+				const health = await fetchBridgeGoHealth(BRIDGE_GO_PORT);
 				ctx.ui.notify(
 					health?.sessionId
 						? `pi-free-bridge session: ${health.sessionId} (from ${health.sessionSource})`
-						: "pi-free-bridge session: resolved at the first request by the relay — " +
+						: "pi-free-bridge session: resolved by bridge-go — " +
 								"run OpenCode once, or set PI_FREE_BRIDGE_SESSION_ID",
 					"info",
 				);
@@ -1183,35 +1078,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			const persisted = writeBridgeConfig({ sessionId: next });
 
-			// S25: restart the relay so no request can carry the previous id.
-			await stopRelay();
-			let relayNote = "";
-			try {
-				await ensureRelay({
-					port: RELAY_PORT,
-					sessionId: next,
-					sessionSource: persisted ? "config" : "env",
-					upstream: UPSTREAM_URL,
-					cwd: process.cwd(),
-					proxy: relayProxyOptions(),
-				});
-			} catch (err) {
-				relayNote = ` Relay restart failed: ${(err as Error).message}`;
-			}
-
-			pi.registerProvider(PROVIDER, {
-				apiKey: API_KEY,
-				api: API,
-				baseUrl: RELAY_URL,
-				authHeader: true,
-				models: buildPiModels(discovered.models),
-				streamSimple: gateStreamSimple,
-			});
 			ctx.ui.notify(
 				`${persisted
 					? `Session id set to ${next} and saved to ${BRIDGE_CONFIG_PATH}`
-					: `Session id set to ${next} for this session only (could not write ${BRIDGE_CONFIG_PATH})`}.${relayNote}`,
-				relayNote ? "warning" : "info",
+					: `Session id set to ${next} for this session only (could not write ${BRIDGE_CONFIG_PATH})`}`,
+				persisted ? "info" : "warning",
 			);
 		},
 	});
@@ -1237,7 +1108,7 @@ export default function (pi: ExtensionAPI) {
 				pi.registerProvider(PROVIDER, {
 					apiKey: API_KEY,
 					api: API,
-					baseUrl: RELAY_URL,
+					baseUrl: BRIDGE_GO_URL,
 					authHeader: true,
 					models: buildPiModels(refreshed.models),
 					streamSimple: gateStreamSimple,
@@ -1263,76 +1134,25 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("free-bridge-proxy", {
-		description: "Test the proxy pool: reachability, latency and the effective egress order",
-		handler: async (_args: string, ctx) => {
-			const proxyConfig = relayProxyOptions();
-			if (!proxyConfig) {
-				ctx.ui.notify(
-					[
-						"pi-free-bridge proxy: no pool configured — egress is direct only.",
-						`  add \"proxy\" to ${BRIDGE_CONFIG_PATH}, for example:`,
-						'    { "proxy": { "static": ["http://1.2.3.4:8080"], "refreshMinutes": 30 } }',
-						"  proxies are only used when the direct path fails.",
-					].join("\n"),
-					"info",
-				);
-				return;
-			}
-
-			let payload;
-			try {
-				const res = await fetch(`http://${RELAY_HOST}:${RELAY_PORT}/proxies`, {
-					signal: AbortSignal.timeout(30_000),
-				});
-				if (!res.ok) throw new Error(`relay answered HTTP ${res.status}`);
-				payload = await res.json();
-			} catch (err) {
-				ctx.ui.notify(
-					`pi-free-bridge proxy: the relay did not answer — ${(err as Error).message}\n` +
-						"  the pool lives in the relay, so it has to be running to be tested.",
-					"error",
-				);
-				return;
-			}
-
-			const lines = [
-				"pi-free-bridge proxy",
-				`  preference: ${(payload.preference ?? []).join(" -> ")}`,
-				`  forced:     ${payload.forced ? "yes — the pool is preferred over direct" : "no — direct first"}`,
-				`  last egress: ${payload.lastEgress ?? "direct (nothing proxied yet)"}`,
-			];
-			for (const candidate of payload.candidates ?? []) {
-				const verdict = candidate.ok
-					? `ok (HTTP ${candidate.status}, ${candidate.latencyMs} ms)`
-					: `DEAD — ${candidate.error}`;
-				lines.push(`  ${candidate.candidate}: ${verdict}`);
-			}
-			ctx.ui.notify(lines.join("\n"), (payload.candidates ?? []).some((c: { ok: boolean }) => c.ok) ? "info" : "warning");
-		},
-	});
-
 	pi.registerCommand("free-bridge-doctor", {
 		description: "Diagnose and repair why the free OpenCode models are missing from the picker",
 		handler: async (_args: string, ctx) => {
-			// S34: the effective id lives on the wire, so read it from the relay.
-			const health = await fetchRelayHealth(RELAY_PORT);
+			const health = await fetchBridgeGoHealth(BRIDGE_GO_PORT);
 			const lines = [
 				"pi-free-bridge doctor",
-				`  provider:   ${PROVIDER}`,
-				`  registered: ${discovered.models.length} free models from ${discovered.source}`,
-				`  session id: ${
+				`  provider:     ${PROVIDER}`,
+				`  registered:   ${discovered.models.length} free models from ${discovered.source}`,
+				`  session id:   ${
 					health?.sessionId
 						? `${health.sessionId} (from ${health.sessionSource})`
 						: "MISSING — run OpenCode once, or set PI_FREE_BRIDGE_SESSION_ID"
 				}`,
-				`  bun:        ${resolveBunPath() ?? "MISSING"}`
-`  bridge-go:   ${describeBridgeGo()}`,
-				`  relay port: ${RELAY_PORT}`,
-				`  relay:      ${describeRelay()}`,
-				`  upstream:   ${UPSTREAM_URL}`,
-				`  live ids:   ${live.source}`,
-				`  skipped:    ${discovered.skipped.length ? discovered.skipped.join(", ") : "none"}`,
+				`  bridge-go bin: ${describeBridgeGoBin()}`,
+				`  bridge-go port: ${BRIDGE_GO_PORT}`,
+				`  bridge-go:    ${describeBridgeGoProcess()}`,
+				`  upstream:     ${UPSTREAM_URL}`,
+				`  live ids:     ${live.source}`,
+				`  skipped:      ${discovered.skipped.length ? discovered.skipped.join(", ") : "none"}`,
 			];
 
 			const result = repairEnabledModels();
@@ -1341,7 +1161,7 @@ export default function (pi: ExtensionAPI) {
 			} else if (result.status === "added") {
 				lines.push(
 					`  scope:      repaired — appended "${SCOPE_PATTERN}" to enabledModels ` +
-						`(${result.previousCount} -> ${result.previousCount + 1} entries)`,
+						`(${result.previousCount} -> ${scope.previousCount + 1} entries)`,
 				);
 			} else {
 				lines.push(`  scope:      FAILED — ${result.reason}`);
