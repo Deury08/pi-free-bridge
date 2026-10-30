@@ -293,6 +293,9 @@ type BridgeConfig = {
 	sessionId?: string;
 	liveIds?: string[];
 	relayPort?: number;
+	autoUpdate?: boolean;
+	lastUpdateCheck?: number;
+	lastKnownVersion?: string;
 	/** Proxy failover pool (odd/tasks/proxy-failover.md S6). */
 	proxy?: {
 		static?: string[];
@@ -570,6 +573,54 @@ async function ensureBinary(pi?: any, ctx?: any): Promise<string> {
 }
 
 /** Update ensureBridgeGo to use ensureBinary before spawn is handled in startBridgeGo */
+
+function isAutoUpdateEnabled(cfg: BridgeConfig): boolean {
+	if (cfg.autoUpdate === true) return true;
+	if (process.env.PI_FREE_BRIDGE_AUTO_UPDATE === "1") return true;
+	return false;
+}
+
+async function checkForUpdate(ctx?: any): Promise<{ available: boolean; version?: string }> {
+	const cfg = readBridgeConfig();
+	if (!isAutoUpdateEnabled(cfg)) return { available: false };
+	const now = Date.now();
+	const last = cfg.lastUpdateCheck ?? 0;
+	if (now - last < 86400 * 1000) return { available: false };
+	try {
+		const res = await new Promise<any>((resolve, reject) => {
+			https.get("https://api.github.com/repos/Deury08/pi-free-bridge/releases/latest", { headers: { "User-Agent": "pi-free-bridge" } }, (r) => {
+				let data = "";
+				r.on("data", (c) => (data += c));
+				r.on("end", () => {
+					try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+				});
+			}).on("error", reject);
+		});
+		const tag = res?.tag_name;
+		if (!tag || tag === `v${PACKAGE_VERSION}`) {
+			writeBridgeConfig({ lastUpdateCheck: now });
+			return { available: false };
+		}
+		writeBridgeConfig({ lastUpdateCheck: now });
+		return { available: true, version: tag.replace(/^v/, "") };
+	} catch {
+		return { available: false };
+	}
+}
+
+async function doUpdate(ctx: any, version: string): Promise<void> {
+	const tag = version.startsWith("v") ? version : `v${version}`;
+	const ok = await ctx.ui.confirm(`Nueva versión disponible (${tag}). ¿Actualizar?`);
+	if (!ok) {
+		writeBridgeConfig({ lastUpdateCheck: Date.now() });
+		ctx.ui.notify("Actualización cancelada.", "info");
+		return;
+	}
+	const targetPath = join(binaryDir(), process.platform === "win32" ? "pi-free-bridge.exe" : "pi-free-bridge");
+	await downloadBinary(targetPath, tag.replace(/^v/, ""), ctx);
+	writeBridgeConfig({ lastKnownVersion: tag });
+	ctx.ui.notify("Actualizado. Reiniciá Pi.", "info");
+}
 
 function describeBridgeGoBin(): string {
 	const path = resolveBridgeGoBin();
@@ -1323,6 +1374,7 @@ export default function (pi: ExtensionAPI) {
 				`  upstream:     ${UPSTREAM_URL}`,
 				`  live ids:     ${live.source}`,
 				`  skipped:      ${discovered.skipped.length ? discovered.skipped.join(", ") : "none"}`,
+				`  auto-update:  ${readBridgeConfig().autoUpdate === true ? "ON" : "OFF"}`,
 			];
 
 			const result = repairEnabledModels();
@@ -1352,4 +1404,57 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(lines.join("\n"), result.status === "malformed" ? "error" : "info");
 		},
 	});
+
+	pi.registerCommand("free-bridge-update", {
+		description: "Check and install the latest pi-free-bridge release",
+		handler: async (_args: string, ctx) => {
+			const r = await checkForUpdate(ctx);
+			// force: bypass interval by reading config and re-checking manually
+			const cfg = readBridgeConfig();
+			const forced = await (async () => {
+				try {
+					const res = await new Promise<any>((resolve, reject) => {
+						https.get("https://api.github.com/repos/Deury08/pi-free-bridge/releases/latest", { headers: { "User-Agent": "pi-free-bridge" } }, (r2) => {
+							let data = "";
+							r2.on("data", (c) => (data += c));
+							r2.on("end", () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+						}).on("error", reject);
+					});
+					const tag = res?.tag_name;
+					if (!tag || tag === `v${PACKAGE_VERSION}`) return { available: false };
+					return { available: true, version: tag.replace(/^v/, "") };
+				} catch {
+					return { available: false };
+				}
+			})();
+			if (!forced.available) {
+				ctx.ui.notify(`Ya tenés la última versión (v${PACKAGE_VERSION})`, "info");
+				return;
+			}
+			await doUpdate(ctx, forced.version!);
+		},
+	});
+
+	pi.registerCommand("free-bridge-auto-update", {
+		description: "Toggle auto-update checks",
+		handler: async (_args: string, ctx) => {
+			const cfg = readBridgeConfig();
+			const current = cfg.autoUpdate === true ? "ON" : "OFF";
+			ctx.ui.notify(`Auto-update: ${current}`, "info");
+			const choice = await ctx.ui.confirm("Activar auto-update?");
+			// simplified: confirm true=activar, false=desactivar
+			const next = choice ? true : false;
+			writeBridgeConfig({ autoUpdate: next });
+			ctx.ui.notify(`Auto-update: ${next ? "ON" : "OFF"}`, "info");
+		},
+	});
+
+	// background check
+	if (readBridgeConfig().autoUpdate === true || process.env.PI_FREE_BRIDGE_AUTO_UPDATE === "1") {
+		void checkForUpdate().then((r) => {
+			if (r.available && r.version) {
+				console.error(`pi-free-bridge: nueva versión disponible ${r.version}. Ejecutá /free-bridge-update`);
+			}
+		});
+	}
 }
