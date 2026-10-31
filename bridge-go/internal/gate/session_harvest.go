@@ -16,11 +16,8 @@ import (
 // Prioridad:
 // 1. PI_FREE_BRIDGE_SESSION_ID (override explícito por variable de entorno)
 // 2. ~/.pi/agent/pi-free-bridge.json (config persistida por el usuario)
-// 3. ~/.local/share/opencode/storage/session_diff/ses_*.json (más reciente por mtime)
-//
-// Fuente 4 (opcional, sin dependencias pesadas): opencode.db requiere un
-// driver SQLite puro Go que añade mucho peso al binario; se deja para una
-// versión posterior si la fuente 3 no basta.
+// 3. ~/.local/share/opencode/opencode.db (SQLite: authoritative, paridad con relay.mjs)
+// 4. ~/.local/share/opencode/storage/session_diff/ses_*.json (más reciente por mtime; puede estar stale)
 func HarvestSessionID() (string, error) {
 	// 1. Override por variable de entorno.
 	if id := os.Getenv("PI_FREE_BRIDGE_SESSION_ID"); id != "" {
@@ -32,7 +29,12 @@ func HarvestSessionID() (string, error) {
 		return id, nil
 	}
 
-	// 3. Archivos de session_diff (más reciente por mtime).
+	// 3. opencode.db (SQLite, fuente autoritativa; paridad con relay.mjs).
+	if id := harvestFromOpenCodeDB(); id != "" {
+		return id, nil
+	}
+
+	// 4. Archivos de session_diff (más reciente por mtime; puede estar stale).
 	if id := harvestFromSessionDiff(); id != "" {
 		return id, nil
 	}
