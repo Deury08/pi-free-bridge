@@ -136,7 +136,7 @@ async function main() {
   let version = "v0.1.0";
   try {
     const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-    version = pkg.version || version;
+    version = "v" + (pkg.version || version).replace(/^v/, "");
   } catch {}
 
   const platformKey = getPlatformKey();
