@@ -2,7 +2,7 @@
 // postinstall.mjs - Downloads pi-free-bridge binary for the current platform
 
 import { spawnSync } from "child_process";
-import { writeFileSync, existsSync, mkdirSync, chmodSync, copyFileSync, unlinkSync, readFileSync } from "fs";
+import { writeFileSync, existsSync, mkdirSync, chmodSync, copyFileSync, unlinkSync, readFileSync, rmSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import https from "https";
@@ -55,11 +55,28 @@ function getWarpAssetName(platformKey, version) {
   return `warp-minimal_${version}_${mapped}${ext}${archiveExt}`;
 }
 
-function downloadFile(url, dest) {
+function downloadFile(url, dest, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
     const file = https.get(url, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode}: ${url}`));
+      const status = res.statusCode ?? 0;
+      if (status === 301 || status === 302 || status === 307 || status === 308) {
+        const location = res.headers.location;
+        res.resume();
+        if (!location) {
+          reject(new Error(`HTTP ${status}: no Location header: ${url}`));
+          return;
+        }
+        if (redirectsLeft <= 0) {
+          reject(new Error(`Too many redirects: ${url}`));
+          return;
+        }
+        const nextUrl = new URL(location, url).href;
+        downloadFile(nextUrl, dest, redirectsLeft - 1).then(resolve).catch(reject);
+        return;
+      }
+      if (status !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${status}: ${url}`));
         return;
       }
       const chunks = [];
@@ -161,6 +178,14 @@ async function main() {
       chmodSync(binaryPath, 0o755);
     }
 
+    // The archive contains bridge-go/pi-free-bridge.exe; move it to BIN_DIR
+    const extractedBinary = join(BIN_DIR, "bridge-go", "pi-free-bridge" + (process.platform === "win32" ? ".exe" : ""));
+    if (existsSync(extractedBinary) && extractedBinary !== binaryPath) {
+      copyFileSync(extractedBinary, binaryPath);
+      if (process.platform !== "win32") chmodSync(binaryPath, 0o755);
+      const subDir = join(BIN_DIR, "bridge-go");
+      if (existsSync(subDir)) rmSync(subDir, { recursive: true, force: true });
+    }
     unlinkSync(archivePath);
     console.log(`[postinstall] pi-free-bridge installed to ${binaryPath}`);
   } catch (err) {
