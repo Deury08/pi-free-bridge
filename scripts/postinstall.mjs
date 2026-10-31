@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// postinstall.mjs - Downloads bridge-go binary for the current platform
+// postinstall.mjs - Downloads pi-free-bridge binary for the current platform
 
 import { spawnSync } from "child_process";
 import { writeFileSync, existsSync, mkdirSync, chmodSync, copyFileSync, unlinkSync, readFileSync } from "fs";
@@ -15,7 +15,7 @@ const BRIDGE_GO_DIR = join(ROOT, "bridge-go");
 
 const RELEASE_BASE = "https://github.com/Deury08/pi-free-bridge/releases/download";
 const REPO = "Deury08/pi-free-bridge";
-const BINARY_NAME = "bridge-go";
+const BINARY_NAME = "pi-free-bridge";
 
 const WARP_RELEASE_BASE = "https://github.com/Deury08/warp-minimal/releases/download";
 const WARP_VERSION = "v0.1.0";
@@ -42,7 +42,7 @@ function getAssetName(platformKey, version) {
     throw new Error(`Unsupported platform: ${platformKey}`);
   }
   const ext = process.platform === "win32" ? ".exe" : "";
-  return `bridge-go_${version}_${mapped}${ext === ".exe" ? ".zip" : ".tar.gz"}`;
+  return `pi-free-bridge_${version}_${mapped}${ext === ".exe" ? ".zip" : ".tar.gz"}`;
 }
 
 function getWarpAssetName(platformKey, version) {
@@ -130,7 +130,7 @@ async function downloadWarpBinary() {
 }
 
 async function main() {
-  console.log("[postinstall] Installing bridge-go...");
+  console.log("[postinstall] Installing pi-free-bridge...");
 
   const pkgPath = join(ROOT, "package.json");
   let version = "v0.1.0";
@@ -162,12 +162,12 @@ async function main() {
     }
 
     unlinkSync(archivePath);
-    console.log(`[postinstall] bridge-go installed to ${binaryPath}`);
+    console.log(`[postinstall] pi-free-bridge installed to ${binaryPath}`);
   } catch (err) {
-    console.error("[postinstall] Failed to download bridge-go:", err.message);
+    console.error("[postinstall] Failed to download pi-free-bridge:", err.message);
     console.log("[postinstall] Falling back to local build if available...");
 
-    const localBinary = join(BRIDGE_GO_DIR, "bridge-go" + (process.platform === "win32" ? ".exe" : ""));
+    const localBinary = join(BRIDGE_GO_DIR, "pi-free-bridge" + (process.platform === "win32" ? ".exe" : ""));
     if (existsSync(localBinary)) {
       copyFileSync(localBinary, binaryPath);
       if (process.platform !== "win32") {
@@ -176,7 +176,7 @@ async function main() {
       console.log("[postinstall] Using locally built binary");
     } else {
       // Try to build from source if Go is available.
-      console.log("[postinstall] Attempting to build bridge-go from source...");
+      console.log("[postinstall] Attempting to build pi-free-bridge from source...");
       const buildResult = spawnSync("go", ["build", "-o", localBinary, "./cmd/bridge-go"], {
         cwd: BRIDGE_GO_DIR,
         stdio: "inherit",
@@ -186,9 +186,9 @@ async function main() {
         if (process.platform !== "win32") {
           chmodSync(binaryPath, 0o755);
         }
-        console.log("[postinstall] Built bridge-go from source");
+        console.log("[postinstall] Built pi-free-bridge from source");
       } else {
-        console.warn("[postinstall] No bridge-go binary available. Install Go and run 'go build -o bridge-go ./cmd/bridge-go' in bridge-go/");
+        console.warn("[postinstall] No pi-free-bridge binary available. Install Go and run 'go build -o pi-free-bridge ./cmd/bridge-go' in pi-free-bridge/");
         process.exit(1);
       }
     }

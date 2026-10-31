@@ -17,27 +17,21 @@ jobs:
           - goos: windows
             goarch: amd64
             ext: .exe
-            asset: bridge-go
           - goos: windows
             goarch: arm64
             ext: .exe
-            asset: bridge-go
           - goos: linux
             goarch: amd64
             ext: ""
-            asset: bridge-go
           - goos: linux
             goarch: arm64
             ext: ""
-            asset: bridge-go
           - goos: darwin
             goarch: amd64
             ext: ""
-            asset: bridge-go
           - goos: darwin
             goarch: arm64
             ext: ""
-            asset: bridge-go
     steps:
       - uses: actions/checkout@v4
 
@@ -46,29 +40,29 @@ jobs:
         with:
           go-version: '1.26'
 
-      - name: Build bridge-go
+      - name: Build pi-free-bridge
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          out="bridge-go${{ matrix.ext }}"
+          out="pi-free-bridge${{ matrix.ext }}"
           cd bridge-go
-          go build -ldflags="-s -w" -o "$out" ./cmd/bridge-go
+          go build -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o "$out" ./cmd/bridge-go
           cd ..
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            zip "bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" "bridge-go/bridge-go${{ matrix.ext }}"
+            zip "pi-free-bridge_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" "bridge-go/pi-free-bridge${{ matrix.ext }}"
           else
-            tar -czf "bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" -C bridge-go "bridge-go${{ matrix.ext }}"
+            tar -czf "pi-free-bridge_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" -C bridge-go "pi-free-bridge${{ matrix.ext }}"
           fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          name: pi-free-bridge_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
           path: |
-            bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip
-            bridge-go_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+            pi-free-bridge_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+            pi-free-bridge_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
 
   release:
     needs: build

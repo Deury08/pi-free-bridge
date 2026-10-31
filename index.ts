@@ -659,7 +659,7 @@ async function probeBridgeGo(port: number): Promise<"healthy" | "foreign" | "abs
 
 function waitForBridgeGoListening(child: ChildProcess, port: number): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const expected = `bridge-go listening on ${BRIDGE_GO_HOST}:${port}`;
+		const expected = `pi-free-bridge listening on ${BRIDGE_GO_HOST}:${port}`;
 		let stdout = "";
 		let stderr = "";
 
