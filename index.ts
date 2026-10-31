@@ -530,17 +530,29 @@ async function downloadBinary(targetPath: string, version: string, ctx?: any): P
 				return;
 			}
 			const chunks: Buffer[] = [];
-			res.on("data", (c: Buffer) => chunks.push(c));
+			let total = 0;
+			const LIMIT = 50 * 1024 * 1024;
+			res.on("data", (c: Buffer) => {
+				total += c.length;
+				if (total > LIMIT) {
+					reject(new Error("Downloaded archive exceeds 50 MB"));
+					res.destroy();
+					return;
+				}
+				chunks.push(c);
+			});
 			res.on("end", () => {
-				writeFileSync(archivePath, Buffer.concat(chunks));
-				resolve();
+				if (total <= LIMIT) {
+					writeFileSync(archivePath, Buffer.concat(chunks));
+					resolve();
+				}
 			});
 		}).on("error", reject);
 	});
 
 	// extract
 	if (ext === "zip") {
-		execFileSync("powershell", ["-Command", `Expand-Archive -Path "${archivePath}" -DestinationPath "${dir}" -Force`], { stdio: "inherit" });
+		execFileSync("powershell", ["-Command", "Expand-Archive", "-Path", archivePath, "-DestinationPath", dir, "-Force"], { stdio: "inherit" });
 	} else {
 		execFileSync("tar", ["-xzf", archivePath, "-C", dir], { stdio: "inherit" });
 	}

@@ -78,7 +78,12 @@ function extractArchive(archivePath, destDir) {
   if (isZip) {
     const result = spawnSync("powershell", [
       "-Command",
-      `Expand-Archive -Path "${archivePath}" -DestinationPath "${destDir}" -Force`,
+      "Expand-Archive",
+      "-Path",
+      archivePath,
+      "-DestinationPath",
+      destDir,
+      "-Force",
     ], { stdio: "inherit" });
     if (result.error || result.status !== 0) {
       throw new Error(`Failed to extract zip`);
