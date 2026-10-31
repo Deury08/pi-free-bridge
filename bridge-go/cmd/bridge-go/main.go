@@ -103,6 +103,21 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	// Validate upstream URL to prevent SSRF (JD-B-003).
+	if cfg.Upstream != "" {
+		valid := false
+		for _, prefix := range []string{"https://opencode.ai/", "http://127.0.0.1:", "http://localhost:"} {
+			if len(cfg.Upstream) >= len(prefix) && cfg.Upstream[:len(prefix)] == prefix {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			log.Printf("bridge-go: warning: invalid upstream URL %q; using default", cfg.Upstream)
+			cfg.Upstream = ""
+		}
+	}
+
 	if cfg.Listen == "" {
 		cfg.Listen = "127.0.0.1:8788"
 	}
@@ -233,6 +248,7 @@ func chatCompletionsHandler(
 		ctx := r.Context()
 
 		var reqBody map[string]any
+		r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
 		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(errorMapper.Map(http.StatusBadRequest, err.Error()))
