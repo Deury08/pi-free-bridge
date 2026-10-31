@@ -37,8 +37,9 @@ hand-written uTLS spec for Bun that produced "downgrade attempt detected" /
 - [x] Harness mode=bt returns HTTP 200 with streamed model content.
 - [x] POST http://127.0.0.1:8790/v1/chat/completions returns HTTP 200 SSE (x2).
 - [x] go build ./... && go vet ./... clean.
-- [ ] Real `gentle-shell` session conversation through Pi free models.
-- [ ] Work-unit commit on the feature branch.
+- [x] Work-unit commit: `ec3ae73` (go-native).
+- [x] Real `gentle-shell` session conversation through Pi free models
+      (user-verified 2026-10-31: started and works).
 
 ## Notes
 - Do NOT trust bare curl `-d` inline bodies on PowerShell 5.1; write the JSON
