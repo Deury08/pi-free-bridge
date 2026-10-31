@@ -63,7 +63,15 @@ helper convention (`relay.mjs`).
   `findPortListenerPid` returned its pid → `isBridgeGoPid` true → kill →
   post-kill probe `absent` → fresh instance `healthy service=pi-free-bridge`.
   Happy-path post-listen retry verified earlier (listening 98 ms via stderr,
-  probe 200).
+  probe 200). Deployed: rebuilt binary replaced at the persistent bin dir
+  (old copy kept as `pi-free-bridge.exe~`); extension files synced to the
+  installed Pi checkout (~/.pi/agent/git/.../pi-free-bridge, was at a965b28).
+  **User confirmed working in a live session (2026-10-31).**
+- T5 multiplatform audit (2026-10-31): recovery primitives are per-OS —
+  Windows: netstat/Get-Process/taskkill /T /F; Linux/macOS: lsof/ps/SIGKILL;
+  missing OS tooling degrades to 0/false without killing anything (README
+  documents the degradation). findPortListenerPid test skips the equality
+  assertion on unix when lsof is absent.
 - T5 suite: `relay.test.mjs` FAILS pre-existing — `relay.mjs` was removed in
   commit 2ebc5f3 and its test was left stale; unrelated to this change, flagged
   as follow-up, not fixed here.

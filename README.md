@@ -51,6 +51,27 @@ Por defecto el binario escucha en `127.0.0.1:8790` y expone `GET /health`:
 `sessionSource` es `env`, `config`, `opencode.db` o `session-diff`. El puerto se
 puede cambiar con `PI_FREE_BRIDGE_BRIDGE_GO_PORT`.
 
+### Arranque y recuperación (launcher, multiplataforma)
+
+Al pedir el puerto, la extensión primero pregunta si ya hay una instancia
+sana (`GET /health`, hasta 3 intentos × 750 ms con 500 ms de pausa: tolera el
+cold-start de un binario recién lanzado, por ejemplo un escaneo de antivirus).
+Si no responde y un proceso `pi-free-bridge` viejo de una sesión anterior quedó
+colgado con el puerto tomado, el launcher lo identifica por pid dueño del
+socket y nombre de proceso, lo mata y arranca una instancia nueva una sola vez
+(acotado). El mecanismo es multiplataforma:
+
+- **Windows**: `netstat -ano` para el pid, `Get-Process` para la identidad,
+  `taskkill /T /F` para terminar todo el árbol de procesos.
+- **Linux/macOS**: `lsof -t -i TCP:<puerto> -sTCP:LISTEN` para el pid,
+  `ps -p <pid> -o comm=` para la identidad, `SIGKILL` para terminar.
+
+Nunca mata un dueño del puerto que no pueda identificar positivamente como
+`pi-free-bridge`; si el puerto lo tiene otro servicio, reporta que hay que
+elegir otro puerto en vez de matar nada. Si las herramientas del SO no están
+disponibles (por ejemplo `lsof` ausente), la recuperación se degrada a
+best-effort y el error original se reporta sin matar nada.
+
 ## Instalación
 
 ### Plug-and-play (recomendado)
@@ -130,7 +151,13 @@ imágenes. Por ahora solo documentado, no implementado.
 
 ## Troubleshooting
 
-- **"pi-free-bridge: bridge-go is not reachable"**: El binario no se descargó o no se puede ejecutar. Ejecutar `/free-bridge-doctor` para diagnóstico.
+- **"bridge-go started but did not answer /health"**: suele ser un zombie de una sesión anterior con el puerto tomado. El launcher ahora lo mata y reincida una vez; si persiste, ejecutar `/free-bridge-doctor` o cambiar el puerto con `PI_FREE_BRIDGE_BRIDGE_GO_PORT`. Causas posibles: instancia previa colgada, o antivirus demorando mucho más de los 3 intentos de arranque.
+- **"bridge-go is not reachable"**: El binario no se descargó o no se puede ejecutar. Ejecutar `/free-bridge-doctor` para diagnóstico.
 - **"No free models discovered"**: El registry de OpenCode no está disponible. Ejecutar `/free-bridge-refresh`.
 - **429 FreeUsageLimitError**: El gate rechazó el request. Verificar que bridge-go esté corriendo y que el session ID sea válido (`/free-bridge-session`).
 - **El paquete desaparece después de `pi update`**: `pi list`, y después `pi install git:github.com/Deury08/pi-free-bridge#go-native`.
+
+## Notas técnicas
+
+- El binario `pi-free-bridge` registra la línea "listening on" en su log **antes** de intentar el bind del puerto; si otra instancia posee el puerto la línea es solo informativa y el proceso muere enseguida con un error de bind. Es la razón por la que el recovery del launcher existe (ver `odd/tasks/bridge-go-health-recovery.md`).
+- Los helpers puros de launcher y recovery son módulos `.mjs` testables con Node (`node --test test/`): `relay.mjs` (eliminado en la rama go-native; su test quedó obsoleto) y `health-recovery.mjs` (probe con reintentos, lookup del pid dueño del puerto, guardia de identidad y kill acotado, todos multiplataforma).
