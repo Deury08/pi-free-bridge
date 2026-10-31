@@ -150,7 +150,7 @@ async function main() {
   console.log("[postinstall] Installing pi-free-bridge...");
 
   const pkgPath = join(ROOT, "package.json");
-  let version = "v0.1.0";
+  let version = "v0.1.1";
   try {
     const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
     version = "v" + (pkg.version || version).replace(/^v/, "");
