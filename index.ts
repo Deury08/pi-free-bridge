@@ -5,6 +5,7 @@ import https from "node:https";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { findPortListenerPid, isBridgeGoPid, killStaleBridgeGo, probeBridgeGoHealth } from "./health-recovery.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -661,20 +662,16 @@ function describeBridgeGoBin(): string {
 	return `${path} (${rel})`;
 }
 
-/** Probe a port for our own bridge-go. `absent` means nothing is listening there. */
+/** Probe a port for our own bridge-go. `absent` means nothing is listening there.
+ *  Single-shot: the launcher decides when retries / recovery are appropriate. */
 async function probeBridgeGo(port: number): Promise<"healthy" | "foreign" | "absent"> {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), 750);
-	try {
-		const res = await fetch(bridgeGoHealthUrl(port), { signal: controller.signal });
-		if (!res.ok) return "foreign";
-		const payload = (await res.json()) as { service?: unknown };
-		return payload?.service === BRIDGE_GO_SERVICE ? "healthy" : "foreign";
-	} catch {
-		return "absent";
-	} finally {
-		clearTimeout(timer);
-	}
+	return probeBridgeGoHealth(bridgeGoHealthUrl(port), BRIDGE_GO_SERVICE, { attempts: 1 });
+}
+
+/** Post-listen health probe with retries: a fresh binary may need more than
+ *  one 750 ms window to answer (Windows AV cold-start of a first-run exe). */
+function probeBridgeGoRetrying(port: number): Promise<"healthy" | "foreign" | "absent"> {
+	return probeBridgeGoHealth(bridgeGoHealthUrl(port), BRIDGE_GO_SERVICE);
 }
 
 function waitForBridgeGoListening(child: ChildProcess, port: number): Promise<void> {
@@ -795,7 +792,7 @@ function bridgeGoEnv(options: BridgeGoOptions): Record<string, string | undefine
 	return env;
 }
 
-async function startBridgeGo(options: BridgeGoOptions, key: string): Promise<BridgeGoState> {
+async function startBridgeGo(options: BridgeGoOptions, key: string, retry = false): Promise<BridgeGoState> {
 	const url = bridgeGoUrl(options.port);
 	const probe = await probeBridgeGo(options.port);
 
@@ -826,12 +823,28 @@ async function startBridgeGo(options: BridgeGoOptions, key: string): Promise<Bri
 
 	try {
 		await waitForBridgeGoListening(child, options.port);
-		child.stdout?.resume();
-		child.stderr?.resume();
 
-		if ((await probeBridgeGo(options.port)) !== "healthy") {
+		let probe = await probeBridgeGoRetrying(options.port);
+		if (probe === "absent" && !retry) {
+			// main.go logs its listening line before ListenAndServe binds, so a
+			// stale hung instance from a previous session makes the new child
+			// print the line and then exit on a bind error — while the probe
+			// questions the hung zombie. Identify and kill that stale owner
+			// once, then start over. A port owner we cannot positively identify
+			// as pi-free-bridge is never killed.
+			const stale = findPortListenerPid(options.port);
+			if (stale !== 0 && stale !== child.pid && isBridgeGoPid(stale) && killStaleBridgeGo(stale)) {
+				child.kill(); // the bind-failed child is already exiting; be sure
+				return startBridgeGo(options, key, true);
+			}
+		}
+
+		if (probe !== "healthy") {
 			throw new Error(`pi-free-bridge: bridge-go started but did not answer /health on ${url}`);
 		}
+
+		child.stdout?.resume();
+		child.stderr?.resume();
 	} catch (err) {
 		if (!child.killed) child.kill();
 		throw err;

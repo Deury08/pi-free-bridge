@@ -18,6 +18,7 @@
   "files": [
     "index.ts",
     "relay.mjs",
+    "health-recovery.mjs",
     "README.md",
     "LICENSE",
     "bridge-go"
