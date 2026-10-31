@@ -123,17 +123,23 @@ func (a *ToolAliaser) lookup(alias string) (string, bool) {
 // is copied verbatim, and only complete `data:` lines whose payload starts
 // with a JSON object brace are rewritten. Reads may arrive fragmented; the
 // buffered reader reassembles lines, which the old per-chunk string-replace
-// could not do. A final line without a terminator (upstream cut mid-event) is
-// still flushed instead of dropped.
+// could not do. A final line without a terminator (an upstream JSON error
+// body, or a stream cut mid-event) is flushed with its terminator intact —
+// never an added \n, which would overrun the response's declared
+// Content-Length and abort the connection.
 func (h *SSEHandler) Pipe(src io.Reader, dst io.Writer) error {
-	// Checker: returns the bytes to write for one complete input line (no
-	// terminator included) and whether the line carried a \r before the \n.
-	emit := func(line []byte, hadCR bool) error {
-		out := rewrite(h.aliaser, line)
-		if hadCR {
-			out = append(out, '\r')
+	// emit writes one line re-terminated exactly as the source terminated
+	// it. hadTerm decides whether a terminator is written at all: appended
+	// only when the source line carried one, so an unterminated final line
+	// (upstream JSON error, cut stream) is written bare and byte-exact.
+	emit := func(restored []byte, hadTerm bool, hadCR bool) error {
+		out := restored
+		if hadTerm {
+			if hadCR {
+				out = append(out, '\r')
+			}
+			out = append(out, '\n')
 		}
-		out = append(out, '\n')
 		_, err := dst.Write(out)
 		return err
 	}
@@ -141,17 +147,19 @@ func (h *SSEHandler) Pipe(src io.Reader, dst io.Writer) error {
 	reader := bufio.NewReaderSize(src, 64*1024)
 	for {
 		line, err := reader.ReadBytes('\n')
+		// ReadBytes returns err == nil exactly when it found the
+		// terminator; on clean EOF after a delimiter it still returns nil.
+		hadTerm := err == nil
 		hadCR := bytes.HasSuffix(line, []byte{'\r', '\n'})
-		if index := bytes.LastIndexByte(line, '\n'); index >= 0 {
-			line = line[:index]
-		}
 		var writeErr error
-		if len(line) > 0 || hadCR || err == nil {
-			// Emit complete lines; keep blank framing lines verbatim.
-			if hadCR {
-				line = line[:len(line)-1] // drop the trailing \r: re-added on emit
+		if len(line) > 0 || hadTerm || err == nil {
+			if index := bytes.LastIndexByte(line, '\n'); index >= 0 {
+				line = line[:index]
 			}
-			writeErr = emit(line, hadCR)
+			if hadCR {
+				line = line[:len(line)-1] // strip the \r before restore
+			}
+			writeErr = emit(rewrite(h.aliaser, line), hadTerm, hadCR)
 		}
 		if err != nil {
 			if err == io.EOF {

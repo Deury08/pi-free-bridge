@@ -205,6 +205,22 @@ func TestPipeRestoresSSEAndKeepsFraming(t *testing.T) {
 	}
 }
 
+// A terminal body without a trailing newline (upstream JSON errors have no
+// terminator and carry an exact Content-Length) must be reproduced byte for
+// byte: adding a phantom \n overruns the declared Content-Length and Go's
+// server aborts the response, killing the client connection.
+func TestPipeUnterminatedFinalLineIsByteExact(t *testing.T) {
+	a := NewToolAliaser()
+	body := `{"error":{"type":"server_error","message":"Model is unavailable."}}`
+	var out bytes.Buffer
+	if err := NewSSEHandler(a).Pipe(strings.NewReader(body), &out); err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	if out.String() != body {
+		t.Errorf("unterminated body not byte-exact:\n got %q\nwant %q", out.String(), body)
+	}
+}
+
 // The parser must survive network-fragmented reads: iotest.OneByteReader
 // gives the reader one byte at a time within a single Pipe call — the exact
 // case that broke the old per-chunk string-replace.

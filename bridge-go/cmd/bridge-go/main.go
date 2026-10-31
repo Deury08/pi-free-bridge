@@ -317,6 +317,10 @@ func chatCompletionsHandler(
 		}
 		defer resp.Body.Close()
 
+		// Copy the upstream response headers verbatim, then stream the
+		// response back restoring aliased tool names. The previous
+		// io.Copy left every "bridge_*" tool call un-restored; see
+		// odd/tasks/bridge-go-tool-alias-restore.md.
 		for k, vv := range resp.Header {
 			for _, v := range vv {
 				w.Header().Add(k, v)
@@ -325,9 +329,26 @@ func chatCompletionsHandler(
 		w.Header().Set("X-Egress-Used", egressUsed)
 		w.WriteHeader(resp.StatusCode)
 
-		// Stream the response back restoring aliased tool names. The previous
-		// io.Copy left every "bridge_*" tool call un-restored; see
-		// odd/tasks/bridge-go-tool-alias-restore.md.
+		// Error bodies are JSON without a trailing newline and carry an
+		// exact Content-Length: copy those bytes literally instead of
+		// paying the line-restore cost — but log a bounded snapshot first,
+		// because "the client saw nothing" diagnostics need upstream
+		// evidence.
+		if resp.StatusCode >= 400 {
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			fmt.Fprintf(os.Stderr, "bridge: upstream %d body: %s\n", resp.StatusCode, bodyBytes)
+			if trimmed := bytes.TrimLeft(bodyBytes, " \t\r\n"); bytes.HasPrefix(trimmed, []byte("data:")) {
+				// An SSE error stream: hand the snapshot back and let the
+				// restore pipe finish the rest verbatim.
+				resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyBytes), resp.Body))
+				if err := sseHandler.Pipe(resp.Body, w); err != nil {
+					log.Printf("bridge-go: stream restore aborted: %v", err)
+				}
+				return
+			}
+			_, _ = w.Write(bodyBytes)
+			return
+		}
 		if err := sseHandler.Pipe(resp.Body, w); err != nil {
 			log.Printf("bridge-go: stream restore aborted: %v", err)
 			return

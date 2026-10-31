@@ -86,6 +86,36 @@ gate changes stay uncommitted; the rebuilt binary still contains them).
 
 Author's inline fix in one bounded area already mapped; Go toolchain present.
 
-## Verification evidence
+## Follow-up defect: Content-Length overrun on error bodies (2026-10-31)
 
-See the section above (T1–T5 evidence consolidated there).
+**Problem (observed live):** after T5 deploy, every upstream error response
+(4xx/5xx JSON with an exact `Content-Length`) killed the client connection:
+`SSEHandler.Pipe` re-emitted the final line always terminated with `\n`, but
+upstream error bodies end without a newline — the copied body ran one byte
+over the declared `Content-Length` and Go's server aborted
+("http: wrote more than the declared Content-Length"; client sees
+`UND_ERR_SOCKET other side closed`). Pi therefore got a dead socket instead
+of the error — "no me responde" with no diagnostic.
+
+**Fix (test-first, RED→GREEN):**
+
+- `SSEHandler.Pipe` now re-terminates each line exactly as the source did
+  (`hadTerm := err == nil` — ReadBytes returns nil only when it found `\n`).
+  Unterminated final lines flush byte-bare. Non-SSE JSON passthrough is now
+  byte-exact. `\r\n` framing unchanged.
+- New test `TestPipeUnterminatedFinalLineIsByteExact` (was RED: got +1 `\n`;
+  now GREEN).
+- `chatCompletionsHandler`: for upstream ≥400 responses the body is read
+  (≤4 KB), logged to stderr for diagnostics, and written literally — exact
+  length match with the copied headers; the restore pipe no longer touches
+  error bodies. SSE-shaped error bodies (leading `data:`) replay the
+  snapshot through the pipe.
+- Removed the temporary debug body/MultiReader hack which could double-serve
+  bytes.
+
+**Evidence:** rebuild + temp instance on 8791 → upstream 400 now returns
+complete body (92 bytes incl the mapped upstream message), client fetch
+resolves cleanly (no `terminated`); happy-path SSE against the real
+upstream (`glm-5.3-flash-free`) still 200 with `[DONE]`, tools restored;
+`go test ./...` and vet clean. Error-map paths (decoder/roundtrip failures)
+write their own status+body and are unaffected.
