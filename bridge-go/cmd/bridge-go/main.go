@@ -273,15 +273,11 @@ func chatCompletionsHandler(
 
 		var clientTools []gate.Tool
 		if tools, ok := reqBody["tools"].([]any); ok {
-			for _, t := range tools {
-				if tt, ok := t.(map[string]any); ok {
-					clientTools = append(clientTools, gate.Tool{
-						Name:        getString(tt, "name"),
-						Description: getString(tt, "description"),
-						Parameters:  getMap(tt, "parameters"),
-					})
-				}
-			}
+			// Pi sends the nested OpenAI shape (type/function), the same shape
+			// gate.Tool marshals; parse both nested and flat (main.go used to
+			// read the flat "name" key only, aliasing every tool with an empty
+			// name as bridge__N — the "Tool bridge__271 not found" defect).
+			clientTools = gate.ToolsFromOpenAI(tools)
 		}
 		aliasedTools, _ := toolAliaser.AliasTools(clientTools)
 		reqBody["tools"] = ensureGateTools(aliasedTools)
@@ -329,20 +325,13 @@ func chatCompletionsHandler(
 		w.Header().Set("X-Egress-Used", egressUsed)
 		w.WriteHeader(resp.StatusCode)
 
-		io.Copy(w, resp.Body)
+		// Stream the response back restoring aliased tool names. The previous
+		// io.Copy left every "bridge_*" tool call un-restored; see
+		// odd/tasks/bridge-go-tool-alias-restore.md.
+		if err := sseHandler.Pipe(resp.Body, w); err != nil {
+			log.Printf("bridge-go: stream restore aborted: %v", err)
+			return
+		}
 	}
 }
 
-func getString(m map[string]any, key string) string {
-	if v, ok := m[key].(string); ok {
-		return v
-	}
-	return ""
-}
-
-func getMap(m map[string]any, key string) map[string]any {
-	if v, ok := m[key].(map[string]any); ok {
-		return v
-	}
-	return nil
-}

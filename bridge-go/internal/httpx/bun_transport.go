@@ -172,19 +172,37 @@ func (t *BunTransport) putConn(addr string, bc *bunConn) {
 }
 
 func (t *BunTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme != "https" {
-		return nil, fmt.Errorf("BunTransport only supports https")
-	}
 	addr := req.URL.Host
-	if req.URL.Port() == "" {
-		addr += ":443"
+	if req.URL.Scheme == "https" {
+		if req.URL.Port() == "" {
+			addr = req.URL.Host + ":443"
+		}
+		bc, err := t.getConn(req.Context(), addr)
+		if err != nil {
+			return nil, err
+		}
+		return t.finishRoundTrip(bc, req, addr)
 	}
 
-	bc, err := t.getConn(req.Context(), addr)
+	// Plain http is accepted only for loopback targets (local fakes and helper
+	// services). The real gate rides TLS, so production upstreams stay https
+	// and keep the Bun fingerprint path.
+	if host := req.URL.Hostname(); !isLoopbackHost(host) {
+		return nil, fmt.Errorf("BunTransport only supports https (plain http allowed only for loopback, got %q)", host)
+	}
+	if req.URL.Port() == "" {
+		return nil, fmt.Errorf("BunTransport plain http requires an explicit port: %s", req.URL.Host)
+	}
+	conn, err := t.dialContext(req.Context(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	return t.finishRoundTrip(&bunConn{conn: conn, transport: t}, req, addr)
+}
 
+// finishRoundTrip performs request write + response read + connection
+// bookkeeping on an already-established (TLS or plain) bunConn.
+func (t *BunTransport) finishRoundTrip(bc *bunConn, req *http.Request, addr string) (*http.Response, error) {
 	if err := t.writeRequest(bc, req); err != nil {
 		bc.Close()
 		return nil, err
@@ -202,6 +220,15 @@ func (t *BunTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		t.putConn(addr, bc)
 	}
 	return resp, nil
+}
+
+// isLoopbackHost reports whether the host is a loopback IP or "localhost".
+func isLoopbackHost(host string) bool {
+	if host == "localhost" || host == "::1" || host == "[::1]" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (t *BunTransport) writeRequest(bc *bunConn, req *http.Request) error {
