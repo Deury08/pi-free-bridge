@@ -295,7 +295,7 @@ func chatCompletionsHandler(
 			reqHeaders.Set(k, v)
 		}
 		reqHeaders.Set("Authorization", "Bearer public")
-		reqHeaders.Set("User-Agent", "opencode/latest/2.1.1/cli")
+		reqHeaders.Set("User-Agent", "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
 		reqHeaders.Set("Accept", "text/event-stream")
 		reqHeaders.Set("Content-Type", "application/json")
 
@@ -313,6 +313,8 @@ func chatCompletionsHandler(
 
 		resp, err, egressUsed := coordinator.RoundTrip(ctx, upstreamReq)
 		if err != nil {
+			// TEMP DEBUG: surface the real roundtrip failure cause.
+			fmt.Fprintf(os.Stderr, "bridge: roundtrip failed via %s: %T %v\n", egressUsed, err, err)
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(errorMapper.Map(http.StatusBadGateway, err.Error()))
 			return

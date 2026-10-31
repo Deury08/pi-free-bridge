@@ -3,9 +3,11 @@ package gate
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -83,10 +85,24 @@ func (s *Session) SessionHeaders() map[string]string {
 	}
 }
 
+// Tool mirrors the nested OpenAI function-declaration shape the gate expects
+// (relay.mjs parity); encoding/json emits it as
+// {"type":"function","function":{"name","description","parameters"}}.
 type Tool struct {
 	Name        string
 	Description string
 	Parameters  map[string]any
+}
+
+func (t Tool) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        t.Name,
+			"description": t.Description,
+			"parameters":  t.Parameters,
+		},
+	})
 }
 
 type ToolAliaser struct {
@@ -157,7 +173,10 @@ func (p *PromptInjector) Inject(messages []map[string]any) []map[string]any {
 	if p.CWD == "" {
 		return messages
 	}
-	envBlock := fmt.Sprintf("<env>\nWorking directory: %s\n</env>\n", p.CWD)
+	// relay.mjs parity: two-space indent, Platform line, appended to the first
+	// system message, no trailing newline after the closing tag.
+	directory := strings.ReplaceAll(p.CWD, "\\", "/")
+	envBlock := fmt.Sprintf("<env>\n  Working directory: %s\n  Platform: %s\n</env>", directory, platformString())
 	hasSystem := false
 	for _, m := range messages {
 		if m["role"] == "system" {
@@ -165,7 +184,7 @@ func (p *PromptInjector) Inject(messages []map[string]any) []map[string]any {
 			if c, ok := m["content"].(string); ok {
 				content = c
 			}
-			m["content"] = envBlock + content
+			m["content"] = content + "\n\n" + envBlock
 			hasSystem = true
 			break
 		}
@@ -174,6 +193,16 @@ func (p *PromptInjector) Inject(messages []map[string]any) []map[string]any {
 		messages = append([]map[string]any{{"role": "system", "content": envBlock}}, messages...)
 	}
 	return messages
+}
+
+// platformString maps runtime GOOS onto the Platform label the gate parses.
+func platformString() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win32"
+	default:
+		return runtime.GOOS
+	}
 }
 
 type ErrorMapper struct{}

@@ -3,7 +3,7 @@ import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, chmodSync, unlinkSync } from "node:fs";
 import https from "node:https";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
@@ -524,30 +524,50 @@ async function downloadBinary(targetPath: string, version: string, ctx?: any): P
 	ctx?.ui?.notify?.(`Downloading pi-free-bridge ${version}...`, "info");
 
 	await new Promise<void>((resolve, reject) => {
-		https.get(url, (res) => {
-			if (res.statusCode !== 200) {
-				reject(new Error(`HTTP ${res.statusCode}: ${url}`));
-				return;
-			}
-			const chunks: Buffer[] = [];
-			let total = 0;
-			const LIMIT = 50 * 1024 * 1024;
-			res.on("data", (c: Buffer) => {
-				total += c.length;
-				if (total > LIMIT) {
-					reject(new Error("Downloaded archive exceeds 50 MB"));
-					res.destroy();
+		const fetch = (currentUrl: string, redirectsLeft: number) => {
+			https.get(currentUrl, (res) => {
+				const status = res.statusCode ?? 0;
+				if (status === 301 || status === 302 || status === 307 || status === 308) {
+					const location = res.headers.location;
+					res.resume();
+					if (!location) {
+						reject(new Error(`HTTP ${status}: no Location header: ${currentUrl}`));
+						return;
+					}
+					if (redirectsLeft <= 0) {
+						reject(new Error(`Too many redirects: ${currentUrl}`));
+						return;
+					}
+					const nextUrl = new URL(location, currentUrl).href;
+					fetch(nextUrl, redirectsLeft - 1);
 					return;
 				}
-				chunks.push(c);
-			});
-			res.on("end", () => {
-				if (total <= LIMIT) {
-					writeFileSync(archivePath, Buffer.concat(chunks));
-					resolve();
+				if (status !== 200) {
+					res.resume();
+					reject(new Error(`HTTP ${status}: ${currentUrl}`));
+					return;
 				}
-			});
-		}).on("error", reject);
+				const chunks: Buffer[] = [];
+				let total = 0;
+				const LIMIT = 50 * 1024 * 1024;
+				res.on("data", (c: Buffer) => {
+					total += c.length;
+					if (total > LIMIT) {
+						reject(new Error("Downloaded archive exceeds 50 MB"));
+						res.destroy();
+						return;
+					}
+					chunks.push(c);
+				});
+				res.on("end", () => {
+					if (total <= LIMIT) {
+						writeFileSync(archivePath, Buffer.concat(chunks));
+						resolve();
+					}
+				});
+			}).on("error", reject);
+		};
+		fetch(url, 5);
 	});
 
 	// extract
@@ -691,6 +711,10 @@ function waitForBridgeGoListening(child: ChildProcess, port: number): Promise<vo
 		};
 		const onStderr = (chunk: Buffer | string) => {
 			stderr += String(chunk);
+			if (stderr.includes(expected)) {
+				cleanup();
+				resolve();
+			}
 		};
 		const onExit = (code: number | null) => {
 			fail(

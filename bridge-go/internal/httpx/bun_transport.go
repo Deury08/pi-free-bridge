@@ -217,9 +217,14 @@ func (t *BunTransport) writeRequest(bc *bunConn, req *http.Request) error {
 	if ct := req.Header.Get("Content-Type"); ct != "" {
 		buf = append(buf, fmt.Sprintf("Content-Type: %s\r\n", ct)...)
 	}
+	if req.ContentLength >= 0 && req.Body != nil {
+		// The body is fully buffered below; the length is known and must be
+		// declared or the upstream cannot parse the request.
+		buf = append(buf, fmt.Sprintf("Content-Length: %d\r\n", req.ContentLength)...)
+	}
 	for k, vv := range req.Header {
 		cl := strings.ToLower(k)
-		if cl == "host" || cl == "user-agent" || cl == "accept" || cl == "content-type" {
+		if cl == "host" || cl == "user-agent" || cl == "accept" || cl == "content-type" || cl == "content-length" {
 			continue
 		}
 		for _, v := range vv {
