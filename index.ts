@@ -38,7 +38,7 @@ const REGISTRY_PATHS = [
 ];
 
 /** Optional user config: `{ "sessionId": "ses_…", "liveIds": ["…"] }`. */
-const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
+export const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
 
 /** Pi's global settings. Pi scopes the model picker to `enabledModels`, so a
  *  non-empty list means "show ONLY these" — see ensureEnabledPattern. */
@@ -616,14 +616,21 @@ function detachRelayHandles(child: ChildProcess): void {
  *  RELAY_SESSION_PI carries the id the extension harvested from Pi's machine
  *  (bun-upgrades S2, remote OpenCode); when neither exists the relay harvests
  *  from its own local store (S31). */
-function relayEnv(options: RelayOptions): Record<string, string | undefined> {
+export function relayEnv(options: RelayOptions): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...process.env,
 		PORT: String(options.port),
 		RELAY_UPSTREAM: options.upstream,
 		RELAY_CWD: options.cwd,
-		RELAY_WARP_MODE: normalizeWarpMode(options.warpMode) ?? resolveWarpMode(),
+		// relay-warp-hot-reload: the relay resolves the warp mode per request from
+		// this file; RELAY_WARP_MODE is only injected when PI_FREE_BRIDGE_WARP_MODE
+		// is a real env override (absolute precedence preserved, by design).
+		RELAY_CONFIG_PATH: BRIDGE_CONFIG_PATH,
 	};
+
+	const envWarpOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
+	delete env.RELAY_WARP_MODE;
+	if (envWarpOverride) env.RELAY_WARP_MODE = envWarpOverride;
 
 	if (options.sessionId) {
 		const source = options.sessionSource ?? "env";
@@ -788,9 +795,16 @@ export async function identifyAndKillPortOwner(port: number): Promise<"killed" |
 	return "unidentified";
 }
 
+/** relay-warp-hot-reload: the relay cache key drops warpMode — a mode change
+ *  must NOT churn the relay; the relay hot-reloads the mode from the config
+ *  file. Exported for tests. */
+export function relayKey(port: number, sessionId?: string): string {
+	return `${port}\u0000${sessionId ?? ""}`;
+}
+
 async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 	const warpMode = normalizeWarpMode(options.warpMode) ?? resolveWarpMode();
-	const key = `${options.port}\u0000${options.sessionId ?? ""}\u0000${warpMode}`;
+	const key = relayKey(options.port, options.sessionId);
 
 	// A non-off mode needs the WARP proxy alive; never fatal — auto degrades
 	// to local, `on` surfaces the 502 with its egress diagnostic.
@@ -888,6 +902,8 @@ type RelayHealth = {
 	sessionId?: string;
 	sessionSource?: string;
 	warpMode?: string;
+	/** relay-warp-hot-reload: who set the reported mode. */
+	warpModeSource?: "env" | "config";
 	lastEgress?: string;
 	pid?: number;
 };
@@ -905,6 +921,7 @@ export async function fetchRelayHealth(port: number): Promise<RelayHealth | unde
 			sessionId?: unknown;
 			sessionSource?: unknown;
 			warpMode?: unknown;
+			warpModeSource?: unknown;
 			lastEgress?: unknown;
 		};
 		if (payload?.service !== RELAY_SERVICE || payload.ok !== true) return undefined;
@@ -912,6 +929,11 @@ export async function fetchRelayHealth(port: number): Promise<RelayHealth | unde
 			sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
 			sessionSource: typeof payload.sessionSource === "string" ? payload.sessionSource : undefined,
 			warpMode: normalizeWarpMode(payload.warpMode),
+			warpModeSource:
+				typeof payload.warpModeSource === "string" &&
+				["env", "config"].includes(payload.warpModeSource)
+					? (payload.warpModeSource as "env" | "config")
+					: undefined,
 			pid: typeof payload.pid === "number" ? payload.pid : undefined,
 			lastEgress: typeof payload.lastEgress === "string" && ["local", "warp"].includes(payload.lastEgress)
 				? payload.lastEgress
@@ -1727,18 +1749,12 @@ export default function (pi: ExtensionAPI) {
 
 			writeBridgeConfig({ warpEnabled: next });
 
-			// The relay reads the mode at startup, so restart it (the key change
-			// respawns automatically).
-			await stopRelay();
-			let relayNote = "";
-			try {
-				await ensureRelay({ port: RELAY_PORT, upstream: UPSTREAM_URL, cwd: process.cwd() });
-			} catch (err) {
-				relayNote = ` Relay restart failed: ${(err as Error).message}`;
-			}
+			// relay-warp-hot-reload: no relay restart. The relay re-reads the
+			// config file on every request, so the new mode applies on the next
+			// request with the same process (pid survives the switch).
 			ctx.ui.notify(
-				`WARP mode set to ${next} and saved to ${BRIDGE_CONFIG_PATH}.${relayNote}`,
-				relayNote ? "warning" : "info",
+				`WARP mode set to ${next} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
+				"info",
 			);
 		},
 	});

@@ -10,7 +10,13 @@
 //
 // The module exports its pure helpers so `test/relay.test.mjs` can run them
 // under plain Node; the server only starts when this file is executed directly.
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import {
+	existsSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -307,6 +313,49 @@ function egressFetch(config, pathname, { body }, egress) {
 	return fetch(toUpstreamUrl(config.upstream, pathname), opts);
 }
 
+/** Pure: per-request warp mode (relay-warp-hot-reload). Precedence: the
+ *  normalized env override, then the normalized value from the config file,
+ *  then "off". Exported for tests. */
+export function resolveWarpModeHot(override, fileValue) {
+	return normalizeWarpMode(override) ?? normalizeWarpMode(fileValue) ?? "off";
+}
+
+/** Read the extension's persisted config file and return its normalized warp
+ *  mode, or undefined on any missing/foreign/malformed file so the caller can
+ *  keep the last known mode. Never throws. */
+export function readFileWarpMode(path) {
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		const value =
+			parsed && typeof parsed === "object" ? parsed.warpEnabled ?? parsed.warpMode : undefined;
+		return normalizeWarpMode(value);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Hot reload (relay-warp-hot-reload): re-read the warp mode from the config
+ *  file the extension points at via RELAY_CONFIG_PATH. A read/parse failure
+ *  keeps the last known mode and never crashes the request; it warns at most
+ *  once for the life of the process. A RELAY_WARP_MODE env override is
+ *  absolute and pins the mode (source "env", by design). */
+let warpConfigWarned = false;
+function refreshWarpMode(config) {
+	if (config.warpModeSource === "env" || !config.warpConfigPath) return;
+	const fileMode = readFileWarpMode(config.warpConfigPath);
+	if (fileMode) {
+		config.warpMode = fileMode;
+		return;
+	}
+	if (!warpConfigWarned) {
+		warpConfigWarned = true;
+		process.stderr.write(
+			`pi-free-bridge relay: could not read a warp mode from ${config.warpConfigPath} — ` +
+				`keeping ${config.warpMode}\n`,
+		);
+	}
+}
+
 async function forward(req, res, pathname, config) {
 	try {
 		const raw = await readBody(req);
@@ -414,6 +463,10 @@ async function forward(req, res, pathname, config) {
 }
 
 async function handle(req, res, config) {
+	// Hot reload (relay-warp-hot-reload): one cheap config re-read per request
+	// drives both /health and /v1.
+	refreshWarpMode(config);
+
 	const { pathname } = new URL(req.url ?? "/", "http://127.0.0.1");
 
 	if (req.method === "GET" && pathname === "/health") {
@@ -425,6 +478,7 @@ async function handle(req, res, config) {
 			sessionId: config.session,
 			sessionSource: config.sessionSource,
 			warpMode: config.warpMode,
+			warpModeSource: config.warpModeSource,
 			warpProxy: config.warpProxy,
 			lastEgress: lastEgress,
 			pid: process.pid,
@@ -455,6 +509,11 @@ async function startServer() {
 		process.exit(1);
 	}
 
+	// relay-warp-hot-reload: when RELAY_WARP_MODE is a real env override the
+	// mode is absolute (source "env") and the relay stays static, by design.
+	// Otherwise the per-request hot refresh resolves it from the config file
+	// the extension points at via RELAY_CONFIG_PATH.
+	const envOverride = normalizeWarpMode(process.env.RELAY_WARP_MODE);
 	const config = {
 		upstream: process.env.RELAY_UPSTREAM || DEFAULT_UPSTREAM,
 		session: session.sessionId,
@@ -462,7 +521,9 @@ async function startServer() {
 		cwd: process.env.RELAY_CWD || process.cwd(),
 		userAgent: process.env.RELAY_USER_AGENT || DEFAULT_USER_AGENT,
 		apiKey: process.env.RELAY_API_KEY || "public",
-		warpMode: normalizeWarpMode(process.env.RELAY_WARP_MODE) ?? "off",
+		warpMode: resolveWarpModeHot(envOverride, readFileWarpMode(process.env.RELAY_CONFIG_PATH || "")),
+		warpModeSource: envOverride ? "env" : "config",
+		warpConfigPath: process.env.RELAY_CONFIG_PATH || "",
 		warpProxy: process.env.RELAY_WARP_PROXY || WARP_PROXY_DEFAULT,
 	};
 
