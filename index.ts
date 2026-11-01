@@ -3,7 +3,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { createRequire, fileURLToPath } from "node:url";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -711,7 +712,7 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
  *  whose /health reports THIS service and a numeric pid) and spawn fresh.
  *  Old builds report no pid — those are never killed, the caller surfaces
  *  them with an actionable message. */
-async function adoptOrReleaseStaleRelay(port: number, warpMode: string): Promise<"match" | "released" | "unkillable" | "absent"> {
+export async function adoptOrReleaseStaleRelay(port: number, warpMode: string): Promise<"match" | "released" | "unkillable" | "absent"> {
 	const health = await fetchRelayHealth(port);
 	if (!health) return "absent";
 	if (health.warpMode === warpMode) return "match";
@@ -728,6 +729,63 @@ async function adoptOrReleaseStaleRelay(port: number, warpMode: string): Promise
 		await new Promise((resolve) => setTimeout(resolve, 300));
 	}
 	return (await fetchRelayHealth(port)) ? "unkillable" : "released";
+}
+
+const RELAY_LISTENING_LINE = `pi-free-bridge relay listening on http://${RELAY_HOST}:`;
+
+/** Resolve the PID that owns the listening port by OS means, and only then
+ *  kill it when its command line identifies it as OUR relay (never a blind
+ *  kill). Windows: netstat -ano + PowerShell CommandLine. POSIX: lsof + ps. */
+export async function identifyAndKillPortOwner(port: number): Promise<"killed" | "unidentified"> {
+	const { execFileSync } = await import("node:child_process");
+	let pid: number | undefined;
+	let commandLine = "";
+	try {
+		if (process.platform === "win32") {
+			const lines = execFileSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8" });
+			const match = lines
+				.split(/\r?\n/)
+				.find((l) => l.includes(`127.0.0.1:${port}`) && l.toUpperCase().includes("LISTENING"));
+			pid = match && Number.parseInt(match.trim().split(/\s+/).pop() ?? "", 10);
+			if (pid && Number.isInteger(pid)) {
+				const owners = execFileSync(
+					"powershell",
+					[
+						"-NoProfile", "-Command",
+						`(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+					],
+					{ encoding: "utf8", timeout: 15000 },
+				);
+				commandLine = owners.trim();
+			}
+		} else {
+			const out = execFileSync("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+			pid = Number.parseInt(out.trim().split(/\s+/)[0] ?? "", 10);
+			if (pid && Number.isInteger(pid)) {
+				commandLine = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }).trim();
+			}
+		}
+	} catch {
+		return "unidentified";
+	}
+	if (!pid || Number.isInteger(pid) === false) return "unidentified";
+	// Identity guard: our relay prints exactly this line at startup — an
+	// older build still matches (bun + relay.mjs in its command line).
+	const identified =
+		commandLine.includes(RELAY_LISTENING_LINE) ||
+		(commandLine.includes("relay.mjs") && commandLine.includes("bun"));
+	if (!identified) return "unidentified";
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {
+		// already gone
+	}
+	// Confirm the port is free before respawning.
+	for (let i = 0; i < 10; i++) {
+		if (!(await fetchRelayHealth(port))) return "killed";
+		await new Promise((resolve) => setTimeout(resolve, 300));
+	}
+	return "unidentified";
 }
 
 async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
@@ -768,11 +826,16 @@ async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 		return { url: relayUrl(options.port), mode: "reused" };
 	}
 	if (stale === "unkillable") {
-		throw new Error(
-			`pi-free-bridge: a relay from an older Pi session is running on port ${options.port} ` +
-				`with a different WARP mode and no reported pid — kill it manually ` +
-				`(see /free-bridge-doctor) or set PI_FREE_BRIDGE_RELAY_PORT.`,
-		);
+		// Second chance: resolve the port owner by OS means (netstat/lsof +
+		// command line) and kill it only when it identifies as OUR relay.
+		const released = await identifyAndKillPortOwner(options.port);
+		if (released !== "killed" || (await fetchRelayHealth(options.port))) {
+			throw new Error(
+				`pi-free-bridge: a relay from an older Pi session is running on port ${options.port} ` +
+					`with a different WARP mode and could not be released safely — kill it manually ` +
+					`or set PI_FREE_BRIDGE_RELAY_PORT.`,
+			);
+		}
 	}
 	// mode !== "off" already warned about WARP above; the spawn must still go
 	// through so the relay's own chain reports the truth on the wire.
@@ -830,7 +893,7 @@ type RelayHealth = {
 };
 
 /** The relay's `/health` payload, or undefined when it is not answering. */
-async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> {
+export async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 750);
 	try {
