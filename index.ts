@@ -1282,7 +1282,10 @@ async function installWarpBinary(
 			process.platform === "win32"
 				? join(process.env.WINDIR ?? "C:\\Windows", "System32", "tar.exe")
 				: "tar";
-		execFileSync(tarBin, ["-xf", archivePath, "-C", tmpDir], { stdio: "ignore" });
+		execFileSync(tarBin, ["-xf", archivePath, "-C", tmpDir], {
+			stdio: "ignore",
+			timeout: 30000,
+		});
 		const exeName = process.platform === "win32" ? "warp-minimal.exe" : "warp-minimal";
 		// The archive may keep the binary at its root or inside a single folder.
 		let extracted: string | undefined = join(tmpDir, exeName);
@@ -1305,7 +1308,9 @@ async function installWarpBinary(
 		writeBridgeConfig({ warpBin: target });
 		return target;
 	} catch (err) {
-		console.error(`pi-free-bridge: warp-minimal install failed — ${(err as Error).message}`);
+		const message = `warp-minimal install failed: ${(err as Error).message}`;
+		console.error(`pi-free-bridge: ${message}`);
+		status?.(message);
 		return undefined;
 	} finally {
 		rmSync(tmpDir, { recursive: true, force: true });
