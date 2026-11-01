@@ -128,6 +128,14 @@ En los errores ≥ 400 el relay loguea un snapshot acotado del cuerpo del upstre
 (stderr) y lo devuelve byte-exacte, con pista específica de session id ante
 `429`.
 
+**Instalación desde Pi (opción 2):** si activás `auto` u `on` y no hay WARP vivo
+ni binario configurado, Pi abre un diálogo de confirmación y, si aceptás, descarga
+la última release de `github.com/Deury08/warp-minimal`, verifica su sha256 contra
+`checksums.txt` del propio release, la instala en
+`~/.pi/agent/pi-free-bridge/warp/` y levanta el proceso. Nada se baja sin tu
+consentimiento explícito, y si el download falla el modo queda configurado con un
+warning (`auto` sigue funcionando directo).
+
 ## Qué registra
 
 Nueve modelos, descubiertos desde el registry de OpenCode
@@ -177,7 +185,8 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `/free-bridge-session ses_…` | Cambia el session id de esta sesión **y lo persiste** en `~/.pi/agent/pi-free-bridge.json` | El gate responde `403` porque el id quedó viejo |
 | `/free-bridge-refresh` | Pide `GET /inference/v1/models`, lo cruza con los gratis del registry, persiste el resultado y re-registra el provider | OpenCode agregó o sacó un modelo gratis |
 | `/free-bridge-warp` | Muestra el modo de salida WARP (`off` por defecto) y el último egress usado | Diagnóstico de red o grandes rate limits |
-| `/free-bridge-warp off\|auto\|on` | Cambia y persiste el modo: `off` directo; `auto` directo primero, WARP ante rate limit; `on` siempre WARP | Requiere `warp-minimal` en `127.0.0.1:8789` (o `PI_FREE_BRIDGE_WARP_BIN` para que la extensión lo levante) |
+| `/free-bridge-warp off\|auto\|on` | Cambia y persiste el modo: `off` directo; `auto` directo primero, WARP ante rate limit; `on` siempre WARP | Requiere `warp-minimal` en `127.0.0.1:8789`. Si no está y no hay ruta configurada, Pi **te pregunta** y ofrece descargar e instalar la release oficial (checksum verificado) |
+| `/free-bridge-warp bin <ruta>` | Configura la ruta del binario `warp-minimal` (queda en `warpBin` de la config) | Cuando ya lo tenés compilado o descargado y preferís apuntarlo a mano |
 
 ### Terminal (fuera de Pi)
 
@@ -201,7 +210,8 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `~/.pi/agent/pi-free-bridge.json` → `warpEnabled` | Modo de egress WARP: `off`, `auto` u `on` (por defecto `off`) |
 | `PI_FREE_BRIDGE_WARP_MODE` | Pisa el modo de egress WARP (también `off`, `auto`, `on`; máxima precedencia) |
 | `PI_FREE_BRIDGE_WARP_PROXY` | URL del proxy WARP (por defecto `http://127.0.0.1:8789`) |
-| `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` para que la extensión lo levante si `/health` no responde |
+| `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` (precedencia sobre `warpBin` en config) |
+| `~/.pi/agent/pi-free-bridge.json` → `warpBin` | Ruta al binario; si no hay ninguna y no responde, Pi ofrece descargar e instalar la release oficial (te lo pregunta antes) |
 | `~/.pi/agent/pi-free-bridge.json` → `liveIds` | Sobreescribe el snapshot de modelos publicitados |
 | `~/.pi/agent/pi-free-bridge.json` → `relayPort` | Puerto del relay (por defecto `8788`) |
 | `PI_FREE_BRIDGE_RELAY_PORT` | Pisa el puerto del relay |

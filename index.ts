@@ -1,9 +1,10 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { createRequire, fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -292,6 +293,8 @@ type BridgeConfig = {
 	relayPort?: number;
 	/** "off" | "auto" | "on" (bun-upgrades S5); anything else reads as off. */
 	warpEnabled?: string;
+	/** Path to the warp-minimal binary for supervised spawning. */
+	warpBin?: string;
 };
 
 function readBridgeConfig(): BridgeConfig {
@@ -1130,7 +1133,10 @@ let warpWarned = false;
 async function ensureWarp(): Promise<boolean> {
 	const ok = await probeWarp(WARP_DEFAULT_PORT, 2);
 	if (ok) return true;
-	const bin = process.env.PI_FREE_BRIDGE_WARP_BIN?.trim();
+	// Precedence: explicit env var, then the persisted config entry, then
+	// supervise nothing (warn once; the relay's chain degrades per mode).
+	const bin =
+		process.env.PI_FREE_BRIDGE_WARP_BIN?.trim() || readBridgeConfig().warpBin?.trim() || "";
 	if (!bin) {
 		if (!warpWarned) {
 			console.error(
@@ -1156,6 +1162,146 @@ async function ensureWarp(): Promise<boolean> {
 			warpWarned = true;
 		}
 		return false;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// warp-minimal install (bun-upgrades S4, in-Pi with explicit consent)
+// ---------------------------------------------------------------------------
+//
+// When a non-off mode needs WARP and no binary is known, the extension can
+// download the latest warp-minimal release from github.com/Deury08/warp-minimal
+// — but ONLY after ctx.ui.confirm answers yes, and with a checksum check from
+// the release's own checksums.txt.
+
+const WARP_RELEASE_API = "https://api.github.com/repos/Deury08/warp-minimal/releases/latest";
+const WARP_INSTALL_DIR = join(homedir(), ".pi", "agent", "pi-free-bridge", "warp");
+
+function warpAssetKey(): string | undefined {
+	const os =
+		process.platform === "win32"
+			? "windows"
+			: process.platform === "darwin"
+				? "darwin"
+				: process.platform === "linux"
+					? "linux"
+					: undefined;
+	if (!os) return undefined;
+	const arch = process.arch === "arm64" ? "arm64" : "amd64";
+	return `${os}_${arch}`;
+}
+
+/** Latest platform asset from the release API. */
+async function findWarpAsset(): Promise<{ tag: string; url: string; name: string; size: number } | undefined> {
+	try {
+		const res = await fetch(WARP_RELEASE_API, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(10000),
+		});
+		if (!res.ok) return undefined;
+		const release = (await res.json()) as {
+			tag_name?: unknown;
+			assets?: { name?: unknown; browser_download_url?: unknown; size?: unknown }[];
+		};
+		const key = warpAssetKey();
+		if (!key) return undefined;
+		const asset = (release.assets ?? []).find(
+			(a) =>
+				typeof a.name === "string" &&
+				typeof a.browser_download_url === "string" &&
+				a.name.includes(key) &&
+				(a.name.endsWith(".zip") || a.name.endsWith(".tar.gz")),
+		);
+		if (!asset) return undefined;
+		return {
+			tag: typeof release.tag_name === "string" ? release.tag_name : "latest",
+			url: asset.browser_download_url as string,
+			name: asset.name as string,
+			size: typeof asset.size === "number" ? asset.size : 0,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/** Download + extract the release, verify its sha256 against checksums.txt,
+ *  install the binary under WARP_INSTALL_DIR and return its path, or
+ *  undefined with the failure logged. Extraction uses the system `tar`
+ *  (bsdtar), which ships with Windows 10+, macOS and Linux and handles the
+ *  zip archives too. */
+async function installWarpBinary(asset: { tag: string; url: string; name: string; size: number }): Promise<string | undefined> {
+	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-warp-"));
+	try {
+		const archivePath = join(tmpDir, asset.name);
+		const res = await fetch(asset.url, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(60000),
+		});
+		if (!res.ok) {
+			console.error(`pi-free-bridge: warp-minimal download failed — HTTP ${res.status}`);
+			return undefined;
+		}
+		writeFileSync(archivePath, Buffer.from(await res.arrayBuffer()));
+
+		const csUrl = asset.url.slice(0, asset.url.length - asset.name.length) + "checksums.txt";
+		const csRes = await fetch(csUrl, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(15000),
+		});
+		if (!csRes.ok) {
+			console.error(`pi-free-bridge: warp-minimal checksums.txt unreachable — HTTP ${csRes.status}`);
+			return undefined;
+		}
+		const checksums = await csRes.text();
+		const expected = checksums
+			.split(/\r?\n/)
+			.find((line) => line.trimEnd().endsWith(asset.name))
+			?.split(/\s+/)[0];
+		const got = createHash("sha256").update(readFileSync(archivePath)).digest("hex");
+		if (!expected) {
+			console.error("pi-free-bridge: no checksum listed for", asset.name);
+			return undefined;
+		}
+		if (expected.toLowerCase() !== got) {
+			console.error(`pi-free-bridge: warp-minimal checksum mismatch (expected ${expected}, got ${got})`);
+			return undefined;
+		}
+
+		mkdirSync(WARP_INSTALL_DIR, { recursive: true });
+		const { execFileSync } = await import("node:child_process");
+		// bsdtar handles the zip archives; GNU tar in a Git-Bash PATH does not.
+		// Windows 10+ ships bsdtar at System32; macOS/Linux default to it.
+		const tarBin =
+			process.platform === "win32"
+				? join(process.env.WINDIR ?? "C:\\Windows", "System32", "tar.exe")
+				: "tar";
+		execFileSync(tarBin, ["-xf", archivePath, "-C", tmpDir], { stdio: "ignore" });
+		const exeName = process.platform === "win32" ? "warp-minimal.exe" : "warp-minimal";
+		// The archive may keep the binary at its root or inside a single folder.
+		let extracted: string | undefined = join(tmpDir, exeName);
+		if (!existsSync(extracted)) {
+			for (const entry of readdirSync(tmpDir)) {
+				const candidate = join(tmpDir, entry, exeName);
+				if (existsSync(candidate)) {
+					extracted = candidate;
+					break;
+				}
+			}
+		}
+		if (!extracted || !existsSync(extracted)) {
+			console.error(`pi-free-bridge: did not find ${exeName} inside ${asset.name}`);
+			return undefined;
+		}
+		const target = join(WARP_INSTALL_DIR, exeName);
+		copyFileSync(extracted, target);
+		if (process.platform !== "win32") chmodSync(target, 0o755);
+		writeBridgeConfig({ warpBin: target });
+		return target;
+	} catch (err) {
+		console.error(`pi-free-bridge: warp-minimal install failed — ${(err as Error).message}`);
+		return undefined;
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
 	}
 }
 
@@ -1364,8 +1510,19 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("free-bridge-warp", {
-		description: "Show or set the WARP egress mode: off | auto | on",
+		description: "Show or set the WARP egress mode: off | auto | on; bin <path> configures the binary",
 		handler: async (args: string, ctx) => {
+			const binArgs = args.trim().match(/^bin\s+(.+)/i);
+			if (binArgs) {
+				const binPath = binArgs[1].trim();
+				if (!existsSync(binPath)) {
+					ctx.ui.notify(`File not found: ${binPath} — nothing was changed`, "warning");
+				} else {
+					writeBridgeConfig({ warpBin: binPath });
+					ctx.ui.notify(`pi-free-bridge: warpBin set to ${binPath} in ${BRIDGE_CONFIG_PATH}`, "info");
+				}
+				return;
+			}
 			const next = normalizeWarpMode(args);
 			if (!next) {
 				const envOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
@@ -1389,6 +1546,55 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			// bun-upgrades S4: a non-off mode needs warp-minimal alive. Ask with
+			// an explicit dialog before anything is downloaded.
+			if (next !== "off" && !(await ensureWarp())) {
+				const asset = await findWarpAsset();
+				const sizeMb = asset && asset.size > 0 ? ` (${(asset.size / 1048576).toFixed(1)} MB)` : "";
+				const consent =
+					ctx.hasUI &&
+					(await ctx.ui.confirm(
+						"pi-free-bridge",
+						asset
+							? `WARP is not running and no binary is configured.\n\n` +
+								`Download warp-minimal ${asset.tag}${sizeMb} from\n` +
+								`github.com/Deury08/warp-minimal, verify its checksum,\n` +
+								`and install it to ${WARP_INSTALL_DIR}?`
+							: `WARP is not running and no binary is configured.\n\n` +
+								`No release asset is reachable right now.\n\n` +
+								`Configure the path manually with: /free-bridge-warp bin <path>\n` +
+								`or set PI_FREE_BRIDGE_WARP_BIN. Switch anyway?`,
+					));
+				if (consent && asset) {
+					ctx.ui.notify(`Downloading warp-minimal ${asset.tag}…`, "info");
+					const installed = await installWarpBinary(asset);
+					if (installed) {
+						ctx.ui.notify(`warp-minimal installed to ${installed}`, "info");
+						if (!(await ensureWarp())) {
+							ctx.ui.notify(
+								`warp-minimal was installed but did not answer /health on 127.0.0.1:${WARP_DEFAULT_PORT}`,
+								"warning",
+							);
+						}
+					} else {
+						ctx.ui.notify(
+							"warp-minimal install failed — see the Pi error log.\n" +
+								"You can still configure the path manually:\n/free-bridge-warp bin <path>",
+							"warning",
+						);
+					}
+				}
+				if (next === "on" && !(await ensureWarp())) {
+					// `on` is WARP-only; switching without a working WARP would
+						// fail every request until WARP comes up.
+					ctx.ui.notify(
+						`Not switching to on: WARP is not up. Set it again when warp-minimal answers on 127.0.0.1:${WARP_DEFAULT_PORT}.`,
+						"warning",
+					);
+					return;
+				}
+			}
+
 			writeBridgeConfig({ warpEnabled: next });
 
 			// The relay reads the mode at startup, so restart it (the key change
