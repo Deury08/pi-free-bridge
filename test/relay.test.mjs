@@ -376,7 +376,12 @@ test("WARP_MODES: exactly off, auto, on", () => {
 // Hot warp-mode resolution (relay-warp-hot-reload)
 // ---------------------------------------------------------------------------
 
-import { readFileWarpMode, resolveWarpModeHot } from "../relay.mjs";
+import {
+	bumpWarp429Streak,
+	needsWarpRecycle,
+	readFileWarpMode,
+	resolveWarpModeHot,
+} from "../relay.mjs";
 
 test("resolveWarpModeHot: override wins over the file value", () => {
 	assert.equal(resolveWarpModeHot("on", "off"), "on");
@@ -420,6 +425,24 @@ test("readFileWarpMode: a malformed config file never throws", () => {
 	const file = join(dir, "config.json");
 	writeFileSync(file, "{ not json");
 	assert.equal(readFileWarpMode(file), undefined);
+});
+
+test("bumpWarp429Streak: only a warp-egress 429 extends the streak", () => {
+	assert.equal(bumpWarp429Streak(0, 429, "warp"), 1);
+	assert.equal(bumpWarp429Streak(1, 429, "warp"), 2);
+	assert.equal(bumpWarp429Streak(2, 429, "local"), 2);
+	assert.equal(bumpWarp429Streak(3, 429, "local"), 3);
+});
+
+test("bumpWarp429Streak: any success resets it", () => {
+	assert.equal(bumpWarp429Streak(2, 200, "warp"), 0);
+	assert.equal(bumpWarp429Streak(2, 200, "local"), 0);
+});
+
+test("needsWarpRecycle: fires at the threshold, not during cooldown", () => {
+	assert.equal(needsWarpRecycle(2, 3, false), false);
+	assert.equal(needsWarpRecycle(3, 3, false), true);
+	assert.equal(needsWarpRecycle(5, 3, true), false);
 });
 
 test("readFileWarpMode: tolerates a UTF-8 BOM in the config file", () => {

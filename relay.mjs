@@ -358,6 +358,73 @@ function refreshWarpMode(config) {
 	}
 }
 
+/** relay-warp-auto-recycle (user-approved): the opencode free gate counts
+ *  quota per (session, egress IP). A persistent 429 via the warp egress means
+ *  that exit IP burnt its window, and only the proxy can re-enroll it. The
+ *  relay counts consecutive 429s DELIVERED through the warp egress and, past
+ *  a threshold, POSTs /recycle to the proxy. If the proxy does not expose
+ *  that endpoint yet, the relay degrades: one warning, requests keep flowing
+ *  exactly as before. Pure helpers exported for tests. */
+const RECYCLE_THRESHOLD = (() => {
+	const n = Number.parseInt(process.env.RELAY_WARP_RECYCLE_THRESHOLD ?? "", 10);
+	return Number.isInteger(n) && n > 0 ? n : 3;
+})();
+const RECYCLE_COOLDOWN_MS = (() => {
+	const n = Number.parseInt(process.env.RELAY_WARP_RECYCLE_COOLDOWN_MS ?? "", 10);
+	return Number.isInteger(n) && n >= 0 ? n : 5 * 60_000;
+})();
+
+/** Pure: only a warp-egress 429 extends the streak; any success resets it;
+ *  a LOCAL 429 says nothing about the exit IP and leaves it untouched. */
+export function bumpWarp429Streak(streak, status, egress) {
+	if (egress === "warp" && status === 429) return streak + 1;
+	if (typeof status === "number" && status < 400) return 0;
+	return streak;
+}
+
+/** Pure: fire when the streak reaches the threshold and not on cooldown. */
+export function needsWarpRecycle(streak, threshold = RECYCLE_THRESHOLD, onCooldown = false) {
+	return !onCooldown && streak >= threshold;
+}
+
+let warp429Streak = 0;
+let warpRecycles = 0;
+let warpRecycleNotBefore = 0;
+let warpRecycleUnavailableWarned = false;
+
+async function maybeRecycleWarp(config, deliveredStatus) {
+	warp429Streak = bumpWarp429Streak(warp429Streak, deliveredStatus, lastEgress);
+	if (!needsWarpRecycle(warp429Streak, RECYCLE_THRESHOLD, Date.now() < warpRecycleNotBefore)) return;
+	warp429Streak = 0;
+	warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
+	if (!config.warpProxy) return;
+	try {
+		const res = await fetch(`${config.warpProxy}/recycle`, {
+			method: "POST",
+			signal: AbortSignal.timeout(10_000),
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		await res.arrayBuffer();
+		warpRecycles += 1;
+		process.stderr.write(
+			`pi-free-bridge relay: warp exit recycled (fresh egress IP) after ${RECYCLE_THRESHOLD} warp 429s
+`,
+		);
+	} catch (err) {
+		const reason = err && err.message ? err.message : String(err);
+		if (!warpRecycleUnavailableWarned) {
+			warpRecycleUnavailableWarned = true;
+			process.stderr.write(
+				`pi-free-bridge relay: warp auto-recycle unavailable (${reason}) — continuing without it
+`,
+			);
+		} else {
+			process.stderr.write(`pi-free-bridge relay: warp auto-recycle attempt failed — ${reason}
+`);
+		}
+	}
+}
+
 async function forward(req, res, pathname, config) {
 	try {
 		const raw = await readBody(req);
@@ -418,6 +485,9 @@ async function forward(req, res, pathname, config) {
 			sendJson(res, 502, { error: { message } });
 			return;
 		}
+		// relay-warp-auto-recycle: count the streak on the DELIVERED response
+		// (the request the client actually sees).
+		await maybeRecycleWarp(config, response.status);
 		warpPreferred = updateWarpPreference(config.warpMode, lastEgress, true);
 
 		// S20: status and content-type pass through, the body is piped unparsed.
@@ -482,6 +552,8 @@ async function handle(req, res, config) {
 			warpMode: config.warpMode,
 			warpModeSource: config.warpModeSource,
 			warpProxy: config.warpProxy,
+			warp429Streak: warp429Streak,
+			warpRecycles: warpRecycles,
 			lastEgress: lastEgress,
 			pid: process.pid,
 		});
