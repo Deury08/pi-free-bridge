@@ -197,14 +197,26 @@ export async function resolveSessionFromStore({ shareDir = openCodeShareDir() } 
 	return undefined;
 }
 
-/** S31 precedence: an explicit override wins over the harvested id. */
-async function resolveRelaySession() {
+/** Verde (bun-upgrades S2): precedence is user override, then the
+ *  Pi-harvested id, then the relay's local store. Exported for tests; takes
+ *  the local store root as an argument so tests can inject a temp store. */
+export async function resolveRelaySession({ shareDir } = {}) {
+	// Precedence (bun-upgrades S2): user override, then the id the extension
+	// harvested on Pi's machine (works when OpenCode lives elsewhere), then the
+	// relay's own local store (same machine as OpenCode).
 	const override = process.env.RELAY_SESSION?.trim();
 	if (override) {
 		const declared = process.env.RELAY_SESSION_SOURCE;
 		return { sessionId: override, source: declared === "config" ? "config" : "env" };
 	}
-	return resolveSessionFromStore();
+	// The id the Pi extension harvested on its own machine (open-code store not
+	// necessarily local). It wins over a relay-local harvest but never over a
+	// user override, and it is reported with its own source for the doctor.
+	const fromPi = process.env.RELAY_SESSION_PI?.trim();
+	if (fromPi && /^ses_/.test(fromPi)) {
+		return { sessionId: fromPi, source: "pi-harvest" };
+	}
+	return resolveSessionFromStore(shareDir ? { shareDir } : {});
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +275,30 @@ async function forward(req, res, pathname, config) {
 		const headers = {};
 		const contentType = upstream.headers.get("content-type");
 		if (contentType) headers["content-type"] = contentType;
+
+		// Error diagnostics (bun-upgrades S3): a gate rejection carries the
+		// usable evidence in its JSON body. Snapshot it (bounded) before piping,
+		// and hand the exact same bytes back — never rewrite or terminate them,
+		// so Content-Length and SSE framing stay untouched.
+		if (upstream.status >= 400) {
+			const errorBody = Buffer.from(await upstream.arrayBuffer());
+			const snapshot = errorBody.subarray(0, 4096);
+			process.stderr.write(
+				`pi-free-bridge relay: upstream ${upstream.status} ${toUpstreamUrl(config.upstream, pathname)}
+` +
+					`pi-free-bridge relay: session ${config.session} (from ${config.sessionSource})
+` +
+					`pi-free-bridge relay: upstream body: ${snapshot.toString("utf8")}
+` +
+					(upstream.status === 429
+						? "pi-free-bridge relay: rate limited — check the session id (/free-bridge-session)\n"
+						: ""),
+			);
+			res.writeHead(upstream.status, headers);
+			res.end(errorBody);
+			return;
+		}
+
 		res.writeHead(upstream.status, headers);
 
 		if (!upstream.body) {

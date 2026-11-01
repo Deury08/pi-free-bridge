@@ -15,6 +15,7 @@ import test from "node:test";
 import {
 	ensureEnvBlock,
 	ensureGateTools,
+	resolveRelaySession,
 	resolveSessionFromStore,
 	toUpstreamUrl,
 } from "../relay.mjs";
@@ -282,4 +283,52 @@ test("importing relay.mjs has no side effects", () => {
 	assert.equal(typeof ensureGateTools, "function");
 	assert.equal(typeof resolveSessionFromStore, "function");
 	assert.equal(typeof toUpstreamUrl, "function");
+});
+
+// ---------------------------------------------------------------------------
+// resolveRelaySession precedence (bun-upgrades S2)
+// ---------------------------------------------------------------------------
+
+function writeStore(shareDir, files) {
+	mkdirSync(join(shareDir, "storage", "session_diff"), { recursive: true });
+	for (const [name, when] of files) {
+		writeFileSync(join(shareDir, "storage", "session_diff", name), "{}");
+		utimesSync(join(shareDir, "storage", "session_diff", name), when, when);
+	}
+}
+
+test("resolveRelaySession: user override wins over a Pi-supplied id", async () => {
+	process.env.RELAY_SESSION = "ses_override";
+	process.env.RELAY_SESSION_SOURCE = "env";
+	process.env.RELAY_SESSION_PI = "ses_pi_harvest";
+	try {
+		const result = await resolveRelaySession({ shareDir: join(tmpdir(), "pfb-empty-none-00") });
+		assert.equal(result.sessionId, "ses_override");
+		assert.equal(result.source, "env");
+	} finally {
+		delete process.env.RELAY_SESSION;
+		delete process.env.RELAY_SESSION_SOURCE;
+		delete process.env.RELAY_SESSION_PI;
+	}
+});
+
+test("resolveRelaySession: Pi-supplied id beats the relay's local store", async () => {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
+	process.env.RELAY_SESSION_PI = "ses_pi_harvest";
+	try {
+		const result = await resolveRelaySession({ shareDir });
+		assert.equal(result.sessionId, "ses_pi_harvest");
+		assert.equal(result.source, "pi-harvest");
+	} finally {
+		delete process.env.RELAY_SESSION_PI;
+	}
+});
+
+test("resolveRelaySession: without a Pi-supplied id, the relay harvests locally", async () => {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
+	const result = await resolveRelaySession({ shareDir });
+	assert.equal(result.sessionId, "ses_local");
+	assert.equal(result.source, "session-diff");
 });

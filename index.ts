@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { createRequire, fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -314,15 +314,85 @@ function writeBridgeConfig(patch: BridgeConfig): void {
 	}
 }
 
-/** S30/S34: the package ships no session id. Only an explicit override is
- *  resolved here; otherwise the relay harvests one from the OpenCode store at
- *  startup. */
+/** `~/.local/share/opencode`, the store the official client writes. */
+const OPENCODE_SHARE_DIR = join(homedir(), ".local", "share", "opencode");
+
+/** Newest `storage/session_diff/ses_*.json` file name, by mtime (fs only). */
+function harvestSessionFromDiff(shareDir: string = OPENCODE_SHARE_DIR): string | undefined {
+	const diffDir = join(shareDir, "storage", "session_diff");
+	let entries: string[];
+	try {
+		entries = readdirSync(diffDir);
+	} catch {
+		return undefined;
+	}
+	let newest: { id: string; mtimeMs: number } | undefined;
+	for (const name of entries) {
+		if (!name.startsWith("ses_") || !name.endsWith(".json")) continue;
+		const id = name.slice(0, -".json".length);
+		if (!/^ses_/.test(id)) continue;
+		try {
+			const stats = statSync(join(diffDir, name));
+			if (!stats.isFile()) continue;
+			if (!newest || stats.mtimeMs > newest.mtimeMs) newest = { id, mtimeMs: stats.mtimeMs };
+		} catch {
+			continue;
+		}
+	}
+	return newest?.id;
+}
+
+/** Newest `session` row from `opencode.db` via `node:sqlite` when available.
+ *  Synchronous best-effort: a missing module, table or permission returns
+ *  undefined and lets the caller fall through to the diff harvest. */
+function harvestSessionFromDb(shareDir: string = OPENCODE_SHARE_DIR): string | undefined {
+	const dbPath = join(shareDir, "opencode.db");
+	if (!existsSync(dbPath)) return undefined;
+	try {
+		const require = createRequire(import.meta.url);
+		const { DatabaseSync } = require("node:sqlite") as { DatabaseSync?: unknown };
+		if (typeof DatabaseSync !== "function") return undefined;
+		const db = new (DatabaseSync as new (path: string, opts?: object) => {
+			query(sql: string): { all(): { id?: unknown }[] };
+			close(): void;
+		})(dbPath, { readOnly: true });
+		try {
+			const rows = db.query("select id from session order by time_created desc limit 5").all();
+			for (const row of rows) {
+				if (row && typeof row.id === "string" && row.id.startsWith("ses_")) return row.id;
+			}
+		} finally {
+			db.close();
+		}
+	} catch {
+		// Node without node:sqlite, missing table, locked db: fall through.
+	}
+	return undefined;
+}
+
+/** bun-upgrades S2: the extension harvests the same store the relay targets,
+ *  so Pi can run on a machine without OpenCode while the relay runs elsewhere
+ *  (or vice versa). db first, diff fallback, `undefined` when neither yields. */
+function harvestSessionId(): { sessionId: string; source: "harvest:opencode.db" | "harvest:session-diff" } | undefined {
+	const fromDb = harvestSessionFromDb();
+	if (fromDb) return { sessionId: fromDb, source: "harvest:opencode.db" };
+	const fromDiff = harvestSessionFromDiff();
+	if (fromDiff) return { sessionId: fromDiff, source: "harvest:session-diff" };
+	return undefined;
+}
+
+/** bun-upgrades S2 precedence: user override, then the extension's own
+ *  harvest; an absent/failed harvest lets the relay fall back to its local
+ *  store (unchanged S31 path, still no synthetic id is ever minted). */
 function resolveSessionId(): { sessionId?: string; source: string } {
 	const fromEnv = process.env.PI_FREE_BRIDGE_SESSION_ID?.trim();
 	if (fromEnv) return { sessionId: fromEnv, source: "env" };
 
 	const fromConfig = readBridgeConfig().sessionId?.trim();
 	if (fromConfig) return { sessionId: fromConfig, source: "config" };
+
+	const harvested = harvestSessionId();
+	if (harvested) return harvested;
 
 	return { source: "none" };
 }
@@ -517,8 +587,10 @@ function detachRelayHandles(child: ChildProcess): void {
 	child.unref();
 }
 
-/** Child environment. RELAY_SESSION is only set for an explicit override; when
- *  it is absent the relay harvests an id from the OpenCode store (S31). */
+/** Child environment. RELAY_SESSION is only set for an explicit override;
+ *  RELAY_SESSION_PI carries the id the extension harvested from Pi's machine
+ *  (bun-upgrades S2, remote OpenCode); when neither exists the relay harvests
+ *  from its own local store (S31). */
 function relayEnv(options: RelayOptions): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...process.env,
@@ -528,13 +600,24 @@ function relayEnv(options: RelayOptions): Record<string, string | undefined> {
 	};
 
 	if (options.sessionId) {
-		env.RELAY_SESSION = options.sessionId;
-		env.RELAY_SESSION_SOURCE = options.sessionSource ?? "env";
-	} else {
-		// Never leak an inherited override into a relay that must harvest.
+		const source = options.sessionSource ?? "env";
+		if (source === "env" || source === "config") {
+			env.RELAY_SESSION = options.sessionId;
+			env.RELAY_SESSION_SOURCE = source;
+		} else {
+			// The extension's own harvest: a different channel, lower
+			// precedence than any explicit override.
+			env.RELAY_SESSION_PI = options.sessionId;
+		}
+	}
+	// Never leak an id from a previous scope into a relay that must resolve
+	// its own.
+	delete env.PI_FREE_BRIDGE_SESSION_ID;
+	if (env.RELAY_SESSION !== options.sessionId) {
 		delete env.RELAY_SESSION;
 		delete env.RELAY_SESSION_SOURCE;
 	}
+	if (env.RELAY_SESSION_PI !== options.sessionId) delete env.RELAY_SESSION_PI;
 	return env;
 }
 
