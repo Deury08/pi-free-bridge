@@ -22,7 +22,8 @@
 - T2 (S3): DONE — commit `9e8fa9d`. Bounded stderr snapshot of gate ≥ 400 bodies, byte-exact return, 429 hint.
 - T3 (S5): DONE — commit `5200496`. `egressOrder`/`updateWarpPreference` pure helpers, per-request chain, sticky auto elevation, failover before first byte only, `x-egress-used` header, health fields `warpMode`/`lastEgress`/`warpProxy`.
 - T4 (S4,S5): DONE — commit `5200496`. Mode resolution (env > config > off), `/free-bridge-warp`, doctor line, relay restart on mode change, optional `PI_FREE_BRIDGE_WARP_BIN` supervisor with `/health` probe, never fatal in auto.
-- T5: DONE — 34 unit tests green; README sections (cosecha híbrida, modes WARP, env vars, config `warpEnabled`). E2E verified locally with fake upstream (429 then 200 SSE) + fake proxy under `bun`: auto elevates to warp after a local 429 and `lastEgress` reports `warp`.
+- T5: DONE — 34 unit tests green; README sections (cosecha híbrida, modes WARP, env vars, config `warpEnabled`, in-Pi install). E2E verified locally with fake upstream (429 then 200 SSE) + fake proxy under `bun`: auto elevates to warp after a local 429 and `lastEgress` reports `warp`.
+- T6 (L7, opción 2 dentro-de-Pi): DONE — commit `f9b92ff`. `/free-bridge-warp auto|on` without a live WARP opens a `ctx.ui.confirm`; with consent it downloads the platform asset from the release, verifies sha256 against `checksums.txt`, extracts with bsdtar (System32 tar.exe on Windows — GNU tar cannot read zip), installs into `~/.pi/agent/pi-free-bridge/warp/`, and persists `warpBin`. `/free-bridge-warp bin <path>` records a manual path (validated with existsSync). Real v0.1.1 download verified in /tmp: checksum `b67d3e6f…` matches, extraction OK.
 
 ## Log
 
@@ -32,3 +33,4 @@
 - L4 (user): "para los modosdel warp aparecen en pi" — the WARP modes are selectable from Pi itself: a Pi command persists `warpEnabled` (off/auto/on) in the bridge config; the relay reads it at startup.
 - L5: E2E evidence (fake upstream on :9001 answering 429 once, then 200 SSE; fake absolute-form proxy on :9000; relay under `bun` with `RELAY_WARP_MODE=auto`): first POST fails local with 429 and returns the SSE body produced through the WARP path; repeat POST goes WARP-first; `/health` shows `warpMode:auto` and `lastEgress:warp`. Note for reproduction: the relay exits on stdin EOF (S26), so hold its stdin open when running it by hand.
 - L6: Differential check (mode `off` vs pre-change behavior) caught a regression: the egress chain drained every 429, turning an off-mode rate limit into a synthetic 502. Fixed in `8f9186c`; re-verified byte-exact 429 passthrough in `off`, chain-exhaustion 502 in `auto` with a dead WARP, and unchanged success paths.
+- L7 (user): "si la dos es dentro de pi que pregunte" — the lazy install must ask inside Pi before downloading anything; implemented as T6 above.
