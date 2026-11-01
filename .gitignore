@@ -1,5 +1,6 @@
 node_modules/
 *.log
+*.exe
 .DS_Store
 
 # Scratch dumps from manual gate triage (see HANDOFF.md §4). Local evidence,
