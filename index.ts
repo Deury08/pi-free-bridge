@@ -1226,13 +1226,18 @@ async function findWarpAsset(): Promise<{ tag: string; url: string; name: string
 
 /** Download + extract the release, verify its sha256 against checksums.txt,
  *  install the binary under WARP_INSTALL_DIR and return its path, or
- *  undefined with the failure logged. Extraction uses the system `tar`
+ *  undefined with the failure logged. `status` reports each stage to Pi's
+ *  notifications (ctx.ui.notify). Extraction uses the system `tar`
  *  (bsdtar), which ships with Windows 10+, macOS and Linux and handles the
  *  zip archives too. */
-async function installWarpBinary(asset: { tag: string; url: string; name: string; size: number }): Promise<string | undefined> {
+async function installWarpBinary(
+	asset: { tag: string; url: string; name: string; size: number },
+	status?: (message: string) => void,
+): Promise<string | undefined> {
 	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-warp-"));
 	try {
 		const archivePath = join(tmpDir, asset.name);
+		status?.(`Downloading warp-minimal ${asset.tag}…`);
 		const res = await fetch(asset.url, {
 			headers: { "user-agent": "pi-free-bridge" },
 			signal: AbortSignal.timeout(60000),
@@ -1252,6 +1257,7 @@ async function installWarpBinary(asset: { tag: string; url: string; name: string
 			console.error(`pi-free-bridge: warp-minimal checksums.txt unreachable — HTTP ${csRes.status}`);
 			return undefined;
 		}
+		status?.("Verifying the release sha256 checksum…");
 		const checksums = await csRes.text();
 		const expected = checksums
 			.split(/\r?\n/)
@@ -1267,6 +1273,7 @@ async function installWarpBinary(asset: { tag: string; url: string; name: string
 			return undefined;
 		}
 
+		status?.(`Installing to ${WARP_INSTALL_DIR}…`);
 		mkdirSync(WARP_INSTALL_DIR, { recursive: true });
 		const { execFileSync } = await import("node:child_process");
 		// bsdtar handles the zip archives; GNU tar in a Git-Bash PATH does not.
@@ -1567,7 +1574,9 @@ export default function (pi: ExtensionAPI) {
 					));
 				if (consent && asset) {
 					ctx.ui.notify(`Downloading warp-minimal ${asset.tag}…`, "info");
-					const installed = await installWarpBinary(asset);
+					const installed = await installWarpBinary(asset, {
+						status: (message) => ctx.ui.notify(message, "info"),
+					});
 					if (installed) {
 						ctx.ui.notify(`warp-minimal installed to ${installed}`, "info");
 						if (!(await ensureWarp())) {
