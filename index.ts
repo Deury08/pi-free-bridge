@@ -1,9 +1,11 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -36,7 +38,7 @@ const REGISTRY_PATHS = [
 ];
 
 /** Optional user config: `{ "sessionId": "ses_…", "liveIds": ["…"] }`. */
-const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
+export const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
 
 /** Pi's global settings. Pi scopes the model picker to `enabledModels`, so a
  *  non-empty list means "show ONLY these" — see ensureEnabledPattern. */
@@ -290,12 +292,18 @@ type BridgeConfig = {
 	sessionId?: string;
 	liveIds?: string[];
 	relayPort?: number;
+	/** "off" | "auto" | "on" (bun-upgrades S5); anything else reads as off. */
+	warpEnabled?: string;
+	/** Path to the warp-minimal binary for supervised spawning. */
+	warpBin?: string;
 };
 
 function readBridgeConfig(): BridgeConfig {
 	if (!existsSync(BRIDGE_CONFIG_PATH)) return {};
 	try {
-		const cfg = JSON.parse(readFileSync(BRIDGE_CONFIG_PATH, "utf-8"));
+		const raw = readFileSync(BRIDGE_CONFIG_PATH, "utf-8");
+		// Windows editors leave a UTF-8 BOM; JSON.parse rejects it.
+		const cfg = JSON.parse(raw.startsWith("﻿") ? raw.slice(1) : raw);
 		return cfg && typeof cfg === "object" ? (cfg as BridgeConfig) : {};
 	} catch {
 		// malformed config falls back to the built-in defaults
@@ -314,15 +322,85 @@ function writeBridgeConfig(patch: BridgeConfig): void {
 	}
 }
 
-/** S30/S34: the package ships no session id. Only an explicit override is
- *  resolved here; otherwise the relay harvests one from the OpenCode store at
- *  startup. */
+/** `~/.local/share/opencode`, the store the official client writes. */
+const OPENCODE_SHARE_DIR = join(homedir(), ".local", "share", "opencode");
+
+/** Newest `storage/session_diff/ses_*.json` file name, by mtime (fs only). */
+function harvestSessionFromDiff(shareDir: string = OPENCODE_SHARE_DIR): string | undefined {
+	const diffDir = join(shareDir, "storage", "session_diff");
+	let entries: string[];
+	try {
+		entries = readdirSync(diffDir);
+	} catch {
+		return undefined;
+	}
+	let newest: { id: string; mtimeMs: number } | undefined;
+	for (const name of entries) {
+		if (!name.startsWith("ses_") || !name.endsWith(".json")) continue;
+		const id = name.slice(0, -".json".length);
+		if (!/^ses_/.test(id)) continue;
+		try {
+			const stats = statSync(join(diffDir, name));
+			if (!stats.isFile()) continue;
+			if (!newest || stats.mtimeMs > newest.mtimeMs) newest = { id, mtimeMs: stats.mtimeMs };
+		} catch {
+			continue;
+		}
+	}
+	return newest?.id;
+}
+
+/** Newest `session` row from `opencode.db` via `node:sqlite` when available.
+ *  Synchronous best-effort: a missing module, table or permission returns
+ *  undefined and lets the caller fall through to the diff harvest. */
+function harvestSessionFromDb(shareDir: string = OPENCODE_SHARE_DIR): string | undefined {
+	const dbPath = join(shareDir, "opencode.db");
+	if (!existsSync(dbPath)) return undefined;
+	try {
+		const require = createRequire(import.meta.url);
+		const { DatabaseSync } = require("node:sqlite") as { DatabaseSync?: unknown };
+		if (typeof DatabaseSync !== "function") return undefined;
+		const db = new (DatabaseSync as new (path: string, opts?: object) => {
+			query(sql: string): { all(): { id?: unknown }[] };
+			close(): void;
+		})(dbPath, { readOnly: true });
+		try {
+			const rows = db.query("select id from session order by time_created desc limit 5").all();
+			for (const row of rows) {
+				if (row && typeof row.id === "string" && row.id.startsWith("ses_")) return row.id;
+			}
+		} finally {
+			db.close();
+		}
+	} catch {
+		// Node without node:sqlite, missing table, locked db: fall through.
+	}
+	return undefined;
+}
+
+/** bun-upgrades S2: the extension harvests the same store the relay targets,
+ *  so Pi can run on a machine without OpenCode while the relay runs elsewhere
+ *  (or vice versa). db first, diff fallback, `undefined` when neither yields. */
+function harvestSessionId(): { sessionId: string; source: "harvest:opencode.db" | "harvest:session-diff" } | undefined {
+	const fromDb = harvestSessionFromDb();
+	if (fromDb) return { sessionId: fromDb, source: "harvest:opencode.db" };
+	const fromDiff = harvestSessionFromDiff();
+	if (fromDiff) return { sessionId: fromDiff, source: "harvest:session-diff" };
+	return undefined;
+}
+
+/** bun-upgrades S2 precedence: user override, then the extension's own
+ *  harvest; an absent/failed harvest lets the relay fall back to its local
+ *  store (unchanged S31 path, still no synthetic id is ever minted). */
 function resolveSessionId(): { sessionId?: string; source: string } {
 	const fromEnv = process.env.PI_FREE_BRIDGE_SESSION_ID?.trim();
 	if (fromEnv) return { sessionId: fromEnv, source: "env" };
 
 	const fromConfig = readBridgeConfig().sessionId?.trim();
 	if (fromConfig) return { sessionId: fromConfig, source: "config" };
+
+	const harvested = harvestSessionId();
+	if (harvested) return harvested;
 
 	return { source: "none" };
 }
@@ -333,6 +411,23 @@ function resolveLiveIds(): { liveIds: Set<string>; source: string } {
 		return { liveIds: new Set(fromConfig), source: BRIDGE_CONFIG_PATH };
 	}
 	return { liveIds: new Set(SNAPSHOT_LIVE_FREE_IDS), source: "built-in snapshot (2026-10-14)" };
+}
+
+/** WARP egress modes (bun-upgrades S5). */
+const WARP_MODES: readonly string[] = ["off", "auto", "on"];
+
+function normalizeWarpMode(value: unknown): string | undefined {
+	const mode = String(value ?? "").trim().toLowerCase();
+	return WARP_MODES.includes(mode) ? mode : undefined;
+}
+
+/** S5 precedence: env override, persisted config, default off. */
+function resolveWarpMode(): string {
+	return (
+		normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE) ??
+		normalizeWarpMode(readBridgeConfig().warpEnabled) ??
+		"off"
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +457,8 @@ type RelayOptions = {
 	sessionId?: string;
 	sessionSource?: string;
 	upstream: string;
+	/** off | auto | on (bun-upgrades S5); resolved by ensureRelay when absent. */
+	warpMode?: string;
 	cwd: string;
 };
 
@@ -517,24 +614,45 @@ function detachRelayHandles(child: ChildProcess): void {
 	child.unref();
 }
 
-/** Child environment. RELAY_SESSION is only set for an explicit override; when
- *  it is absent the relay harvests an id from the OpenCode store (S31). */
-function relayEnv(options: RelayOptions): Record<string, string | undefined> {
+/** Child environment. RELAY_SESSION is only set for an explicit override;
+ *  RELAY_SESSION_PI carries the id the extension harvested from Pi's machine
+ *  (bun-upgrades S2, remote OpenCode); when neither exists the relay harvests
+ *  from its own local store (S31). */
+export function relayEnv(options: RelayOptions): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...process.env,
 		PORT: String(options.port),
 		RELAY_UPSTREAM: options.upstream,
 		RELAY_CWD: options.cwd,
+		// relay-warp-hot-reload: the relay resolves the warp mode per request from
+		// this file; RELAY_WARP_MODE is only injected when PI_FREE_BRIDGE_WARP_MODE
+		// is a real env override (absolute precedence preserved, by design).
+		RELAY_CONFIG_PATH: BRIDGE_CONFIG_PATH,
 	};
 
+	const envWarpOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
+	delete env.RELAY_WARP_MODE;
+	if (envWarpOverride) env.RELAY_WARP_MODE = envWarpOverride;
+
 	if (options.sessionId) {
-		env.RELAY_SESSION = options.sessionId;
-		env.RELAY_SESSION_SOURCE = options.sessionSource ?? "env";
-	} else {
-		// Never leak an inherited override into a relay that must harvest.
+		const source = options.sessionSource ?? "env";
+		if (source === "env" || source === "config") {
+			env.RELAY_SESSION = options.sessionId;
+			env.RELAY_SESSION_SOURCE = source;
+		} else {
+			// The extension's own harvest: a different channel, lower
+			// precedence than any explicit override.
+			env.RELAY_SESSION_PI = options.sessionId;
+		}
+	}
+	// Never leak an id from a previous scope into a relay that must resolve
+	// its own.
+	delete env.PI_FREE_BRIDGE_SESSION_ID;
+	if (env.RELAY_SESSION !== options.sessionId) {
 		delete env.RELAY_SESSION;
 		delete env.RELAY_SESSION_SOURCE;
 	}
+	if (env.RELAY_SESSION_PI !== options.sessionId) delete env.RELAY_SESSION_PI;
 	return env;
 }
 
@@ -596,18 +714,147 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 }
 
 /** Ensure a healthy relay for this port + session id, spawning one if needed. */
+/** bun-upgrades L8: a relay left by an older Pi session may carry a different
+ *  egress mode than the config now asks for; reusing it silently would ignore
+ *  the user's switch. Reuse only when the running relay reports the wanted
+ *  mode; otherwise kill the stale one (identity-guarded: only a process
+ *  whose /health reports THIS service and a numeric pid) and spawn fresh.
+ *  Old builds report no pid — those are never killed, the caller surfaces
+ *  them with an actionable message. */
+export async function adoptOrReleaseStaleRelay(port: number, warpMode: string): Promise<"match" | "released" | "unkillable" | "absent"> {
+	const health = await fetchRelayHealth(port);
+	if (!health) return "absent";
+	if (health.warpMode === warpMode) return "match";
+	if (typeof health.pid !== "number") return "unkillable";
+	try {
+		process.kill(health.pid, "SIGKILL");
+	} catch {
+		// already gone or owned by another user — treat both as resolved
+		return (await fetchRelayHealth(port)) ? "unkillable" : "released";
+	}
+	// Wait for the port to be released before respawning.
+	for (let i = 0; i < 10; i++) {
+		if (!(await fetchRelayHealth(port))) return "released";
+		await new Promise((resolve) => setTimeout(resolve, 300));
+	}
+	return (await fetchRelayHealth(port)) ? "unkillable" : "released";
+}
+
+const RELAY_LISTENING_LINE = `pi-free-bridge relay listening on http://${RELAY_HOST}:`;
+
+/** Resolve the PID that owns the listening port by OS means, and only then
+ *  kill it when its command line identifies it as OUR relay (never a blind
+ *  kill). Windows: netstat -ano + PowerShell CommandLine. POSIX: lsof + ps. */
+export async function identifyAndKillPortOwner(port: number): Promise<"killed" | "unidentified"> {
+	const { execFileSync } = await import("node:child_process");
+	let pid: number | undefined;
+	let commandLine = "";
+	try {
+		if (process.platform === "win32") {
+			const lines = execFileSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8" });
+			const match = lines
+				.split(/\r?\n/)
+				.find((l) => l.includes(`127.0.0.1:${port}`) && l.toUpperCase().includes("LISTENING"));
+			pid = match && Number.parseInt(match.trim().split(/\s+/).pop() ?? "", 10);
+			if (pid && Number.isInteger(pid)) {
+				const owners = execFileSync(
+					"powershell",
+					[
+						"-NoProfile", "-Command",
+						`(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`,
+					],
+					{ encoding: "utf8", timeout: 15000 },
+				);
+				commandLine = owners.trim();
+			}
+		} else {
+			const out = execFileSync("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+			pid = Number.parseInt(out.trim().split(/\s+/)[0] ?? "", 10);
+			if (pid && Number.isInteger(pid)) {
+				commandLine = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" }).trim();
+			}
+		}
+	} catch {
+		return "unidentified";
+	}
+	if (!pid || Number.isInteger(pid) === false) return "unidentified";
+	// Identity guard: our relay prints exactly this line at startup — an
+	// older build still matches (bun + relay.mjs in its command line).
+	const identified =
+		commandLine.includes(RELAY_LISTENING_LINE) ||
+		(commandLine.includes("relay.mjs") && commandLine.includes("bun"));
+	if (!identified) return "unidentified";
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {
+		// already gone
+	}
+	// Confirm the port is free before respawning.
+	for (let i = 0; i < 10; i++) {
+		if (!(await fetchRelayHealth(port))) return "killed";
+		await new Promise((resolve) => setTimeout(resolve, 300));
+	}
+	return "unidentified";
+}
+
+/** relay-warp-hot-reload: the relay cache key drops warpMode — a mode change
+ *  must NOT churn the relay; the relay hot-reloads the mode from the config
+ *  file. Exported for tests. */
+export function relayKey(port: number, sessionId?: string): string {
+	return `${port}\u0000${sessionId ?? ""}`;
+}
+
 async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
-	const key = `${options.port}\u0000${options.sessionId ?? ""}`;
+	const warpMode = normalizeWarpMode(options.warpMode) ?? resolveWarpMode();
+	const key = relayKey(options.port, options.sessionId);
+
+	// A non-off mode needs the WARP proxy alive; never fatal — auto degrades
+	// to local, `on` surfaces the 502 with its egress diagnostic.
+	if (warpMode !== "off" && !(await ensureWarp())) {
+		console.error(
+			`pi-free-bridge: WARP is not up but mode is ${warpMode} — ` +
+				(warpMode === "on" ? "requests will fail through WARP" : "staying on the local egress"),
+		);
+	}
 
 	if (relayState?.key === key) {
-		// A relay we spawned is trusted; one we only reused may belong to another
-		// Pi that has since exited, so its liveness is re-checked.
-		if (relayState.mode === "spawned" || (await probeRelay(options.port)) === "healthy") {
+		// A relay we spawned is trusted; one we only reused must match the
+		// requested egress mode too (L8) and is re-checked for liveness.
+		if (relayState.mode === "spawned") {
 			return { url: relayState.url, mode: relayState.mode };
 		}
-		relayState = undefined;
+		const health = await fetchRelayHealth(options.port);
+		if (health) {
+			if (health.warpMode === warpMode) {
+				return { url: relayState.url, mode: relayState.mode };
+			}
+			relayState = undefined;
+		} else {
+			relayState = undefined;
+		}
 	}
 	if (relayPending?.key === key) return relayPending.promise;
+
+	// Stale-relay gate: before spawning, a healthy foreign relay with a
+	// different warp mode is released, not reused (L8).
+	const stale = await adoptOrReleaseStaleRelay(options.port, warpMode);
+	if (stale === "match" && relayState?.key === key) {
+		return { url: relayUrl(options.port), mode: "reused" };
+	}
+	if (stale === "unkillable") {
+		// Second chance: resolve the port owner by OS means (netstat/lsof +
+		// command line) and kill it only when it identifies as OUR relay.
+		const released = await identifyAndKillPortOwner(options.port);
+		if (released !== "killed" || (await fetchRelayHealth(options.port))) {
+			throw new Error(
+				`pi-free-bridge: a relay from an older Pi session is running on port ${options.port} ` +
+					`with a different WARP mode and could not be released safely — kill it manually ` +
+					`or set PI_FREE_BRIDGE_RELAY_PORT.`,
+			);
+		}
+	}
+	// mode !== "off" already warned about WARP above; the spawn must still go
+	// through so the relay's own chain reports the truth on the wire.
 
 	const promise = startRelay(options, key)
 		.then((state) => {
@@ -656,10 +903,15 @@ function describeRelay(): string {
 type RelayHealth = {
 	sessionId?: string;
 	sessionSource?: string;
+	warpMode?: string;
+	/** relay-warp-hot-reload: who set the reported mode. */
+	warpModeSource?: "env" | "config";
+	lastEgress?: string;
+	pid?: number;
 };
 
 /** The relay's `/health` payload, or undefined when it is not answering. */
-async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> {
+export async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 750);
 	try {
@@ -670,11 +922,24 @@ async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> 
 			ok?: unknown;
 			sessionId?: unknown;
 			sessionSource?: unknown;
+			warpMode?: unknown;
+			warpModeSource?: unknown;
+			lastEgress?: unknown;
 		};
 		if (payload?.service !== RELAY_SERVICE || payload.ok !== true) return undefined;
 		return {
 			sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
 			sessionSource: typeof payload.sessionSource === "string" ? payload.sessionSource : undefined,
+			warpMode: normalizeWarpMode(payload.warpMode),
+			warpModeSource:
+				typeof payload.warpModeSource === "string" &&
+				["env", "config"].includes(payload.warpModeSource)
+					? (payload.warpModeSource as "env" | "config")
+					: undefined,
+			pid: typeof payload.pid === "number" ? payload.pid : undefined,
+			lastEgress: typeof payload.lastEgress === "string" && ["local", "warp"].includes(payload.lastEgress)
+				? payload.lastEgress
+				: undefined,
 		};
 	} catch {
 		return undefined;
@@ -972,6 +1237,234 @@ const gateStreamSimple = (async (
 }) as unknown as ProviderConfig["streamSimple"];
 
 // ---------------------------------------------------------------------------
+// warp-minimal supervisor (bun-upgrades S4)
+// ---------------------------------------------------------------------------
+//
+// warp-minimal is the alternate egress proxy of S5 (127.0.0.1:8789, /health).
+// It ships separately (its own repo, e.g. PI_FREE_BRIDGE_WARP_BIN); when the
+// configured mode needs it and it is not answering, the extension spawns the
+// binary if one is known. Without a path it never spawns anything — it just
+// warns, and the relay's own egress chain degrades exactly per the mode.
+
+const WARP_DEFAULT_PORT = 8789;
+const WARP_START_TIMEOUT_MS = 5000;
+
+function warpHealthUrl(port: number): string {
+	return `http://${RELAY_HOST}:${port}/health`;
+}
+
+async function probeWarp(port: number, attempts: number): Promise<boolean> {
+	for (let i = 0; i < attempts; i++) {
+		try {
+			const res = await fetch(warpHealthUrl(port), { signal: AbortSignal.timeout(750) });
+			if (res.ok) return true;
+		} catch {
+			// not up yet
+		}
+		if (i + 1 < attempts) await new Promise((r) => setTimeout(r, 300));
+	}
+	return false;
+}
+
+let warpWarned = false;
+
+/** Best-effort: never throws; returns whether WARP answered /health. */
+export async function ensureWarp(): Promise<boolean> {
+	const ok = await probeWarp(WARP_DEFAULT_PORT, 2);
+	if (ok) return true;
+	// Precedence: explicit env var, then the persisted config entry, then the
+	// binary installed by /free-bridge-warp in the plugin folder, then nothing
+	// (warn once; the relay's chain degrades per mode).
+	const installeBin = join(WARP_INSTALL_DIR, "warp-minimal.exe");
+	const installeConfig = join(WARP_INSTALL_DIR, "config.json");
+	const bin =
+		process.env.PI_FREE_BRIDGE_WARP_BIN?.trim() ||
+		readBridgeConfig().warpBin?.trim() ||
+		(existsSync(installeBin) ? installeBin : "");
+	if (!bin) {
+		if (!warpWarned) {
+			console.error(
+				`pi-free-bridge: WARP mode needs warp-minimal on 127.0.0.1:${WARP_DEFAULT_PORT} — ` +
+					"it is not answering. Start it, or set PI_FREE_BRIDGE_WARP_BIN to its binary.",
+			);
+			warpWarned = true;
+		}
+		return false;
+	}
+	try {
+		// warp-minimal needs its config; the install folder always carries the
+		// matching config.json next to the binary.
+		const args = bin === installeBin && existsSync(installeConfig) ? ["-config", installeConfig] : [];
+		const child = spawn(bin, args, {
+			stdio: "ignore",
+			detached: true,
+			windowsHide: true,
+		});
+		child.once("error", () => undefined); // surface via probe failure
+		child.unref();
+		return await probeWarp(WARP_DEFAULT_PORT, 6);
+	} catch (err) {
+		if (!warpWarned) {
+			console.error(`pi-free-bridge: could not start warp-minimal — ${(err as Error).message}`);
+			warpWarned = true;
+		}
+		return false;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// warp-minimal install (bun-upgrades S4, in-Pi with explicit consent)
+// ---------------------------------------------------------------------------
+//
+// When a non-off mode needs WARP and no binary is known, the extension can
+// download the latest warp-minimal release from github.com/Deury08/warp-minimal
+// — but ONLY after ctx.ui.confirm answers yes, and with a checksum check from
+// the release's own checksums.txt.
+
+const WARP_RELEASE_API = "https://api.github.com/repos/Deury08/warp-minimal/releases/latest";
+const WARP_INSTALL_DIR = join(homedir(), ".pi", "agent", "pi-free-bridge", "warp");
+
+function warpAssetKey(): string | undefined {
+	const os =
+		process.platform === "win32"
+			? "windows"
+			: process.platform === "darwin"
+				? "darwin"
+				: process.platform === "linux"
+					? "linux"
+					: undefined;
+	if (!os) return undefined;
+	const arch = process.arch === "arm64" ? "arm64" : "amd64";
+	return `${os}_${arch}`;
+}
+
+/** Latest platform asset from the release API. */
+async function findWarpAsset(): Promise<{ tag: string; url: string; name: string; size: number } | undefined> {
+	try {
+		const res = await fetch(WARP_RELEASE_API, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(10000),
+		});
+		if (!res.ok) return undefined;
+		const release = (await res.json()) as {
+			tag_name?: unknown;
+			assets?: { name?: unknown; browser_download_url?: unknown; size?: unknown }[];
+		};
+		const key = warpAssetKey();
+		if (!key) return undefined;
+		const asset = (release.assets ?? []).find(
+			(a) =>
+				typeof a.name === "string" &&
+				typeof a.browser_download_url === "string" &&
+				a.name.includes(key) &&
+				(a.name.endsWith(".zip") || a.name.endsWith(".tar.gz")),
+		);
+		if (!asset) return undefined;
+		return {
+			tag: typeof release.tag_name === "string" ? release.tag_name : "latest",
+			url: asset.browser_download_url as string,
+			name: asset.name as string,
+			size: typeof asset.size === "number" ? asset.size : 0,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/** Download + extract the release, verify its sha256 against checksums.txt,
+ *  install the binary under WARP_INSTALL_DIR and return its path, or
+ *  undefined with the failure logged. `status` reports each stage to Pi's
+ *  notifications (ctx.ui.notify). Extraction uses the system `tar`
+ *  (bsdtar), which ships with Windows 10+, macOS and Linux and handles the
+ *  zip archives too. */
+async function installWarpBinary(
+	asset: { tag: string; url: string; name: string; size: number },
+	status?: (message: string) => void,
+): Promise<string | undefined> {
+	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-warp-"));
+	try {
+		const archivePath = join(tmpDir, asset.name);
+		status?.(`Downloading warp-minimal ${asset.tag}…`);
+		const res = await fetch(asset.url, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(60000),
+		});
+		if (!res.ok) {
+			console.error(`pi-free-bridge: warp-minimal download failed — HTTP ${res.status}`);
+			return undefined;
+		}
+		writeFileSync(archivePath, Buffer.from(await res.arrayBuffer()));
+
+		const csUrl = asset.url.slice(0, asset.url.length - asset.name.length) + "checksums.txt";
+		const csRes = await fetch(csUrl, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(15000),
+		});
+		if (!csRes.ok) {
+			console.error(`pi-free-bridge: warp-minimal checksums.txt unreachable — HTTP ${csRes.status}`);
+			return undefined;
+		}
+		status?.("Verifying the release sha256 checksum…");
+		const checksums = await csRes.text();
+		const expected = checksums
+			.split(/\r?\n/)
+			.find((line) => line.trimEnd().endsWith(asset.name))
+			?.split(/\s+/)[0];
+		const got = createHash("sha256").update(readFileSync(archivePath)).digest("hex");
+		if (!expected) {
+			console.error("pi-free-bridge: no checksum listed for", asset.name);
+			return undefined;
+		}
+		if (expected.toLowerCase() !== got) {
+			console.error(`pi-free-bridge: warp-minimal checksum mismatch (expected ${expected}, got ${got})`);
+			return undefined;
+		}
+
+		status?.(`Installing to ${WARP_INSTALL_DIR}…`);
+		mkdirSync(WARP_INSTALL_DIR, { recursive: true });
+		const { execFileSync } = await import("node:child_process");
+		// bsdtar handles the zip archives; GNU tar in a Git-Bash PATH does not.
+		// Windows 10+ ships bsdtar at System32; macOS/Linux default to it.
+		const tarBin =
+			process.platform === "win32"
+				? join(process.env.WINDIR ?? "C:\\Windows", "System32", "tar.exe")
+				: "tar";
+		execFileSync(tarBin, ["-xf", archivePath, "-C", tmpDir], {
+			stdio: "ignore",
+			timeout: 30000,
+		});
+		const exeName = process.platform === "win32" ? "warp-minimal.exe" : "warp-minimal";
+		// The archive may keep the binary at its root or inside a single folder.
+		let extracted: string | undefined = join(tmpDir, exeName);
+		if (!existsSync(extracted)) {
+			for (const entry of readdirSync(tmpDir)) {
+				const candidate = join(tmpDir, entry, exeName);
+				if (existsSync(candidate)) {
+					extracted = candidate;
+					break;
+				}
+			}
+		}
+		if (!extracted || !existsSync(extracted)) {
+			console.error(`pi-free-bridge: did not find ${exeName} inside ${asset.name}`);
+			return undefined;
+		}
+		const target = join(WARP_INSTALL_DIR, exeName);
+		copyFileSync(extracted, target);
+		if (process.platform !== "win32") chmodSync(target, 0o755);
+		writeBridgeConfig({ warpBin: target });
+		return target;
+	} catch (err) {
+		const message = `warp-minimal install failed: ${(err as Error).message}`;
+		console.error(`pi-free-bridge: ${message}`);
+		status?.(message);
+		return undefined;
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
@@ -1175,6 +1668,107 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("free-bridge-warp", {
+		description: "Show or set the WARP egress mode: off | auto | on; bin <path> configures the binary",
+		handler: async (args: string, ctx) => {
+			const binArgs = args.trim().match(/^bin\s+(.+)/i);
+			if (binArgs) {
+				const binPath = binArgs[1].trim();
+				if (!existsSync(binPath)) {
+					ctx.ui.notify(`File not found: ${binPath} — nothing was changed`, "warning");
+				} else {
+					writeBridgeConfig({ warpBin: binPath });
+					ctx.ui.notify(`pi-free-bridge: warpBin set to ${binPath} in ${BRIDGE_CONFIG_PATH}`, "info");
+				}
+				return;
+			}
+			const next = normalizeWarpMode(args);
+			if (!next) {
+				const envOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
+				const health = await fetchRelayHealth(RELAY_PORT);
+				const onWire = health?.warpMode ? `relay reports ${health.warpMode}${health.lastEgress ? `, last egress ${health.lastEgress}` : ""}` : "relay not running";
+				ctx.ui.notify(
+					[
+						`pi-free-bridge warp: ${resolveWarpMode()} (config)${envOverride ? ` — env override wins: ${envOverride}` : ""}`,
+						onWire,
+						"off: direct only; auto: direct first, WARP on rate limit; on: always WARP.",
+						"Set with /free-bridge-warp off|auto|on.",
+					].join("\n"),
+					"info",
+				);
+				return;
+			}
+			if (normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE)) {
+				ctx.ui.notify(
+					`PI_FREE_BRIDGE_WARP_MODE is set: it beats the config. Unset it to use ${next}.`,
+					"warning",
+				);
+				return;
+			}
+			// bun-upgrades S4: a non-off mode needs warp-minimal alive. Ask with
+			// an explicit dialog before anything is downloaded.
+			if (next !== "off" && !(await ensureWarp())) {
+				const asset = await findWarpAsset();
+				const sizeMb = asset && asset.size > 0 ? ` (${(asset.size / 1048576).toFixed(1)} MB)` : "";
+				const consent =
+					ctx.hasUI &&
+					(await ctx.ui.confirm(
+						"pi-free-bridge",
+						asset
+							? `WARP is not running and no binary is configured.\n\n` +
+								`Download warp-minimal ${asset.tag}${sizeMb} from\n` +
+								`github.com/Deury08/warp-minimal, verify its checksum,\n` +
+								`and install it to ${WARP_INSTALL_DIR}?`
+							: `WARP is not running and no binary is configured.\n\n` +
+								`No release asset is reachable right now.\n\n` +
+								`Configure the path manually with: /free-bridge-warp bin <path>\n` +
+								`or set PI_FREE_BRIDGE_WARP_BIN. Switch anyway?`,
+					));
+				if (consent && asset) {
+					ctx.ui.notify(`Downloading warp-minimal ${asset.tag}…`, "info");
+					const installed = await installWarpBinary(
+						asset,
+						(message) => ctx.ui.notify(message, "info"),
+					);
+					if (installed) {
+						ctx.ui.notify(`warp-minimal installed to ${installed}`, "info");
+						if (!(await ensureWarp())) {
+							ctx.ui.notify(
+								`warp-minimal was installed but did not answer /health on 127.0.0.1:${WARP_DEFAULT_PORT}`,
+								"warning",
+							);
+						}
+					} else {
+						ctx.ui.notify(
+							"warp-minimal install failed — see the Pi error log.\n" +
+								"You can still configure the path manually:\n/free-bridge-warp bin <path>",
+							"warning",
+						);
+					}
+				}
+				if (next === "on" && !(await ensureWarp())) {
+					// `on` is WARP-only; switching without a working WARP would
+						// fail every request until WARP comes up.
+					ctx.ui.notify(
+						`Not switching to on: WARP is not up. Set it again when warp-minimal answers on 127.0.0.1:${WARP_DEFAULT_PORT}.`,
+						"warning",
+					);
+					return;
+				}
+			}
+
+			writeBridgeConfig({ warpEnabled: next });
+
+			// relay-warp-hot-reload: no relay restart. The relay re-reads the
+			// config file on every request, so the new mode applies on the next
+			// request with the same process (pid survives the switch).
+			ctx.ui.notify(
+				`WARP mode set to ${next} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
+				"info",
+			);
+		},
+	});
+
 	pi.registerCommand("free-bridge-doctor", {
 		description: "Diagnose and repair why the free OpenCode models are missing from the picker",
 		handler: async (_args: string, ctx) => {
@@ -1192,6 +1786,11 @@ export default function (pi: ExtensionAPI) {
 				`  bun:        ${resolveBunPath() ?? "MISSING"}`,
 				`  relay port: ${RELAY_PORT}`,
 				`  relay:      ${describeRelay()}`,
+				`  warp:       ${
+					health?.warpMode
+						? `${health.warpMode} on the relay${health.lastEgress ? ` (last egress: ${health.lastEgress})` : ""}`
+						: `${resolveWarpMode()} (configured; the relay reports it once it runs)`
+				}`,
 				`  upstream:   ${UPSTREAM_URL}`,
 				`  live ids:   ${live.source}`,
 				`  skipped:    ${discovered.skipped.length ? discovered.skipped.join(", ") : "none"}`,

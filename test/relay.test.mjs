@@ -8,6 +8,7 @@
 // must not start a server.
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +16,7 @@ import test from "node:test";
 import {
 	ensureEnvBlock,
 	ensureGateTools,
+	resolveRelaySession,
 	resolveSessionFromStore,
 	toUpstreamUrl,
 } from "../relay.mjs";
@@ -282,4 +284,263 @@ test("importing relay.mjs has no side effects", () => {
 	assert.equal(typeof ensureGateTools, "function");
 	assert.equal(typeof resolveSessionFromStore, "function");
 	assert.equal(typeof toUpstreamUrl, "function");
+});
+
+// ---------------------------------------------------------------------------
+// resolveRelaySession precedence (bun-upgrades S2)
+// ---------------------------------------------------------------------------
+
+function writeStore(shareDir, files) {
+	mkdirSync(join(shareDir, "storage", "session_diff"), { recursive: true });
+	for (const [name, when] of files) {
+		writeFileSync(join(shareDir, "storage", "session_diff", name), "{}");
+		utimesSync(join(shareDir, "storage", "session_diff", name), when, when);
+	}
+}
+
+test("resolveRelaySession: user override wins over a Pi-supplied id", async () => {
+	process.env.RELAY_SESSION = "ses_override";
+	process.env.RELAY_SESSION_SOURCE = "env";
+	process.env.RELAY_SESSION_PI = "ses_pi_harvest";
+	try {
+		const result = await resolveRelaySession({ shareDir: join(tmpdir(), "pfb-empty-none-00") });
+		assert.equal(result.sessionId, "ses_override");
+		assert.equal(result.source, "env");
+	} finally {
+		delete process.env.RELAY_SESSION;
+		delete process.env.RELAY_SESSION_SOURCE;
+		delete process.env.RELAY_SESSION_PI;
+	}
+});
+
+test("resolveRelaySession: Pi-supplied id beats the relay's local store", async () => {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
+	process.env.RELAY_SESSION_PI = "ses_pi_harvest";
+	try {
+		const result = await resolveRelaySession({ shareDir });
+		assert.equal(result.sessionId, "ses_pi_harvest");
+		assert.equal(result.source, "pi-harvest");
+	} finally {
+		delete process.env.RELAY_SESSION_PI;
+	}
+});
+
+test("resolveRelaySession: without a Pi-supplied id, the relay harvests locally", async () => {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
+	const result = await resolveRelaySession({ shareDir });
+	assert.equal(result.sessionId, "ses_local");
+	assert.equal(result.source, "session-diff");
+});
+
+// ---------------------------------------------------------------------------
+// Egress selection (bun-upgrades S5)
+// ---------------------------------------------------------------------------
+
+import { egressOrder, updateWarpPreference, WARP_MODES } from "../relay.mjs";
+
+test("egressOrder: off is always local-only", () => {
+	assert.deepEqual(egressOrder("off", false), ["local"]);
+	assert.deepEqual(egressOrder("off", true), ["local"]);
+});
+
+test("egressOrder: on is always warp-only", () => {
+	assert.deepEqual(egressOrder("on", false), ["warp"]);
+});
+
+test("egressOrder: auto starts local and elevates after a warp-only success", () => {
+	assert.deepEqual(egressOrder("auto", false), ["local", "warp"]);
+	assert.deepEqual(egressOrder("auto", true), ["warp", "local"]);
+});
+
+test("egressOrder: unknown mode falls back to off", () => {
+	assert.deepEqual(egressOrder("banana", false), ["local"]);
+});
+
+test("updateWarpPreference: auto elevates when warp was the final egress", () => {
+	assert.equal(updateWarpPreference("auto", "warp", true), true);
+	assert.equal(updateWarpPreference("auto", "local", true), false);
+	assert.equal(updateWarpPreference("off", "warp", true), false);
+});
+
+test("updateWarpPreference: a failure never elevates warp", () => {
+	assert.equal(updateWarpPreference("auto", "warp", false), false);
+});
+
+test("WARP_MODES: exactly off, auto, on", () => {
+	assert.deepEqual(WARP_MODES, ["off", "auto", "on"]);
+});
+
+// ---------------------------------------------------------------------------
+// Hot warp-mode resolution (relay-warp-hot-reload)
+// ---------------------------------------------------------------------------
+
+import {
+	bumpWarp429Streak,
+	needsWarpRecycle,
+	readFileWarpMode,
+	resolveWarpModeHot,
+} from "../relay.mjs";
+
+test("resolveWarpModeHot: override wins over the file value", () => {
+	assert.equal(resolveWarpModeHot("on", "off"), "on");
+});
+
+test("resolveWarpModeHot: override is normalized before it wins", () => {
+	assert.equal(resolveWarpModeHot("  ON ", "off"), "on");
+});
+
+test("resolveWarpModeHot: a valid file value wins when there is no override", () => {
+	assert.equal(resolveWarpModeHot(undefined, "auto"), "auto");
+	assert.equal(resolveWarpModeHot("", "on"), "on");
+});
+
+test("resolveWarpModeHot: a garbage file value falls through to off", () => {
+	assert.equal(resolveWarpModeHot(undefined, "banana"), "off");
+	assert.equal(resolveWarpModeHot(undefined, undefined), "off");
+	assert.equal(resolveWarpModeHot("", ""), "off");
+});
+
+test("resolveWarpModeHot: a garbage override falls through to the file value", () => {
+	assert.equal(resolveWarpModeHot("banana", "auto"), "auto");
+});
+
+test("readFileWarpMode: reads warpEnabled from the extension's config file", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	const file = join(dir, "config.json");
+	writeFileSync(file, JSON.stringify({ warpEnabled: "on" }));
+	assert.equal(readFileWarpMode(file), "on");
+});
+
+test("readFileWarpMode: a file value outside WARP_MODES is rejected", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	const file = join(dir, "config.json");
+	writeFileSync(file, JSON.stringify({ warpEnabled: "banana" }));
+	assert.equal(readFileWarpMode(file), undefined);
+});
+
+test("readFileWarpMode: a malformed config file never throws", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	const file = join(dir, "config.json");
+	writeFileSync(file, "{ not json");
+	assert.equal(readFileWarpMode(file), undefined);
+});
+
+test("bumpWarp429Streak: only a warp-egress 429 extends the streak", () => {
+	assert.equal(bumpWarp429Streak(0, 429, "warp"), 1);
+	assert.equal(bumpWarp429Streak(1, 429, "warp"), 2);
+	assert.equal(bumpWarp429Streak(2, 429, "local"), 2);
+	assert.equal(bumpWarp429Streak(3, 429, "local"), 3);
+});
+
+test("bumpWarp429Streak: any success resets it", () => {
+	assert.equal(bumpWarp429Streak(2, 200, "warp"), 0);
+	assert.equal(bumpWarp429Streak(2, 200, "local"), 0);
+});
+
+test("needsWarpRecycle: fires at the threshold, not during cooldown", () => {
+	assert.equal(needsWarpRecycle(2, 3, false), false);
+	assert.equal(needsWarpRecycle(3, 3, false), true);
+	assert.equal(needsWarpRecycle(5, 3, true), false);
+});
+
+test("readFileWarpMode: tolerates a UTF-8 BOM in the config file", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	const file = join(dir, "config.json");
+	writeFileSync(file, "﻿" + JSON.stringify({ warpEnabled: "auto" }), "utf8");
+	assert.equal(readFileWarpMode(file), "auto");
+	writeFileSync(file, "﻿" + "{ broken", "utf8");
+	assert.equal(readFileWarpMode(file), undefined);
+});
+
+test("readFileWarpMode: a missing config file never throws", () => {
+	assert.equal(readFileWarpMode(join(tmpdir(), "pfb-relay-nope/x.json")), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Extension relay wiring (relay-warp-hot-reload, T3/T5)
+// ---------------------------------------------------------------------------
+// The extension module is TypeScript; it is imported here the same way
+// test/smoke.mjs does it, with the dry-run/self-repair guards set BEFORE the
+// import so it never writes the real settings file.
+
+const withIndex = async () => {
+	delete process.env.PI_FREE_BRIDGE_WARP_MODE;
+	const mod = await import("../index.ts");
+	return mod;
+};
+
+test("relayKey: the cache key is port and session id only — no warpMode", async () => {
+	const { relayKey } = await withIndex();
+	assert.equal(relayKey(8788, "ses_abc"), "8788\u0000ses_abc");
+	assert.equal(relayKey(8788), "8788\u0000");
+});
+
+test("relayEnv: RELAY_WARP_MODE is omitted when there is no env override", async () => {
+	const mod = await withIndex();
+	const env = mod.relayEnv({ port: 8788, upstream: "https://example.test", cwd: "." });
+	assert.equal(env.RELAY_WARP_MODE, undefined);
+});
+
+test("relayEnv: a real PI_FREE_BRIDGE_WARP_MODE override is injected as RELAY_WARP_MODE", async () => {
+	const mod = await withIndex();
+	process.env.PI_FREE_BRIDGE_WARP_MODE = "on";
+	try {
+		const env = mod.relayEnv({ port: 8788, upstream: "https://example.test", cwd: "." });
+		assert.equal(env.RELAY_WARP_MODE, "on");
+	} finally {
+		delete process.env.PI_FREE_BRIDGE_WARP_MODE;
+	}
+});
+
+test("relayEnv: RELAY_CONFIG_PATH points at the extension's config file", async () => {
+	const mod = await withIndex();
+	const env = mod.relayEnv({ port: 8788, upstream: "https://example.test", cwd: "." });
+	assert.equal(env.RELAY_CONFIG_PATH, mod.BRIDGE_CONFIG_PATH);
+});
+
+test("fetchRelayHealth: parses warpModeSource from the /health payload", async () => {
+	const { fetchRelayHealth } = await withIndex();
+	const server = createServer((_req, res) => {
+		res.setHeader("content-type", "application/json");
+		res.end(
+			JSON.stringify({
+				service: "pi-free-bridge-relay",
+				ok: true,
+				sessionId: "ses_x",
+				sessionSource: "env",
+				warpMode: "auto",
+				warpModeSource: "config",
+				lastEgress: "local",
+				pid: 1234,
+			}),
+		);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	try {
+		const health = await fetchRelayHealth(server.address().port);
+		assert.equal(health?.warpMode, "auto");
+		assert.equal(health?.warpModeSource, "config");
+	} finally {
+		server.close();
+	}
+});
+
+test("fetchRelayHealth: an old relay without warpModeSource reads as undefined", async () => {
+	const { fetchRelayHealth } = await withIndex();
+	const server = createServer((_req, res) => {
+		res.setHeader("content-type", "application/json");
+		res.end(
+			JSON.stringify({ service: "pi-free-bridge-relay", ok: true, warpMode: "off", pid: 1234 }),
+		);
+	});
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	try {
+		const health = await fetchRelayHealth(server.address().port);
+		assert.equal(health?.warpMode, "off");
+		assert.equal(health?.warpModeSource, undefined);
+	} finally {
+		server.close();
+	}
 });

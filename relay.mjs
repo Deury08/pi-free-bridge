@@ -10,7 +10,13 @@
 //
 // The module exports its pure helpers so `test/relay.test.mjs` can run them
 // under plain Node; the server only starts when this file is executed directly.
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import {
+	existsSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -197,14 +203,26 @@ export async function resolveSessionFromStore({ shareDir = openCodeShareDir() } 
 	return undefined;
 }
 
-/** S31 precedence: an explicit override wins over the harvested id. */
-async function resolveRelaySession() {
+/** Verde (bun-upgrades S2): precedence is user override, then the
+ *  Pi-harvested id, then the relay's local store. Exported for tests; takes
+ *  the local store root as an argument so tests can inject a temp store. */
+export async function resolveRelaySession({ shareDir } = {}) {
+	// Precedence (bun-upgrades S2): user override, then the id the extension
+	// harvested on Pi's machine (works when OpenCode lives elsewhere), then the
+	// relay's own local store (same machine as OpenCode).
 	const override = process.env.RELAY_SESSION?.trim();
 	if (override) {
 		const declared = process.env.RELAY_SESSION_SOURCE;
 		return { sessionId: override, source: declared === "config" ? "config" : "env" };
 	}
-	return resolveSessionFromStore();
+	// The id the Pi extension harvested on its own machine (open-code store not
+	// necessarily local). It wins over a relay-local harvest but never over a
+	// user override, and it is reported with its own source for the doctor.
+	const fromPi = process.env.RELAY_SESSION_PI?.trim();
+	if (fromPi && /^ses_/.test(fromPi)) {
+		return { sessionId: fromPi, source: "pi-harvest" };
+	}
+	return resolveSessionFromStore(shareDir ? { shareDir } : {});
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +251,180 @@ async function readBody(req) {
 	return Buffer.concat(chunks).toString("utf8");
 }
 
+// ---------------------------------------------------------------------------
+// Egress selection (bun-upgrades S5): off | auto | on
+// ---------------------------------------------------------------------------
+//
+//   off   — every request goes direct (unchanged behavior).
+//   auto  — direct first; a rate limit (429) received before the first
+//           downstream byte retries through WARP. When a request only succeeds
+//           through WARP, the relay prefers WARP from then on (with local as
+//           the backoff so a dead WARP cannot brick the bridge).
+//   on    — every request goes through WARP.
+//
+// Failover NEVER happens after the first downstream byte: an SSE stream cannot
+// be replayed, a mid-stream retry corrupts it. `warp-minimal` listens on
+// 127.0.0.1:8789 (upstream env RELAY_WARP_PROXY).
+
+const WARP_PROXY_DEFAULT = "http://127.0.0.1:8789";
+
+/** Allowed modes, exported for validation in the extension config too. */
+export const WARP_MODES = ["off", "auto", "on"];
+
+function normalizeWarpMode(value) {
+	const mode = String(value ?? "").trim().toLowerCase();
+	return WARP_MODES.includes(mode) ? mode : undefined;
+}
+
+/** Pure: the egress order for one request. */
+export function egressOrder(mode, warpPreferred) {
+	if (mode === "on") return ["warp"];
+	if (mode === "auto") return warpPreferred ? ["warp", "local"] : ["local", "warp"];
+	return ["local"];
+}
+
+/** Pure: the next warp preference after one request.
+ *  `used` names the egress that produced the final response, `ok` says whether
+ *  it was not a rate limit. */
+export function updateWarpPreference(mode, used, ok) {
+	if (mode !== "auto") return false;
+	if (!ok) return false;
+	return used === "warp";
+}
+
+// Process-level stickiness for `auto`: once WARP was the only working path,
+// later requests try it first.
+let warpPreferred = false;
+let lastEgress = undefined;
+
+function egressFetch(config, pathname, { body }, egress) {
+	const opts = {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"user-agent": config.userAgent,
+			authorization: `Bearer ${config.apiKey}`,
+			"x-opencode-session": config.session,
+			"x-opencode-session-id": config.session,
+		},
+		body,
+	};
+	if (egress === "warp") opts.proxy = config.warpProxy;
+	return fetch(toUpstreamUrl(config.upstream, pathname), opts);
+}
+
+/** Pure: per-request warp mode (relay-warp-hot-reload). Precedence: the
+ *  normalized env override, then the normalized value from the config file,
+ *  then "off". Exported for tests. */
+export function resolveWarpModeHot(override, fileValue) {
+	return normalizeWarpMode(override) ?? normalizeWarpMode(fileValue) ?? "off";
+}
+
+/** Read the extension's persisted config file and return its normalized warp
+ *  mode, or undefined on any missing/foreign/malformed file so the caller can
+ *  keep the last known mode. Never throws. */
+export function readFileWarpMode(path) {
+	try {
+		const raw = readFileSync(path, "utf8");
+		// Strip a UTF-8 BOM (Windows editors) so JSON.parse cannot reject the file.
+		const parsed = JSON.parse(raw.startsWith("﻿") ? raw.slice(1) : raw);
+		const value =
+			parsed && typeof parsed === "object" ? parsed.warpEnabled ?? parsed.warpMode : undefined;
+		return normalizeWarpMode(value);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Hot reload (relay-warp-hot-reload): re-read the warp mode from the config
+ *  file the extension points at via RELAY_CONFIG_PATH. A read/parse failure
+ *  keeps the last known mode and never crashes the request; it warns at most
+ *  once for the life of the process. A RELAY_WARP_MODE env override is
+ *  absolute and pins the mode (source "env", by design). */
+let warpConfigWarned = false;
+function refreshWarpMode(config) {
+	if (config.warpModeSource === "env" || !config.warpConfigPath) return;
+	const fileMode = readFileWarpMode(config.warpConfigPath);
+	if (fileMode) {
+		config.warpMode = fileMode;
+		return;
+	}
+	if (!warpConfigWarned) {
+		warpConfigWarned = true;
+		process.stderr.write(
+			`pi-free-bridge relay: could not read a warp mode from ${config.warpConfigPath} — ` +
+				`keeping ${config.warpMode}\n`,
+		);
+	}
+}
+
+/** relay-warp-auto-recycle (user-approved): the opencode free gate counts
+ *  quota per (session, egress IP). A persistent 429 via the warp egress means
+ *  that exit IP burnt its window, and only the proxy can re-enroll it. The
+ *  relay counts consecutive 429s DELIVERED through the warp egress and, past
+ *  a threshold, POSTs /recycle to the proxy. If the proxy does not expose
+ *  that endpoint yet, the relay degrades: one warning, requests keep flowing
+ *  exactly as before. Pure helpers exported for tests. */
+const RECYCLE_THRESHOLD = (() => {
+	const n = Number.parseInt(process.env.RELAY_WARP_RECYCLE_THRESHOLD ?? "", 10);
+	return Number.isInteger(n) && n > 0 ? n : 3;
+})();
+const RECYCLE_COOLDOWN_MS = (() => {
+	const n = Number.parseInt(process.env.RELAY_WARP_RECYCLE_COOLDOWN_MS ?? "", 10);
+	return Number.isInteger(n) && n >= 0 ? n : 5 * 60_000;
+})();
+
+/** Pure: only a warp-egress 429 extends the streak; any success resets it;
+ *  a LOCAL 429 says nothing about the exit IP and leaves it untouched. */
+export function bumpWarp429Streak(streak, status, egress) {
+	if (egress === "warp" && status === 429) return streak + 1;
+	if (typeof status === "number" && status < 400) return 0;
+	return streak;
+}
+
+/** Pure: fire when the streak reaches the threshold and not on cooldown. */
+export function needsWarpRecycle(streak, threshold = RECYCLE_THRESHOLD, onCooldown = false) {
+	return !onCooldown && streak >= threshold;
+}
+
+let warp429Streak = 0;
+let warpRecycles = 0;
+let warpRecycleNotBefore = 0;
+let warpRecycleUnavailableWarned = false;
+
+async function maybeRecycleWarp(config, deliveredStatus) {
+	warp429Streak = bumpWarp429Streak(warp429Streak, deliveredStatus, lastEgress);
+	if (!needsWarpRecycle(warp429Streak, RECYCLE_THRESHOLD, Date.now() < warpRecycleNotBefore)) return;
+	warp429Streak = 0;
+	warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
+	if (!config.warpProxy) return;
+	try {
+		const res = await fetch(`${config.warpProxy}/recycle`, {
+			method: "POST",
+			signal: AbortSignal.timeout(10_000),
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		await res.arrayBuffer();
+		warpRecycles += 1;
+		process.stderr.write(
+			`pi-free-bridge relay: warp exit recycled (fresh egress IP) after ${RECYCLE_THRESHOLD} warp 429s
+`,
+		);
+	} catch (err) {
+		const reason = err && err.message ? err.message : String(err);
+		if (!warpRecycleUnavailableWarned) {
+			warpRecycleUnavailableWarned = true;
+			process.stderr.write(
+				`pi-free-bridge relay: warp auto-recycle unavailable (${reason}) — continuing without it
+`,
+			);
+		} else {
+			process.stderr.write(`pi-free-bridge relay: warp auto-recycle attempt failed — ${reason}
+`);
+		}
+	}
+}
+
 async function forward(req, res, pathname, config) {
 	try {
 		const raw = await readBody(req);
@@ -247,30 +439,90 @@ async function forward(req, res, pathname, config) {
 			stream: true,
 		});
 
-		const upstream = await fetch(toUpstreamUrl(config.upstream, pathname), {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"user-agent": config.userAgent,
-				authorization: `Bearer ${config.apiKey}`,
-				"x-opencode-session": config.session,
-				"x-opencode-session-id": config.session,
-			},
-			body: JSON.stringify(body),
-		});
+		// S5: walk the egress chain, failover only while nothing has reached
+		// the client. Whatever response ends the loop is delivered verbatim by
+		// the code below (error body byte-exact included).
+		const order = egressOrder(config.warpMode, warpPreferred);
+		const errors = [];
+		let response = undefined;
+		let last429 = undefined;
+		for (const egress of order) {
+			lastEgress = egress;
+			let candidate;
+			try {
+				candidate = await egressFetch(config, pathname, { body: JSON.stringify(body) }, egress);
+			} catch (err) {
+				errors.push(`${egress}: ${err && err.message ? err.message : String(err)}`);
+				continue;
+			}
+			if (candidate.status === 429) {
+				// The raw gate 429 is payday evidence for the client; the old
+				// relay piped it through byte-exact when there was no alternate
+				// egress. Keep it instead of the drain, and only fall back while
+				// another egress in the chain actually exists.
+				if (egress === order[order.length - 1]) {
+					response = candidate;
+					break;
+				}
+				await candidate.arrayBuffer(); // drain for connection reuse
+				last429 = `429 (${egress})`;
+				errors.push(`${egress}: 429`);
+				continue;
+			}
+			response = candidate;
+			break;
+		}
+		if (!response && last429) {
+			// Non-last 429 with every fallback exhausted: surface the chain.
+			sendJson(res, 502, { error: { message: `rate limited on every egress: ${errors.join("; ")}` } });
+			return;
+		}
+		if (!response) {
+			const message =
+				errors.length > 0
+					? `all egress attempts failed: ${errors.join("; ")}`
+					: "no egress configured";
+			sendJson(res, 502, { error: { message } });
+			return;
+		}
+		// relay-warp-auto-recycle: count the streak on the DELIVERED response
+		// (the request the client actually sees).
+		await maybeRecycleWarp(config, response.status);
+		warpPreferred = updateWarpPreference(config.warpMode, lastEgress, true);
 
 		// S20: status and content-type pass through, the body is piped unparsed.
 		const headers = {};
-		const contentType = upstream.headers.get("content-type");
+		const contentType = response.headers.get("content-type");
 		if (contentType) headers["content-type"] = contentType;
-		res.writeHead(upstream.status, headers);
 
-		if (!upstream.body) {
+		// Error diagnostics (bun-upgrades S3): a gate rejection carries the
+		// usable evidence in its JSON body. Snapshot it (bounded) before piping,
+		// and hand the exact same bytes back — never rewrite or terminate them,
+		// so Content-Length and SSE framing stay untouched.
+		if (response.status >= 400) {
+			const errorBody = Buffer.from(await response.arrayBuffer());
+			const snapshot = errorBody.subarray(0, 4096);
+			process.stderr.write(
+				`pi-free-bridge relay: upstream ${response.status} via ${lastEgress} ${toUpstreamUrl(config.upstream, pathname)}
+` +
+					`pi-free-bridge relay: session ${config.session} (from ${config.sessionSource})
+` +
+					`pi-free-bridge relay: upstream body: ${snapshot.toString("utf8")}
+`,
+			);
+			res.writeHead(response.status, headers);
+			res.end(errorBody);
+			return;
+		}
+
+		res.writeHead(response.status, { ...headers, "x-egress-used": lastEgress });
+
+		if (!response.body) {
 			res.end();
 			return;
 		}
 
-		const reader = upstream.body.getReader();
+		const reader = response.body.getReader();
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
@@ -283,6 +535,10 @@ async function forward(req, res, pathname, config) {
 }
 
 async function handle(req, res, config) {
+	// Hot reload (relay-warp-hot-reload): one cheap config re-read per request
+	// drives both /health and /v1.
+	refreshWarpMode(config);
+
 	const { pathname } = new URL(req.url ?? "/", "http://127.0.0.1");
 
 	if (req.method === "GET" && pathname === "/health") {
@@ -293,6 +549,13 @@ async function handle(req, res, config) {
 			ok: true,
 			sessionId: config.session,
 			sessionSource: config.sessionSource,
+			warpMode: config.warpMode,
+			warpModeSource: config.warpModeSource,
+			warpProxy: config.warpProxy,
+			warp429Streak: warp429Streak,
+			warpRecycles: warpRecycles,
+			lastEgress: lastEgress,
+			pid: process.pid,
 		});
 		return;
 	}
@@ -320,6 +583,11 @@ async function startServer() {
 		process.exit(1);
 	}
 
+	// relay-warp-hot-reload: when RELAY_WARP_MODE is a real env override the
+	// mode is absolute (source "env") and the relay stays static, by design.
+	// Otherwise the per-request hot refresh resolves it from the config file
+	// the extension points at via RELAY_CONFIG_PATH.
+	const envOverride = normalizeWarpMode(process.env.RELAY_WARP_MODE);
 	const config = {
 		upstream: process.env.RELAY_UPSTREAM || DEFAULT_UPSTREAM,
 		session: session.sessionId,
@@ -327,6 +595,10 @@ async function startServer() {
 		cwd: process.env.RELAY_CWD || process.cwd(),
 		userAgent: process.env.RELAY_USER_AGENT || DEFAULT_USER_AGENT,
 		apiKey: process.env.RELAY_API_KEY || "public",
+		warpMode: resolveWarpModeHot(envOverride, readFileWarpMode(process.env.RELAY_CONFIG_PATH || "")),
+		warpModeSource: envOverride ? "env" : "config",
+		warpConfigPath: process.env.RELAY_CONFIG_PATH || "",
+		warpProxy: process.env.RELAY_WARP_PROXY || WARP_PROXY_DEFAULT,
 	};
 
 	const server = createServer((req, res) => {
