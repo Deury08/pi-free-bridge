@@ -704,6 +704,32 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 }
 
 /** Ensure a healthy relay for this port + session id, spawning one if needed. */
+/** bun-upgrades L8: a relay left by an older Pi session may carry a different
+ *  egress mode than the config now asks for; reusing it silently would ignore
+ *  the user's switch. Reuse only when the running relay reports the wanted
+ *  mode; otherwise kill the stale one (identity-guarded: only a process
+ *  whose /health reports THIS service and a numeric pid) and spawn fresh.
+ *  Old builds report no pid — those are never killed, the caller surfaces
+ *  them with an actionable message. */
+async function adoptOrReleaseStaleRelay(port: number, warpMode: string): Promise<"match" | "released" | "unkillable" | "absent"> {
+	const health = await fetchRelayHealth(port);
+	if (!health) return "absent";
+	if (health.warpMode === warpMode) return "match";
+	if (typeof health.pid !== "number") return "unkillable";
+	try {
+		process.kill(health.pid, "SIGKILL");
+	} catch {
+		// already gone or owned by another user — treat both as resolved
+		return (await fetchRelayHealth(port)) ? "unkillable" : "released";
+	}
+	// Wait for the port to be released before respawning.
+	for (let i = 0; i < 10; i++) {
+		if (!(await fetchRelayHealth(port))) return "released";
+		await new Promise((resolve) => setTimeout(resolve, 300));
+	}
+	return (await fetchRelayHealth(port)) ? "unkillable" : "released";
+}
+
 async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 	const warpMode = normalizeWarpMode(options.warpMode) ?? resolveWarpMode();
 	const key = `${options.port}\u0000${options.sessionId ?? ""}\u0000${warpMode}`;
@@ -718,14 +744,38 @@ async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 	}
 
 	if (relayState?.key === key) {
-		// A relay we spawned is trusted; one we only reused may belong to another
-		// Pi that has since exited, so its liveness is re-checked.
-		if (relayState.mode === "spawned" || (await probeRelay(options.port)) === "healthy") {
+		// A relay we spawned is trusted; one we only reused must match the
+		// requested egress mode too (L8) and is re-checked for liveness.
+		if (relayState.mode === "spawned") {
 			return { url: relayState.url, mode: relayState.mode };
 		}
-		relayState = undefined;
+		const health = await fetchRelayHealth(options.port);
+		if (health) {
+			if (health.warpMode === warpMode) {
+				return { url: relayState.url, mode: relayState.mode };
+			}
+			relayState = undefined;
+		} else {
+			relayState = undefined;
+		}
 	}
 	if (relayPending?.key === key) return relayPending.promise;
+
+	// Stale-relay gate: before spawning, a healthy foreign relay with a
+	// different warp mode is released, not reused (L8).
+	const stale = await adoptOrReleaseStaleRelay(options.port, warpMode);
+	if (stale === "match" && relayState?.key === key) {
+		return { url: relayUrl(options.port), mode: "reused" };
+	}
+	if (stale === "unkillable") {
+		throw new Error(
+			`pi-free-bridge: a relay from an older Pi session is running on port ${options.port} ` +
+				`with a different WARP mode and no reported pid — kill it manually ` +
+				`(see /free-bridge-doctor) or set PI_FREE_BRIDGE_RELAY_PORT.`,
+		);
+	}
+	// mode !== "off" already warned about WARP above; the spawn must still go
+	// through so the relay's own chain reports the truth on the wire.
 
 	const promise = startRelay(options, key)
 		.then((state) => {
@@ -776,6 +826,7 @@ type RelayHealth = {
 	sessionSource?: string;
 	warpMode?: string;
 	lastEgress?: string;
+	pid?: number;
 };
 
 /** The relay's `/health` payload, or undefined when it is not answering. */
@@ -798,6 +849,7 @@ async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> 
 			sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
 			sessionSource: typeof payload.sessionSource === "string" ? payload.sessionSource : undefined,
 			warpMode: normalizeWarpMode(payload.warpMode),
+			pid: typeof payload.pid === "number" ? payload.pid : undefined,
 			lastEgress: typeof payload.lastEgress === "string" && ["local", "warp"].includes(payload.lastEgress)
 				? payload.lastEgress
 				: undefined,

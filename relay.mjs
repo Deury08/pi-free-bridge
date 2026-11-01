@@ -427,6 +427,7 @@ async function handle(req, res, config) {
 			warpMode: config.warpMode,
 			warpProxy: config.warpProxy,
 			lastEgress: lastEgress,
+			pid: process.pid,
 		});
 		return;
 	}
