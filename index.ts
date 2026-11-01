@@ -1709,10 +1709,14 @@ export default function (pi: ExtensionAPI) {
 				let chosen: string | undefined;
 
 				if (ctx.hasUI && typeof ctx.ui.select === "function") {
-					chosen = (await ctx.ui.select(
+					const selected = await ctx.ui.select(
 						`🚀 Gentle WARP 🔥 — modo actual: ${current}`,
 						modes.map((m) => `${m} — ${modeLabel[m]}`),
-					));
+					);
+					// ctx.ui.select devuelve el string completo de la opción
+					// (p. ej. "on — siempre WARP"); extraer solo el modo puro.
+					chosen = selected ? String(selected).split(" ")[0] : undefined;
+					if (!WARP_MODES.includes(chosen)) chosen = undefined;
 				} else if (ctx.hasUI) {
 					if (
 						await ctx.ui.confirm(
