@@ -327,6 +327,7 @@ async function forward(req, res, pathname, config) {
 		const order = egressOrder(config.warpMode, warpPreferred);
 		const errors = [];
 		let response = undefined;
+		let last429 = undefined;
 		for (const egress of order) {
 			lastEgress = egress;
 			let candidate;
@@ -337,12 +338,26 @@ async function forward(req, res, pathname, config) {
 				continue;
 			}
 			if (candidate.status === 429) {
+				// The raw gate 429 is payday evidence for the client; the old
+				// relay piped it through byte-exact when there was no alternate
+				// egress. Keep it instead of the drain, and only fall back while
+				// another egress in the chain actually exists.
+				if (egress === order[order.length - 1]) {
+					response = candidate;
+					break;
+				}
 				await candidate.arrayBuffer(); // drain for connection reuse
+				last429 = `429 (${egress})`;
 				errors.push(`${egress}: 429`);
 				continue;
 			}
 			response = candidate;
 			break;
+		}
+		if (!response && last429) {
+			// Non-last 429 with every fallback exhausted: surface the chain.
+			sendJson(res, 502, { error: { message: `rate limited on every egress: ${errors.join("; ")}` } });
+			return;
 		}
 		if (!response) {
 			const message =
