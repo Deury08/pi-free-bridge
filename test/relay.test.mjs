@@ -422,6 +422,15 @@ test("readFileWarpMode: a malformed config file never throws", () => {
 	assert.equal(readFileWarpMode(file), undefined);
 });
 
+test("readFileWarpMode: tolerates a UTF-8 BOM in the config file", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	const file = join(dir, "config.json");
+	writeFileSync(file, "﻿" + JSON.stringify({ warpEnabled: "auto" }), "utf8");
+	assert.equal(readFileWarpMode(file), "auto");
+	writeFileSync(file, "﻿" + "{ broken", "utf8");
+	assert.equal(readFileWarpMode(file), undefined);
+});
+
 test("readFileWarpMode: a missing config file never throws", () => {
 	assert.equal(readFileWarpMode(join(tmpdir(), "pfb-relay-nope/x.json")), undefined);
 });

@@ -325,7 +325,9 @@ export function resolveWarpModeHot(override, fileValue) {
  *  keep the last known mode. Never throws. */
 export function readFileWarpMode(path) {
 	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		const raw = readFileSync(path, "utf8");
+		// Strip a UTF-8 BOM (Windows editors) so JSON.parse cannot reject the file.
+		const parsed = JSON.parse(raw.startsWith("﻿") ? raw.slice(1) : raw);
 		const value =
 			parsed && typeof parsed === "object" ? parsed.warpEnabled ?? parsed.warpMode : undefined;
 		return normalizeWarpMode(value);

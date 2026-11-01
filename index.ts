@@ -301,7 +301,9 @@ type BridgeConfig = {
 function readBridgeConfig(): BridgeConfig {
 	if (!existsSync(BRIDGE_CONFIG_PATH)) return {};
 	try {
-		const cfg = JSON.parse(readFileSync(BRIDGE_CONFIG_PATH, "utf-8"));
+		const raw = readFileSync(BRIDGE_CONFIG_PATH, "utf-8");
+		// Windows editors leave a UTF-8 BOM; JSON.parse rejects it.
+		const cfg = JSON.parse(raw.startsWith("﻿") ? raw.slice(1) : raw);
 		return cfg && typeof cfg === "object" ? (cfg as BridgeConfig) : {};
 	} catch {
 		// malformed config falls back to the built-in defaults
