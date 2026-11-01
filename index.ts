@@ -1579,9 +1579,10 @@ export default function (pi: ExtensionAPI) {
 					));
 				if (consent && asset) {
 					ctx.ui.notify(`Downloading warp-minimal ${asset.tag}…`, "info");
-					const installed = await installWarpBinary(asset, {
-						status: (message) => ctx.ui.notify(message, "info"),
-					});
+					const installed = await installWarpBinary(
+						asset,
+						(message) => ctx.ui.notify(message, "info"),
+					);
 					if (installed) {
 						ctx.ui.notify(`warp-minimal installed to ${installed}`, "info");
 						if (!(await ensureWarp())) {
