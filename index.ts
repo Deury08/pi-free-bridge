@@ -1698,42 +1698,58 @@ export default function (pi: ExtensionAPI) {
 				);
 
 				// Menú rápido: cambiar el modo sin tener que escribirlo completo.
-				if (
-					ctx.hasUI &&
-					(await ctx.ui.confirm(
-						"pi-free-bridge",
-						`Modo actual: ${current}.\n\n¿Querés cambiarlo?\n1) on — siempre WARP\n2) auto — directo primero, WARP ante rate limit\n3) off — solo directo`,
-					))
-				) {
-					let chosen: string | undefined;
-					if (current !== "on") {
-						chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "on" (WARP siempre)?`)) ? "on" : undefined;
-					}
-					if (!chosen && current !== "auto") {
-						chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "auto" (directo primero, WARP ante rate limit)?`)) ? "auto" : undefined;
-					}
-					if (!chosen && current !== "off") {
-						chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "off" (solo directo)?`)) ? "off" : undefined;
-					}
-					if (!chosen) {
-						ctx.ui.notify("Sin cambios en el modo WARP.", "info");
-						return;
-					}
+				// Usa ctx.ui.select (opciones seleccionables) cuando Pi lo expone,
+				// igual que /gentle:yolo; si no, cae a confirmaciones encadenadas.
+				const modes = ["on", "auto", "off"] as const;
+				const modeLabel: Record<string, string> = {
+					on: "siempre WARP",
+					auto: "directo primero, WARP ante rate limit",
+					off: "solo directo",
+				};
+				let chosen: string | undefined;
 
-					if (normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE)) {
-						ctx.ui.notify(
-							`PI_FREE_BRIDGE_WARP_MODE is set: it beats the config. Unset it to use ${chosen}.`,
-							"warning",
-						);
-						return;
+				if (ctx.hasUI && typeof ctx.ui.select === "function") {
+					chosen = (await ctx.ui.select(
+						`🚀 Gentle WARP 🔥 — modo actual: ${current}`,
+						modes.map((m) => `${m} — ${modeLabel[m]}`),
+					));
+				} else if (ctx.hasUI) {
+					if (
+						await ctx.ui.confirm(
+							"pi-free-bridge",
+							`Modo actual: ${current}.\n\n¿Querés cambiarlo?\n1) on — siempre WARP\n2) auto — directo primero, WARP ante rate limit\n3) off — solo directo`,
+						)
+					) {
+						if (current !== "on") {
+							chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "on" (WARP siempre)?`)) ? "on" : undefined;
+						}
+						if (!chosen && current !== "auto") {
+							chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "auto" (directo primero, WARP ante rate limit)?`)) ? "auto" : undefined;
+						}
+						if (!chosen && current !== "off") {
+							chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "off" (solo directo)?`)) ? "off" : undefined;
+						}
 					}
-
-					writeBridgeConfig({ warpEnabled: chosen });
-					ctx.ui.notify(
-						`WARP mode set to ${chosen} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
-						"info",
-					);
 				}
+
+				if (!chosen) {
+					ctx.ui.notify("Sin cambios en el modo WARP.", "info");
+					return;
+				}
+
+				if (normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE)) {
+					ctx.ui.notify(
+						`PI_FREE_BRIDGE_WARP_MODE is set: it beats the config. Unset it to use ${chosen}.`,
+						"warning",
+					);
+					return;
+				}
+
+				writeBridgeConfig({ warpEnabled: chosen });
+				ctx.ui.notify(
+					`WARP mode set to ${chosen} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
+					"info",
+				);
 				return;
 			}
 			if (normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE)) {
