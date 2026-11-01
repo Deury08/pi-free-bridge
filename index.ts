@@ -1269,13 +1269,18 @@ async function probeWarp(port: number, attempts: number): Promise<boolean> {
 let warpWarned = false;
 
 /** Best-effort: never throws; returns whether WARP answered /health. */
-async function ensureWarp(): Promise<boolean> {
+export async function ensureWarp(): Promise<boolean> {
 	const ok = await probeWarp(WARP_DEFAULT_PORT, 2);
 	if (ok) return true;
-	// Precedence: explicit env var, then the persisted config entry, then
-	// supervise nothing (warn once; the relay's chain degrades per mode).
+	// Precedence: explicit env var, then the persisted config entry, then the
+	// binary installed by /free-bridge-warp in the plugin folder, then nothing
+	// (warn once; the relay's chain degrades per mode).
+	const installeBin = join(WARP_INSTALL_DIR, "warp-minimal.exe");
+	const installeConfig = join(WARP_INSTALL_DIR, "config.json");
 	const bin =
-		process.env.PI_FREE_BRIDGE_WARP_BIN?.trim() || readBridgeConfig().warpBin?.trim() || "";
+		process.env.PI_FREE_BRIDGE_WARP_BIN?.trim() ||
+		readBridgeConfig().warpBin?.trim() ||
+		(existsSync(installeBin) ? installeBin : "");
 	if (!bin) {
 		if (!warpWarned) {
 			console.error(
@@ -1287,7 +1292,10 @@ async function ensureWarp(): Promise<boolean> {
 		return false;
 	}
 	try {
-		const child = spawn(bin, [], {
+		// warp-minimal needs its config; the install folder always carries the
+		// matching config.json next to the binary.
+		const args = bin === installeBin && existsSync(installeConfig) ? ["-config", installeConfig] : [];
+		const child = spawn(bin, args, {
 			stdio: "ignore",
 			detached: true,
 			windowsHide: true,
