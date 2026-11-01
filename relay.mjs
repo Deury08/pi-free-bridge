@@ -245,6 +245,68 @@ async function readBody(req) {
 	return Buffer.concat(chunks).toString("utf8");
 }
 
+// ---------------------------------------------------------------------------
+// Egress selection (bun-upgrades S5): off | auto | on
+// ---------------------------------------------------------------------------
+//
+//   off   — every request goes direct (unchanged behavior).
+//   auto  — direct first; a rate limit (429) received before the first
+//           downstream byte retries through WARP. When a request only succeeds
+//           through WARP, the relay prefers WARP from then on (with local as
+//           the backoff so a dead WARP cannot brick the bridge).
+//   on    — every request goes through WARP.
+//
+// Failover NEVER happens after the first downstream byte: an SSE stream cannot
+// be replayed, a mid-stream retry corrupts it. `warp-minimal` listens on
+// 127.0.0.1:8789 (upstream env RELAY_WARP_PROXY).
+
+const WARP_PROXY_DEFAULT = "http://127.0.0.1:8789";
+
+/** Allowed modes, exported for validation in the extension config too. */
+export const WARP_MODES = ["off", "auto", "on"];
+
+function normalizeWarpMode(value) {
+	const mode = String(value ?? "").trim().toLowerCase();
+	return WARP_MODES.includes(mode) ? mode : undefined;
+}
+
+/** Pure: the egress order for one request. */
+export function egressOrder(mode, warpPreferred) {
+	if (mode === "on") return ["warp"];
+	if (mode === "auto") return warpPreferred ? ["warp", "local"] : ["local", "warp"];
+	return ["local"];
+}
+
+/** Pure: the next warp preference after one request.
+ *  `used` names the egress that produced the final response, `ok` says whether
+ *  it was not a rate limit. */
+export function updateWarpPreference(mode, used, ok) {
+	if (mode !== "auto") return false;
+	if (!ok) return false;
+	return used === "warp";
+}
+
+// Process-level stickiness for `auto`: once WARP was the only working path,
+// later requests try it first.
+let warpPreferred = false;
+let lastEgress = undefined;
+
+function egressFetch(config, pathname, { body }, egress) {
+	const opts = {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			"user-agent": config.userAgent,
+			authorization: `Bearer ${config.apiKey}`,
+			"x-opencode-session": config.session,
+			"x-opencode-session-id": config.session,
+		},
+		body,
+	};
+	if (egress === "warp") opts.proxy = config.warpProxy;
+	return fetch(toUpstreamUrl(config.upstream, pathname), opts);
+}
+
 async function forward(req, res, pathname, config) {
 	try {
 		const raw = await readBody(req);
@@ -259,54 +321,72 @@ async function forward(req, res, pathname, config) {
 			stream: true,
 		});
 
-		const upstream = await fetch(toUpstreamUrl(config.upstream, pathname), {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"user-agent": config.userAgent,
-				authorization: `Bearer ${config.apiKey}`,
-				"x-opencode-session": config.session,
-				"x-opencode-session-id": config.session,
-			},
-			body: JSON.stringify(body),
-		});
+		// S5: walk the egress chain, failover only while nothing has reached
+		// the client. Whatever response ends the loop is delivered verbatim by
+		// the code below (error body byte-exact included).
+		const order = egressOrder(config.warpMode, warpPreferred);
+		const errors = [];
+		let response = undefined;
+		for (const egress of order) {
+			lastEgress = egress;
+			let candidate;
+			try {
+				candidate = await egressFetch(config, pathname, { body: JSON.stringify(body) }, egress);
+			} catch (err) {
+				errors.push(`${egress}: ${err && err.message ? err.message : String(err)}`);
+				continue;
+			}
+			if (candidate.status === 429) {
+				await candidate.arrayBuffer(); // drain for connection reuse
+				errors.push(`${egress}: 429`);
+				continue;
+			}
+			response = candidate;
+			break;
+		}
+		if (!response) {
+			const message =
+				errors.length > 0
+					? `all egress attempts failed: ${errors.join("; ")}`
+					: "no egress configured";
+			sendJson(res, 502, { error: { message } });
+			return;
+		}
+		warpPreferred = updateWarpPreference(config.warpMode, lastEgress, true);
 
 		// S20: status and content-type pass through, the body is piped unparsed.
 		const headers = {};
-		const contentType = upstream.headers.get("content-type");
+		const contentType = response.headers.get("content-type");
 		if (contentType) headers["content-type"] = contentType;
 
 		// Error diagnostics (bun-upgrades S3): a gate rejection carries the
 		// usable evidence in its JSON body. Snapshot it (bounded) before piping,
 		// and hand the exact same bytes back — never rewrite or terminate them,
 		// so Content-Length and SSE framing stay untouched.
-		if (upstream.status >= 400) {
-			const errorBody = Buffer.from(await upstream.arrayBuffer());
+		if (response.status >= 400) {
+			const errorBody = Buffer.from(await response.arrayBuffer());
 			const snapshot = errorBody.subarray(0, 4096);
 			process.stderr.write(
-				`pi-free-bridge relay: upstream ${upstream.status} ${toUpstreamUrl(config.upstream, pathname)}
+				`pi-free-bridge relay: upstream ${response.status} via ${lastEgress} ${toUpstreamUrl(config.upstream, pathname)}
 ` +
 					`pi-free-bridge relay: session ${config.session} (from ${config.sessionSource})
 ` +
 					`pi-free-bridge relay: upstream body: ${snapshot.toString("utf8")}
-` +
-					(upstream.status === 429
-						? "pi-free-bridge relay: rate limited — check the session id (/free-bridge-session)\n"
-						: ""),
+`,
 			);
-			res.writeHead(upstream.status, headers);
+			res.writeHead(response.status, headers);
 			res.end(errorBody);
 			return;
 		}
 
-		res.writeHead(upstream.status, headers);
+		res.writeHead(response.status, { ...headers, "x-egress-used": lastEgress });
 
-		if (!upstream.body) {
+		if (!response.body) {
 			res.end();
 			return;
 		}
 
-		const reader = upstream.body.getReader();
+		const reader = response.body.getReader();
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
@@ -329,6 +409,9 @@ async function handle(req, res, config) {
 			ok: true,
 			sessionId: config.session,
 			sessionSource: config.sessionSource,
+			warpMode: config.warpMode,
+			warpProxy: config.warpProxy,
+			lastEgress: lastEgress,
 		});
 		return;
 	}
@@ -363,6 +446,8 @@ async function startServer() {
 		cwd: process.env.RELAY_CWD || process.cwd(),
 		userAgent: process.env.RELAY_USER_AGENT || DEFAULT_USER_AGENT,
 		apiKey: process.env.RELAY_API_KEY || "public",
+		warpMode: normalizeWarpMode(process.env.RELAY_WARP_MODE) ?? "off",
+		warpProxy: process.env.RELAY_WARP_PROXY || WARP_PROXY_DEFAULT,
 	};
 
 	const server = createServer((req, res) => {

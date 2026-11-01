@@ -332,3 +332,41 @@ test("resolveRelaySession: without a Pi-supplied id, the relay harvests locally"
 	assert.equal(result.sessionId, "ses_local");
 	assert.equal(result.source, "session-diff");
 });
+
+// ---------------------------------------------------------------------------
+// Egress selection (bun-upgrades S5)
+// ---------------------------------------------------------------------------
+
+import { egressOrder, updateWarpPreference, WARP_MODES } from "../relay.mjs";
+
+test("egressOrder: off is always local-only", () => {
+	assert.deepEqual(egressOrder("off", false), ["local"]);
+	assert.deepEqual(egressOrder("off", true), ["local"]);
+});
+
+test("egressOrder: on is always warp-only", () => {
+	assert.deepEqual(egressOrder("on", false), ["warp"]);
+});
+
+test("egressOrder: auto starts local and elevates after a warp-only success", () => {
+	assert.deepEqual(egressOrder("auto", false), ["local", "warp"]);
+	assert.deepEqual(egressOrder("auto", true), ["warp", "local"]);
+});
+
+test("egressOrder: unknown mode falls back to off", () => {
+	assert.deepEqual(egressOrder("banana", false), ["local"]);
+});
+
+test("updateWarpPreference: auto elevates when warp was the final egress", () => {
+	assert.equal(updateWarpPreference("auto", "warp", true), true);
+	assert.equal(updateWarpPreference("auto", "local", true), false);
+	assert.equal(updateWarpPreference("off", "warp", true), false);
+});
+
+test("updateWarpPreference: a failure never elevates warp", () => {
+	assert.equal(updateWarpPreference("auto", "warp", false), false);
+});
+
+test("WARP_MODES: exactly off, auto, on", () => {
+	assert.deepEqual(WARP_MODES, ["off", "auto", "on"]);
+});

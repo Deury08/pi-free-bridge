@@ -290,6 +290,8 @@ type BridgeConfig = {
 	sessionId?: string;
 	liveIds?: string[];
 	relayPort?: number;
+	/** "off" | "auto" | "on" (bun-upgrades S5); anything else reads as off. */
+	warpEnabled?: string;
 };
 
 function readBridgeConfig(): BridgeConfig {
@@ -405,6 +407,23 @@ function resolveLiveIds(): { liveIds: Set<string>; source: string } {
 	return { liveIds: new Set(SNAPSHOT_LIVE_FREE_IDS), source: "built-in snapshot (2026-10-14)" };
 }
 
+/** WARP egress modes (bun-upgrades S5). */
+const WARP_MODES: readonly string[] = ["off", "auto", "on"];
+
+function normalizeWarpMode(value: unknown): string | undefined {
+	const mode = String(value ?? "").trim().toLowerCase();
+	return WARP_MODES.includes(mode) ? mode : undefined;
+}
+
+/** S5 precedence: env override, persisted config, default off. */
+function resolveWarpMode(): string {
+	return (
+		normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE) ??
+		normalizeWarpMode(readBridgeConfig().warpEnabled) ??
+		"off"
+	);
+}
+
 // ---------------------------------------------------------------------------
 // Relay supervisor
 // ---------------------------------------------------------------------------
@@ -432,6 +451,8 @@ type RelayOptions = {
 	sessionId?: string;
 	sessionSource?: string;
 	upstream: string;
+	/** off | auto | on (bun-upgrades S5); resolved by ensureRelay when absent. */
+	warpMode?: string;
 	cwd: string;
 };
 
@@ -597,6 +618,7 @@ function relayEnv(options: RelayOptions): Record<string, string | undefined> {
 		PORT: String(options.port),
 		RELAY_UPSTREAM: options.upstream,
 		RELAY_CWD: options.cwd,
+		RELAY_WARP_MODE: normalizeWarpMode(options.warpMode) ?? resolveWarpMode(),
 	};
 
 	if (options.sessionId) {
@@ -680,7 +702,17 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 
 /** Ensure a healthy relay for this port + session id, spawning one if needed. */
 async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
-	const key = `${options.port}\u0000${options.sessionId ?? ""}`;
+	const warpMode = normalizeWarpMode(options.warpMode) ?? resolveWarpMode();
+	const key = `${options.port}\u0000${options.sessionId ?? ""}\u0000${warpMode}`;
+
+	// A non-off mode needs the WARP proxy alive; never fatal — auto degrades
+	// to local, `on` surfaces the 502 with its egress diagnostic.
+	if (warpMode !== "off" && !(await ensureWarp())) {
+		console.error(
+			`pi-free-bridge: WARP is not up but mode is ${warpMode} — ` +
+				(warpMode === "on" ? "requests will fail through WARP" : "staying on the local egress"),
+		);
+	}
 
 	if (relayState?.key === key) {
 		// A relay we spawned is trusted; one we only reused may belong to another
@@ -739,6 +771,8 @@ function describeRelay(): string {
 type RelayHealth = {
 	sessionId?: string;
 	sessionSource?: string;
+	warpMode?: string;
+	lastEgress?: string;
 };
 
 /** The relay's `/health` payload, or undefined when it is not answering. */
@@ -753,11 +787,17 @@ async function fetchRelayHealth(port: number): Promise<RelayHealth | undefined> 
 			ok?: unknown;
 			sessionId?: unknown;
 			sessionSource?: unknown;
+			warpMode?: unknown;
+			lastEgress?: unknown;
 		};
 		if (payload?.service !== RELAY_SERVICE || payload.ok !== true) return undefined;
 		return {
 			sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
 			sessionSource: typeof payload.sessionSource === "string" ? payload.sessionSource : undefined,
+			warpMode: normalizeWarpMode(payload.warpMode),
+			lastEgress: typeof payload.lastEgress === "string" && ["local", "warp"].includes(payload.lastEgress)
+				? payload.lastEgress
+				: undefined,
 		};
 	} catch {
 		return undefined;
@@ -1055,6 +1095,71 @@ const gateStreamSimple = (async (
 }) as unknown as ProviderConfig["streamSimple"];
 
 // ---------------------------------------------------------------------------
+// warp-minimal supervisor (bun-upgrades S4)
+// ---------------------------------------------------------------------------
+//
+// warp-minimal is the alternate egress proxy of S5 (127.0.0.1:8789, /health).
+// It ships separately (its own repo, e.g. PI_FREE_BRIDGE_WARP_BIN); when the
+// configured mode needs it and it is not answering, the extension spawns the
+// binary if one is known. Without a path it never spawns anything — it just
+// warns, and the relay's own egress chain degrades exactly per the mode.
+
+const WARP_DEFAULT_PORT = 8789;
+const WARP_START_TIMEOUT_MS = 5000;
+
+function warpHealthUrl(port: number): string {
+	return `http://${RELAY_HOST}:${port}/health`;
+}
+
+async function probeWarp(port: number, attempts: number): Promise<boolean> {
+	for (let i = 0; i < attempts; i++) {
+		try {
+			const res = await fetch(warpHealthUrl(port), { signal: AbortSignal.timeout(750) });
+			if (res.ok) return true;
+		} catch {
+			// not up yet
+		}
+		if (i + 1 < attempts) await new Promise((r) => setTimeout(r, 300));
+	}
+	return false;
+}
+
+let warpWarned = false;
+
+/** Best-effort: never throws; returns whether WARP answered /health. */
+async function ensureWarp(): Promise<boolean> {
+	const ok = await probeWarp(WARP_DEFAULT_PORT, 2);
+	if (ok) return true;
+	const bin = process.env.PI_FREE_BRIDGE_WARP_BIN?.trim();
+	if (!bin) {
+		if (!warpWarned) {
+			console.error(
+				`pi-free-bridge: WARP mode needs warp-minimal on 127.0.0.1:${WARP_DEFAULT_PORT} — ` +
+					"it is not answering. Start it, or set PI_FREE_BRIDGE_WARP_BIN to its binary.",
+			);
+			warpWarned = true;
+		}
+		return false;
+	}
+	try {
+		const child = spawn(bin, [], {
+			stdio: "ignore",
+			detached: true,
+			windowsHide: true,
+		});
+		child.once("error", () => undefined); // surface via probe failure
+		child.unref();
+		return await probeWarp(WARP_DEFAULT_PORT, 6);
+	} catch (err) {
+		if (!warpWarned) {
+			console.error(`pi-free-bridge: could not start warp-minimal — ${(err as Error).message}`);
+			warpWarned = true;
+		}
+		return false;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
@@ -1258,6 +1363,50 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("free-bridge-warp", {
+		description: "Show or set the WARP egress mode: off | auto | on",
+		handler: async (args: string, ctx) => {
+			const next = normalizeWarpMode(args);
+			if (!next) {
+				const envOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
+				const health = await fetchRelayHealth(RELAY_PORT);
+				const onWire = health?.warpMode ? `relay reports ${health.warpMode}${health.lastEgress ? `, last egress ${health.lastEgress}` : ""}` : "relay not running";
+				ctx.ui.notify(
+					[
+						`pi-free-bridge warp: ${resolveWarpMode()} (config)${envOverride ? ` — env override wins: ${envOverride}` : ""}`,
+						onWire,
+						"off: direct only; auto: direct first, WARP on rate limit; on: always WARP.",
+						"Set with /free-bridge-warp off|auto|on.",
+					].join("\n"),
+					"info",
+				);
+				return;
+			}
+			if (normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE)) {
+				ctx.ui.notify(
+					`PI_FREE_BRIDGE_WARP_MODE is set: it beats the config. Unset it to use ${next}.`,
+					"warning",
+				);
+				return;
+			}
+			writeBridgeConfig({ warpEnabled: next });
+
+			// The relay reads the mode at startup, so restart it (the key change
+			// respawns automatically).
+			await stopRelay();
+			let relayNote = "";
+			try {
+				await ensureRelay({ port: RELAY_PORT, upstream: UPSTREAM_URL, cwd: process.cwd() });
+			} catch (err) {
+				relayNote = ` Relay restart failed: ${(err as Error).message}`;
+			}
+			ctx.ui.notify(
+				`WARP mode set to ${next} and saved to ${BRIDGE_CONFIG_PATH}.${relayNote}`,
+				relayNote ? "warning" : "info",
+			);
+		},
+	});
+
 	pi.registerCommand("free-bridge-doctor", {
 		description: "Diagnose and repair why the free OpenCode models are missing from the picker",
 		handler: async (_args: string, ctx) => {
@@ -1275,6 +1424,11 @@ export default function (pi: ExtensionAPI) {
 				`  bun:        ${resolveBunPath() ?? "MISSING"}`,
 				`  relay port: ${RELAY_PORT}`,
 				`  relay:      ${describeRelay()}`,
+				`  warp:       ${
+					health?.warpMode
+						? `${health.warpMode} on the relay${health.lastEgress ? ` (last egress: ${health.lastEgress})` : ""}`
+						: `${resolveWarpMode()} (configured; the relay reports it once it runs)`
+				}`,
 				`  upstream:   ${UPSTREAM_URL}`,
 				`  live ids:   ${live.source}`,
 				`  skipped:    ${discovered.skipped.length ? discovered.skipped.join(", ") : "none"}`,
