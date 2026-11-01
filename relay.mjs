@@ -292,6 +292,38 @@ export function updateWarpPreference(mode, used, ok) {
 	return used === "warp";
 }
 
+// ---------------------------------------------------------------------------
+// S7 (warp-minimal WireGuard migration): network-error fallback for mode "on"
+// ---------------------------------------------------------------------------
+//
+// When warpMode is "on" every request goes through WARP. If WARP fails with a
+// network/socket error (not an HTTP 429/403 quota error) the relay falls back
+// to the local egress so the client does not get a 502. Failover never happens
+// after the first downstream byte: this only applies while the fetch itself
+// rejects (nothing has been delivered to the client yet).
+
+const NETWORK_ERROR_CODES = new Set([
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"ETIMEDOUT",
+	"ENOTFOUND",
+	"EAI_AGAIN",
+	"ECONNABORTED",
+	"ENETUNREACH",
+	"ENETDOWN",
+	"EHOSTUNREACH",
+	"ENOTCONN",
+]);
+
+/** Pure: true when `err` is a network/socket failure (not an HTTP status). */
+export function isNetworkError(err) {
+	if (!err) return false;
+	const code = err && err.code ? String(err.code).toUpperCase() : "";
+	if (NETWORK_ERROR_CODES.has(code)) return true;
+	const msg = String(err && err.message ? err.message : err).toLowerCase();
+	return /network|socket|connection refused|connection reset|timed out|getaddrinfo|failed to fetch|fetch failed|fetch:/.test(msg);
+}
+
 // Process-level stickiness for `auto`: once WARP was the only working path,
 // later requests try it first.
 let warpPreferred = false;
@@ -452,6 +484,22 @@ async function forward(req, res, pathname, config) {
 			try {
 				candidate = await egressFetch(config, pathname, { body: JSON.stringify(body) }, egress);
 			} catch (err) {
+				// S7: modo "on" y WARP falla con error de red (no 429/403 de
+				// quota) → fallback a local para evitar 502. Nada se ha
+				// entregado al cliente aún (fetch rechazó antes del primer byte).
+				if (config.warpMode === "on" && egress === "warp" && isNetworkError(err)) {
+					try {
+						candidate = await egressFetch(config, pathname, {
+							body: JSON.stringify(body),
+						}, "local");
+						lastEgress = "local";
+						response = candidate;
+						break;
+					} catch (err2) {
+						errors.push(`local: ${err2 && err2.message ? err2.message : String(err2)}`);
+						continue;
+					}
+				}
 				errors.push(`${egress}: ${err && err.message ? err.message : String(err)}`);
 				continue;
 			}
