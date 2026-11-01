@@ -18,11 +18,11 @@
 
 ## Tasks
 
-- T1 (S2,S3): hybrid session harvest — extension harvests and passes the id to the relay via env; relay keeps its local harvest as fallback; precedence override > Pi-supplied > relay-local; doctor reports the source.
-- T2 (S3): 429 diagnostics — actionable message on gate rejection (`/free-bridge-session`), no synthetic minting anywhere.
-- T3 (S5): WARP egress modes in relay.mjs — `warpEnabled` config (`off|auto|on`), failover-before-first-byte, local backoff after WARP attempt in `auto`.
-- T4 (S4,S5): warp-minimal supervisor in index.ts (spawn/reuse/health probe, mirroring the relay supervisor) plus the Pi command (`/free-bridge-warp off|auto|on`) that persists the mode, disabled by default.
-- T5: tests + README/docs for the new config and behavior.
+- T1 (S2,S3): DONE — commit `9e8fa9d`. Extension harvest (`node:sqlite` + session_diff) → `RELAY_SESSION_PI`; relay precedence override > pi-harvest > local; source visible in `/health`.
+- T2 (S3): DONE — commit `9e8fa9d`. Bounded stderr snapshot of gate ≥ 400 bodies, byte-exact return, 429 hint.
+- T3 (S5): DONE — commit `5200496`. `egressOrder`/`updateWarpPreference` pure helpers, per-request chain, sticky auto elevation, failover before first byte only, `x-egress-used` header, health fields `warpMode`/`lastEgress`/`warpProxy`.
+- T4 (S4,S5): DONE — commit `5200496`. Mode resolution (env > config > off), `/free-bridge-warp`, doctor line, relay restart on mode change, optional `PI_FREE_BRIDGE_WARP_BIN` supervisor with `/health` probe, never fatal in auto.
+- T5: DONE — 34 unit tests green; README sections (cosecha híbrida, modes WARP, env vars, config `warpEnabled`). E2E verified locally with fake upstream (429 then 200 SSE) + fake proxy under `bun`: auto elevates to warp after a local 429 and `lastEgress` reports `warp`.
 
 ## Log
 
@@ -30,3 +30,4 @@
 - L2 (user, verbatim): "feat/bun-upgrades si esta rama, recuerda que para el warp debemos tener la opcion de auto: primero sin warp y se aparece el rait limit usamos el warp; encendido: todo pasa por el warp; apagado: sin el warp , me entiendes?"
 - L3: Branch `feat/bun-upgrades` created from `master` (it did not exist yet).
 - L4 (user): "para los modosdel warp aparecen en pi" — the WARP modes are selectable from Pi itself: a Pi command persists `warpEnabled` (off/auto/on) in the bridge config; the relay reads it at startup.
+- L5: E2E evidence (fake upstream on :9001 answering 429 once, then 200 SSE; fake absolute-form proxy on :9000; relay under `bun` with `RELAY_WARP_MODE=auto`): first POST fails local with 429 and returns the SSE body produced through the WARP path; repeat POST goes WARP-first; `/health` shows `warpMode:auto` and `lastEgress:warp`. Note for reproduction: the relay exits on stdin EOF (S26), so hold its stdin open when running it by hand.
