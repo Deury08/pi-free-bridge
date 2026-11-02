@@ -809,12 +809,11 @@ async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 	const key = relayKey(options.port, options.sessionId);
 
 	// A non-off mode needs the WARP proxy alive; never fatal — auto degrades
-	// to local, `on` surfaces the 502 with its egress diagnostic.
+	// to local, `on` surfaces the 502 with its egress diagnostic. No console
+	// warning here: the download prompt is presented only when the user enters
+	// the WARP activation menu (/free-bridge-warp) and no binary is present.
 	if (warpMode !== "off" && !(await ensureWarp())) {
-		console.error(
-			`pi-free-bridge: WARP is not up but mode is ${warpMode} — ` +
-				(warpMode === "on" ? "requests will fail through WARP" : "staying on the local egress"),
-		);
+		// intentionally silent — prompt lives in the warp menu
 	}
 
 	if (relayState?.key === key) {
@@ -1269,29 +1268,30 @@ async function probeWarp(port: number, attempts: number): Promise<boolean> {
 let warpWarned = false;
 
 /** Best-effort: never throws; returns whether WARP answered /health. */
+/** Resuelve el binario de warp-minimal con la misma precedencia que usa el
+ *  supervisor: env var, luego config persistida, luego el binario instalado
+ *  por /free-bridge-warp en la carpeta de la extensión. Retorna undefined si
+ *  no hay ninguno conocido. Nunca descarga nada. */
+function resolveWarpBin(): string | undefined {
+	const envBin = process.env.PI_FREE_BRIDGE_WARP_BIN?.trim();
+	if (envBin) return envBin;
+	const cfgBin = readBridgeConfig().warpBin?.trim();
+	if (cfgBin) return cfgBin;
+	const installeBin = join(WARP_INSTALL_DIR, process.platform === "win32" ? "warp-minimal.exe" : "warp-minimal");
+	return existsSync(installeBin) ? installeBin : undefined;
+}
+
 export async function ensureWarp(): Promise<boolean> {
 	const ok = await probeWarp(WARP_DEFAULT_PORT, 2);
 	if (ok) return true;
-	// Precedence: explicit env var, then the persisted config entry, then the
-	// binary installed by /free-bridge-warp in the plugin folder, then nothing
-	// (warn once; the relay's chain degrades per mode).
-	const installeBin = join(WARP_INSTALL_DIR, "warp-minimal.exe");
-	const installeConfig = join(WARP_INSTALL_DIR, "config.json");
-	const bin =
-		process.env.PI_FREE_BRIDGE_WARP_BIN?.trim() ||
-		readBridgeConfig().warpBin?.trim() ||
-		(existsSync(installeBin) ? installeBin : "");
-	if (!bin) {
-		if (!warpWarned) {
-			console.error(
-				`pi-free-bridge: WARP mode needs warp-minimal on 127.0.0.1:${WARP_DEFAULT_PORT} — ` +
-					"it is not answering. Start it, or set PI_FREE_BRIDGE_WARP_BIN to its binary.",
-			);
-			warpWarned = true;
-		}
-		return false;
-	}
+	// Precedencia: env var, config persistida, binario instalado por el menú,
+	// luego nada (sin aviso de consola: el aviso de descarga se presenta solo
+	// al entrar al menú de activar WARP).
+	const bin = resolveWarpBin();
+	if (!bin) return false;
 	try {
+		const installeBin = join(WARP_INSTALL_DIR, process.platform === "win32" ? "warp-minimal.exe" : "warp-minimal");
+		const installeConfig = join(WARP_INSTALL_DIR, "config.json");
 		// warp-minimal needs its config; the install folder always carries the
 		// matching config.json next to the binary.
 		const args = bin === installeBin && existsSync(installeConfig) ? ["-config", installeConfig] : [];
@@ -1696,6 +1696,49 @@ export default function (pi: ExtensionAPI) {
 					].join("\n"),
 					"info",
 				);
+
+				// Si no hay binario de warp-minimal y el modo no es off,
+				// presentar el aviso de descarga únicamente al entrar al menú
+				// de activar WARP (/free-bridge-warp), nunca al iniciar Pi.
+				if (
+					current !== "off" &&
+					!normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE) &&
+					!resolveWarpBin()
+				) {
+					const asset = await findWarpAsset();
+					const sizeMb = asset && asset.size > 0 ? ` (${(asset.size / 1048576).toFixed(1)} MB)` : "";
+					const consent = ctx.hasUI && (await ctx.ui.confirm("pi-free-bridge", asset
+						? `WARP no está activo y no hay binario configurado.\n\nDescargar warp-minimal ${asset.tag}${sizeMb} de github.com/Deury08/warp-minimal, verificar su checksum e instalarlo en ${WARP_INSTALL_DIR}?`
+						: `WARP no está activo y no hay binario configurado.\n\nNo se pudo alcanzar el release ahora.\n\nConfigurá el path manualmente con:\n/free-bridge-warp bin <path>\no sete PI_FREE_BRIDGE_WARP_BIN.`));
+					if (consent && asset) {
+						ctx.ui.notify(`Descargando warp-minimal ${asset.tag}…`, "info");
+						const installed = await installWarpBinary(
+							asset,
+							(message) => ctx.ui.notify(message, "info"),
+						);
+						if (installed) {
+							ctx.ui.notify(`warp-minimal instalado en ${installed}`, "info");
+							if (!(await ensureWarp())) {
+								ctx.ui.notify(
+									`warp-minimal fue instalado pero no respondió /health en 127.0.0.1:${WARP_DEFAULT_PORT}`,
+									"warning",
+								);
+							}
+						} else {
+							ctx.ui.notify(
+								"warp-minimal falló la instalación — ver el log de errores de Pi.\n" +
+									"Aún podés configurar el path manualmente:\n/free-bridge-warp bin <path>",
+								"warning",
+							);
+						}
+					} else if (consent && !asset) {
+						ctx.ui.notify(
+							"No se pudo descargar warp-minimal ahora.\n" +
+								"Configurá el path con /free-bridge-warp bin <path> o sete PI_FREE_BRIDGE_WARP_BIN.",
+							"warning",
+						);
+					}
+				}
 
 				// Menú rápido: cambiar el modo sin tener que escribirlo completo.
 				// Usa ctx.ui.select (opciones seleccionables) cuando Pi lo expone,
