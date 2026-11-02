@@ -218,8 +218,8 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `~/.pi/agent/pi-free-bridge.json` → `sessionId` | Session id persistido |
 | `~/.pi/agent/pi-free-bridge.json` → `warpEnabled` | Modo de egress WARP: `off`, `auto` u `on` (por defecto `off`) |
 | `PI_FREE_BRIDGE_WARP_MODE` | Pisa el modo de egress WARP (también `off`, `auto`, `on`; máxima precedencia). Mientras exista, el relay **no** lee el `warpEnabled` del config — el modo queda fijado (estático por diseño) |
-| `RELAY_WARP_RECYCLE_THRESHOLD` | Relay-only: warp 429s consecutive (default `3`) that trigger a proxy `POST /recycle`. |
-| `RELAY_WARP_RECYCLE_COOLDOWN_MS` | Relay-only: cool-down between recycles (default `300000`). The relay degrades gracefully if the proxy has no `/recycle` endpoint. |
+| `RELAY_WARP_RECYCLE_THRESHOLD` | Relay-only: respuestas 429 observadas en el egress warp que disparan un `POST /recycle` al proxy (default `1`: la IP rota apenas hay un 429 por warp). La cadena local no cuenta ni resetea. |
+| `RELAY_WARP_RECYCLE_COOLDOWN_MS` | Relay-only: cool-down entre recycles (default `300000`). El relay degrada con gracia si el proxy no tiene endpoint `/recycle`. |
 | `PI_FREE_BRIDGE_WARP_PROXY` | URL del proxy WARP (por defecto `http://127.0.0.1:8789`) |
 | `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` (precedencia sobre `warpBin` en config) |
 | `~/.pi/agent/pi-free-bridge.json` → `warpBin` | Ruta al binario; si no hay ninguna y no responde, Pi ofrece descargar e instalar la release oficial (te lo pregunta antes) |

@@ -427,16 +427,19 @@ test("readFileWarpMode: a malformed config file never throws", () => {
 	assert.equal(readFileWarpMode(file), undefined);
 });
 
-test("bumpWarp429Streak: only a warp-egress 429 extends the streak", () => {
+test("bumpWarp429Streak: only warp-egress outcomes move the streak", () => {
 	assert.equal(bumpWarp429Streak(0, 429, "warp"), 1);
 	assert.equal(bumpWarp429Streak(1, 429, "warp"), 2);
 	assert.equal(bumpWarp429Streak(2, 429, "local"), 2);
 	assert.equal(bumpWarp429Streak(3, 429, "local"), 3);
 });
 
-test("bumpWarp429Streak: any success resets it", () => {
+test("bumpWarp429Streak: only a warp-egress success resets it — a local fallback 200 does not erase warp 429s", () => {
 	assert.equal(bumpWarp429Streak(2, 200, "warp"), 0);
-	assert.equal(bumpWarp429Streak(2, 200, "local"), 0);
+	// auto mode: warp 429 -> local fallback delivers 200; the streak must survive
+	assert.equal(bumpWarp429Streak(2, 200, "local"), 2);
+	assert.equal(bumpWarp429Streak(2, 500, "local"), 2);
+	assert.equal(bumpWarp429Streak(2, 502, "warp"), 2);
 });
 
 test("needsWarpRecycle: fires at the threshold, not during cooldown", () => {
