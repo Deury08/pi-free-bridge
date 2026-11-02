@@ -320,8 +320,10 @@ export function isNetworkError(err) {
 	if (!err) return false;
 	const code = err && err.code ? String(err.code).toUpperCase() : "";
 	if (NETWORK_ERROR_CODES.has(code)) return true;
+	const name = err && err.name ? String(err.name) : "";
+	if (name === "AbortError") return true; // fetch timeout / aborted request
 	const msg = String(err && err.message ? err.message : err).toLowerCase();
-	return /network|socket|connection refused|connection reset|timed out|getaddrinfo|failed to fetch|fetch failed|fetch:/.test(msg);
+	return /network|socket|connection refused|connection reset|timed out|aborted|getaddrinfo|failed to fetch|fetch failed|fetch:/.test(msg);
 }
 
 // Process-level stickiness for `auto`: once WARP was the only working path,
