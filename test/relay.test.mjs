@@ -547,3 +547,164 @@ test("fetchRelayHealth: an old relay without warpModeSource reads as undefined",
 		server.close();
 	}
 });
+
+// ---------------------------------------------------------------------------
+// Shared-config WARP target (warp-minimal's own config.json)
+// ---------------------------------------------------------------------------
+// warp-minimal's config file is the single source of truth for the listen
+// address and health path; the extension only READS it. Every fixture below is
+// a throwaway temp directory — the real user config is never touched.
+
+function writeWarpConfig(text) {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-warp-config-"));
+	const file = join(dir, "config.json");
+	writeFileSync(file, text, "utf8");
+	return file;
+}
+
+test("parseListen: accepts every listen shape warp-minimal emits", async () => {
+	const { parseListen } = await withIndex();
+	assert.deepEqual(parseListen("127.0.0.1:8789"), { host: "127.0.0.1", port: 8789 });
+	assert.deepEqual(parseListen(":9000"), { host: "127.0.0.1", port: 9000 });
+	assert.deepEqual(parseListen("9000"), { host: "127.0.0.1", port: 9000 });
+	assert.deepEqual(parseListen("[::1]:9000"), { host: "::1", port: 9000 });
+	assert.deepEqual(parseListen("192.168.1.50:8789"), { host: "192.168.1.50", port: 8789 });
+});
+
+test("parseListen: returns undefined for anything unparseable", async () => {
+	const { parseListen } = await withIndex();
+	for (const value of ["garbage", "host:0", "host:99999", undefined, ""]) {
+		assert.equal(parseListen(value), undefined, `${String(value)} must not parse`);
+	}
+});
+
+test("warpHostUrl: brackets a bare IPv6 literal and leaves IPv4 alone", async () => {
+	const { warpHostUrl } = await withIndex();
+	assert.equal(warpHostUrl("::1"), "[::1]");
+	assert.equal(warpHostUrl("[::1]"), "[::1]");
+	assert.equal(warpHostUrl("127.0.0.1"), "127.0.0.1");
+});
+
+test("isLoopbackHost: only loopback literals count as local", async () => {
+	const { isLoopbackHost } = await withIndex();
+	for (const host of ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.53"]) {
+		assert.equal(isLoopbackHost(host), true, `${host} must be loopback`);
+	}
+	for (const host of ["192.168.1.50", "warp.example.test"]) {
+		assert.equal(isLoopbackHost(host), false, `${host} must not be loopback`);
+	}
+});
+
+test("resolveWarpTarget: a missing config file means the warp-minimal defaults", async () => {
+	const { resolveWarpTarget } = await withIndex();
+	const target = resolveWarpTarget(join(tmpdir(), "pfb-warp-config-absent", "config.json"));
+	assert.equal(target.port, 8789);
+	assert.equal(target.healthPath, "/health");
+	assert.equal(target.source, "default");
+	assert.equal(target.isLoopback, true);
+	assert.equal(target.url, "http://127.0.0.1:8789");
+	assert.equal(target.healthUrl, "http://127.0.0.1:8789/health");
+});
+
+test("resolveWarpTarget: listen and health_path come from the shared config file", async () => {
+	const { resolveWarpTarget } = await withIndex();
+	const file = writeWarpConfig(
+		JSON.stringify({
+			listen: "127.0.0.1:9000",
+			health_path: "/status",
+			pool_size: 7,
+			stack: "ipv4",
+			log_path: "/tmp/warp.log",
+		}),
+	);
+
+	const target = resolveWarpTarget(file);
+
+	assert.equal(target.port, 9000);
+	assert.equal(target.healthPath, "/status");
+	assert.equal(target.healthUrl, "http://127.0.0.1:9000/status");
+	assert.equal(target.source, "config");
+	assert.equal(target.isLoopback, true);
+});
+
+test("resolveWarpTarget: malformed JSON falls back to the defaults and never throws", async () => {
+	const { resolveWarpTarget } = await withIndex();
+	const file = writeWarpConfig("{ not json");
+
+	const target = resolveWarpTarget(file);
+
+	assert.equal(target.source, "default");
+	assert.equal(target.port, 8789);
+	assert.equal(target.healthPath, "/health");
+});
+
+test("resolveWarpTarget: an unusable listen falls back to the defaults and reports no file origin", async () => {
+	const { resolveWarpTarget } = await withIndex();
+	const file = writeWarpConfig(JSON.stringify({ listen: "not-a-listen", health_path: 42 }));
+
+	const target = resolveWarpTarget(file);
+
+	assert.equal(target.port, 8789);
+	assert.equal(target.healthPath, "/health");
+	assert.equal(
+		target.source,
+		"default",
+		"a file that contributes nothing usable must not claim the defaults came from it",
+	);
+	assert.equal(target.isLoopback, true);
+});
+
+test("resolveWarpTarget: a non-loopback listen marks the target remote", async () => {
+	const { resolveWarpTarget } = await withIndex();
+	const file = writeWarpConfig(JSON.stringify({ listen: "192.168.1.50:8789" }));
+
+	const target = resolveWarpTarget(file);
+
+	assert.equal(target.isLoopback, false);
+	assert.equal(target.url, "http://192.168.1.50:8789");
+});
+
+test("relayEnv: RELAY_WARP_PROXY is dropped when no target is resolved", async () => {
+	const mod = await withIndex();
+	process.env.RELAY_WARP_PROXY = "http://127.0.0.1:9999";
+	try {
+		const env = mod.relayEnv({ port: 8788, upstream: "https://example.test", cwd: "." });
+		assert.equal(env.RELAY_WARP_PROXY, undefined, "a stale value must never be inherited");
+	} finally {
+		delete process.env.RELAY_WARP_PROXY;
+	}
+});
+
+test("relayEnv: RELAY_WARP_PROXY carries the resolved target", async () => {
+	const mod = await withIndex();
+	const env = mod.relayEnv({
+		port: 8788,
+		upstream: "https://example.test",
+		cwd: ".",
+		warpProxy: "http://127.0.0.1:9000",
+	});
+	assert.equal(env.RELAY_WARP_PROXY, "http://127.0.0.1:9000");
+});
+
+// PRESERVE: the proxy wiring sits next to the existing relay-env contract and
+// must not disturb it — the config path and the warp-mode override still reach
+// the relay, and a stale proxy value is replaced, never inherited.
+test("relayEnv: a resolved proxy leaves the existing relay env contract intact", async () => {
+	const mod = await withIndex();
+	process.env.PI_FREE_BRIDGE_WARP_MODE = "auto";
+	process.env.RELAY_WARP_PROXY = "http://127.0.0.1:9999";
+	try {
+		const env = mod.relayEnv({
+			port: 8788,
+			upstream: "https://example.test",
+			cwd: ".",
+			warpProxy: "http://127.0.0.1:9000",
+		});
+		assert.equal(env.RELAY_CONFIG_PATH, mod.BRIDGE_CONFIG_PATH);
+		assert.equal(env.RELAY_WARP_MODE, "auto");
+		assert.equal(env.RELAY_WARP_PROXY, "http://127.0.0.1:9000", "the resolved target wins over a stale env value");
+	} finally {
+		delete process.env.PI_FREE_BRIDGE_WARP_MODE;
+		delete process.env.RELAY_WARP_PROXY;
+	}
+});

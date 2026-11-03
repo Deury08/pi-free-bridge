@@ -459,6 +459,8 @@ type RelayOptions = {
 	upstream: string;
 	/** off | auto | on (bun-upgrades S5); resolved by ensureRelay when absent. */
 	warpMode?: string;
+	/** Absolute http://host:port of the WARP proxy the relay must use. */
+	warpProxy?: string;
 	cwd: string;
 };
 
@@ -474,6 +476,8 @@ type RelayState = RelayResult & {
 
 let relayState: RelayState | undefined;
 let relayPending: { key: string; promise: Promise<RelayResult> } | undefined;
+/** Proxy URL the relay we spawned was born with (undefined when none). */
+let relayWarpProxy: string | undefined;
 
 function parsePort(value: unknown): number | undefined {
 	const port = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
@@ -630,6 +634,13 @@ export function relayEnv(options: RelayOptions): Record<string, string | undefin
 		RELAY_CONFIG_PATH: BRIDGE_CONFIG_PATH,
 	};
 
+	// The relay must never inherit a stale proxy URL from process.env: clear it
+	// first, then set only the target this process actually resolved.
+	delete env.RELAY_WARP_PROXY;
+	if (typeof options.warpProxy === "string" && options.warpProxy.length > 0) {
+		env.RELAY_WARP_PROXY = options.warpProxy;
+	}
+
 	const envWarpOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
 	delete env.RELAY_WARP_MODE;
 	if (envWarpOverride) env.RELAY_WARP_MODE = envWarpOverride;
@@ -709,6 +720,10 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 	child.once("exit", () => {
 		if (relayState?.child === child) relayState = undefined;
 	});
+
+	// Record the proxy URL this relay was born with, so ensureRelay can restart
+	// it when the shared WARP config moves the target.
+	relayWarpProxy = options.warpProxy;
 
 	return { key, url, mode: "spawned", child };
 }
@@ -805,6 +820,7 @@ export function relayKey(port: number, sessionId?: string): string {
 }
 
 async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
+	const target = resolveWarpTarget();
 	const warpMode = normalizeWarpMode(options.warpMode) ?? resolveWarpMode();
 	const key = relayKey(options.port, options.sessionId);
 
@@ -814,6 +830,14 @@ async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 	// the WARP activation menu (/free-bridge-warp) and no binary is present.
 	if (warpMode !== "off" && !(await ensureWarp())) {
 		// intentionally silent — prompt lives in the warp menu
+	}
+
+	// A relay we spawned keeps the proxy URL it was born with, so a config
+	// change that moves the WARP target must restart it. A REUSED relay
+	// (spawned by another Pi) keeps its own proxy URL: we cannot read it back
+	// from /health. relayKey stays port + session id, so the URL never churns it.
+	if (relayState?.mode === "spawned" && relayWarpProxy !== target.url) {
+		await stopRelay();
 	}
 
 	if (relayState?.key === key) {
@@ -855,7 +879,7 @@ async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 	// mode !== "off" already warned about WARP above; the spawn must still go
 	// through so the relay's own chain reports the truth on the wire.
 
-	const promise = startRelay(options, key)
+	const promise = startRelay({ ...options, warpProxy: target.url }, key)
 		.then((state) => {
 			relayState = state;
 			return { url: state.url, mode: state.mode };
@@ -874,6 +898,7 @@ async function stopRelay(): Promise<void> {
 	const state = relayState;
 	relayState = undefined;
 	relayPending = undefined;
+	relayWarpProxy = undefined;
 
 	const child = state?.child;
 	if (!child || child.exitCode !== null || child.killed) return;
@@ -1239,23 +1264,147 @@ const gateStreamSimple = (async (
 // warp-minimal supervisor (bun-upgrades S4)
 // ---------------------------------------------------------------------------
 //
-// warp-minimal is the alternate egress proxy of S5 (127.0.0.1:8789, /health).
+// warp-minimal is the alternate egress proxy of S5. Its OWN config file
+// (`<install dir>/config.json`) is the SHARED source of truth: warp-minimal
+// obeys it and this extension reads the same values — `listen` and
+// `health_path` — so both always agree on the endpoint. The file is read-only
+// here: nothing is ever created or rewritten, a missing key falls back to the
+// default, and an absent file means every value is the default.
+//
+// The target may be a REMOTE host (warp-minimal in another PC or container).
+// Only a loopback target is ever spawned locally; a remote one is reported,
+// never started.
+//
 // It ships separately (its own repo, e.g. PI_FREE_BRIDGE_WARP_BIN); when the
 // configured mode needs it and it is not answering, the extension spawns the
 // binary if one is known. Without a path it never spawns anything — it just
 // warns, and the relay's own egress chain degrades exactly per the mode.
 
-const WARP_DEFAULT_PORT = 8789;
+export const WARP_DEFAULT_PORT = 8789;
+const WARP_DEFAULT_HEALTH_PATH = "/health";
 const WARP_START_TIMEOUT_MS = 5000;
+const WARP_LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
-function warpHealthUrl(port: number): string {
-	return `http://${RELAY_HOST}:${port}/health`;
+/** Resolved WARP endpoint plus where each value came from. */
+export type WarpTarget = {
+	host: string;
+	port: number;
+	healthPath: string;
+	/** http://host:port — the relay's proxy URL. */
+	url: string;
+	/** http://host:port<healthPath> — what the probe hits. */
+	healthUrl: string;
+	/** Only a loopback target may be spawned locally. */
+	isLoopback: boolean;
+	source: "default" | "config";
+};
+
+/** Parse a warp-minimal `listen` value. Accepts "host:port", ":port", "port",
+ *  "[::1]:port". Returns undefined for anything unparseable so the caller can
+ *  fall back to the defaults. Never throws. */
+export function parseListen(value: unknown): { host: string; port: number } | undefined {
+	if (typeof value !== "string") return undefined;
+	const text = value.trim();
+	if (!text) return undefined;
+
+	// Bare port: "8789"
+	if (/^\d+$/.test(text)) {
+		const port = Number.parseInt(text, 10);
+		return Number.isInteger(port) && port > 0 && port < 65536 ? { host: "127.0.0.1", port } : undefined;
+	}
+
+	// Bracketed IPv6: "[::1]:8789"
+	const bracketed = text.match(/^\[([^\]]+)\]:(\d+)$/);
+	if (bracketed) {
+		const port = Number.parseInt(bracketed[2]!, 10);
+		return Number.isInteger(port) && port > 0 && port < 65536
+			? { host: bracketed[1]!, port }
+			: undefined;
+	}
+
+	// "host:port" and ":port"
+	const lastColon = text.lastIndexOf(":");
+	if (lastColon === -1) return undefined;
+	const host = text.slice(0, lastColon).trim();
+	const port = Number.parseInt(text.slice(lastColon + 1).trim(), 10);
+	if (!Number.isInteger(port) || port <= 0 || port >= 65536) return undefined;
+	return { host: host || "127.0.0.1", port };
 }
 
-async function probeWarp(port: number, attempts: number): Promise<boolean> {
+/** Bracketed when the host is a bare IPv6 literal. */
+export function warpHostUrl(host: string): string {
+	const bare = host.replace(/^\[|\]$/g, "");
+	return bare.includes(":") ? `[${bare}]` : bare;
+}
+
+export function isLoopbackHost(host: string): boolean {
+	const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+	return WARP_LOOPBACK_HOSTS.has(bare) || bare.startsWith("127.");
+}
+
+/** Build the target from already-parsed parts; shared by both paths. */
+function buildWarpTarget(host: string, port: number, healthPath: string, source: "default" | "config"): WarpTarget {
+	const authority = `${warpHostUrl(host)}:${port}`;
+	return {
+		host,
+		port,
+		healthPath,
+		url: `http://${authority}`,
+		healthUrl: `http://${authority}${healthPath}`,
+		isLoopback: isLoopbackHost(host),
+		source,
+	};
+}
+
+/** warp-minimal's own config file, in its canonical install directory. */
+function warpConfigPath(): string {
+	return join(WARP_INSTALL_DIR, "config.json");
+}
+
+/** Resolve the target from warp-minimal's shared config file. The file is
+ *  read-only for us: absent, unreadable or malformed all mean "defaults".
+ *  Never throws, never writes. */
+export function resolveWarpTarget(configPath: string = warpConfigPath()): WarpTarget {
+	const fallback = () => buildWarpTarget("127.0.0.1", WARP_DEFAULT_PORT, WARP_DEFAULT_HEALTH_PATH, "default");
+	if (!existsSync(configPath)) return fallback();
+
+	let raw: Record<string, unknown>;
+	try {
+		const text = readFileSync(configPath, "utf-8");
+		const parsed = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return fallback();
+		raw = parsed as Record<string, unknown>;
+	} catch (err) {
+		if (!warpConfigWarned) {
+			console.error(`pi-free-bridge: ignoring ${configPath} — ${(err as Error).message}`);
+			warpConfigWarned = true;
+		}
+		return fallback();
+	}
+
+	const listen = parseListen(raw.listen);
+	const host = listen?.host ?? "127.0.0.1";
+	const port = listen?.port ?? WARP_DEFAULT_PORT;
+	const rawHealth = typeof raw.health_path === "string" ? raw.health_path.trim() : "";
+	const healthPath = rawHealth.startsWith("/") ? rawHealth : WARP_DEFAULT_HEALTH_PATH;
+	// Report "config" only when a value actually came from the file. A file that
+	// exists but contributes nothing usable (typo, wrong types) must not claim
+	// the defaults were read from it — that is exactly the confusing case.
+	const usedFile = listen !== undefined || rawHealth.startsWith("/");
+	return buildWarpTarget(host, port, healthPath, usedFile ? "config" : "default");
+}
+
+/** One line naming the effective endpoint and where it came from. */
+function describeWarpTarget(target: WarpTarget): string {
+	const origin = target.source === "config" ? `from ${warpConfigPath()}` : "defaults";
+	return `${target.url} (${origin}) — ${target.isLoopback ? "loopback" : "remote"}`;
+}
+
+/** Probe a WARP health endpoint. Never throws. */
+async function probeWarp(healthUrl: string, attempts: number): Promise<boolean> {
 	for (let i = 0; i < attempts; i++) {
 		try {
-			const res = await fetch(warpHealthUrl(port), { signal: AbortSignal.timeout(750) });
+			const res = await fetch(healthUrl, { signal: AbortSignal.timeout(750) });
 			if (res.ok) return true;
 		} catch {
 			// not up yet
@@ -1266,6 +1415,7 @@ async function probeWarp(port: number, attempts: number): Promise<boolean> {
 }
 
 let warpWarned = false;
+let warpConfigWarned = false;
 
 /** OS-adapted canonical install path used by the WARP menu. */
 function warpInstallPath(): string {
@@ -1288,23 +1438,30 @@ function resolveWarpBin(): string | undefined {
 	return undefined;
 }
 
-/** Best-effort: never throws; returns whether WARP answered /health. */
+/** Best-effort: never throws; returns whether WARP answered its health endpoint.
+ *
+ *  Startup rule: probe first. Only when a LOOPBACK target does not answer is a
+ *  local binary launched — a remote target is never spawned, only reported. */
 export async function ensureWarp(): Promise<boolean> {
-	// (a) Probe /health — if WARP answers, we are done.
-	const ok = await probeWarp(WARP_DEFAULT_PORT, 2);
-	if (ok) return true;
+	const target = resolveWarpTarget();
 
-	// (b) No health response: try to find a binary. If none exists, stay
-	//     completely silent (startup must not warn or download).
+	// (a) Probe the resolved health endpoint — if WARP answers, we are done.
+	if (await probeWarp(target.healthUrl, 2)) return true;
+
+	// (b) The target lives on another machine: nothing can be started from here,
+	//     so report the miss silently and let the relay degrade per its mode.
+	if (!target.isLoopback) return false;
+
+	// (c) No health response from a local target: try to find a binary. If none
+	//     exists, stay completely silent (startup must not warn or download).
 	const bin = resolveWarpBin();
 	if (!bin) return false;
 
-	// (c) Spawn the binary. Only pass -config when the binary is the
-	//     canonical install path and config.json sits next to it.
+	// (d) Spawn the binary, handing it the shared config file when it exists so
+	//     both sides read the same listen address and health path.
 	try {
-		const installPath = warpInstallPath();
-		const installConfig = join(WARP_INSTALL_DIR, "config.json");
-		const args = bin === installPath && existsSync(installConfig) ? ["-config", installConfig] : [];
+		const installConfig = warpConfigPath();
+		const args = existsSync(installConfig) ? ["-config", installConfig] : [];
 		const child = spawn(bin, args, {
 			stdio: "ignore",
 			detached: true,
@@ -1313,10 +1470,10 @@ export async function ensureWarp(): Promise<boolean> {
 		child.once("error", () => undefined); // surface via probe failure
 		child.unref();
 
-		// (d) Probe again up to 6 attempts.
-		return await probeWarp(WARP_DEFAULT_PORT, 6);
+		// (e) Probe again up to 6 attempts.
+		return await probeWarp(target.healthUrl, 6);
 	} catch (err) {
-		// (e) Log once via warpWarned.
+		// (f) Log once via warpWarned.
 		if (!warpWarned) {
 			console.error(`pi-free-bridge: could not start warp-minimal — ${(err as Error).message}`);
 			warpWarned = true;
@@ -1487,15 +1644,27 @@ type WarpPromptContext = {
 };
 
 /** Bring WARP up, offering the guided download only when no binary exists.
- *  Returns whether WARP ended up answering /health. Never downloads without an
- *  explicit yes from ctx.ui.confirm. */
+ *  Returns whether WARP ended up answering its health endpoint. Never downloads
+ *  without an explicit yes from ctx.ui.confirm. */
 async function ensureWarpWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
 	if (await ensureWarp()) return true;
+
+	const target = resolveWarpTarget();
+
+	// A remote target runs on another host: installing a binary here could never
+	// bring it up, so report the miss and stop.
+	if (!target.isLoopback) {
+		ctx.ui.notify(
+			`warp-minimal at ${target.healthUrl} is not answering. It runs on another host, so nothing is started here.`,
+			"warning",
+		);
+		return false;
+	}
 
 	const bin = resolveWarpBin();
 	if (bin) {
 		ctx.ui.notify(
-			`warp-minimal is present at ${bin} but did not answer /health on 127.0.0.1:${WARP_DEFAULT_PORT}.`,
+			`warp-minimal is present at ${bin} but did not answer ${target.healthUrl}.`,
 			"warning",
 		);
 		return false;
@@ -1541,17 +1710,17 @@ async function ensureWarpWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
 	// restart. ensureWarp probes /health, then spawns the binary; the extra probe
 	// gives a first run on a fresh machine time to bring the tunnel up.
 	ctx.ui.notify("Starting warp-minimal…", "info");
-	const up = (await ensureWarp()) || (await probeWarp(WARP_DEFAULT_PORT, 20));
+	const up = (await ensureWarp()) || (await probeWarp(target.healthUrl, 20));
 	if (!up) {
 		ctx.ui.notify(
-			`warp-minimal was installed but did not answer /health on 127.0.0.1:${WARP_DEFAULT_PORT}.\n` +
+			`warp-minimal was installed but did not answer ${target.healthUrl}.\n` +
 				`Check that the binary runs on this system, then retry with /free-bridge-warp.`,
 			"warning",
 		);
 		return false;
 	}
 	ctx.ui.notify(
-		`WARP is up on 127.0.0.1:${WARP_DEFAULT_PORT}. Choose mode on or auto to route through it.`,
+		`WARP is up on ${target.url}. Choose mode on or auto to route through it.`,
 		"info",
 	);
 	return true;
@@ -1782,10 +1951,13 @@ export default function (pi: ExtensionAPI) {
 				const health = await fetchRelayHealth(RELAY_PORT);
 				const onWire = health?.warpMode ? `relay reports ${health.warpMode}${health.lastEgress ? `, last egress ${health.lastEgress}` : ""}` : "relay not running";
 				const current = resolveWarpMode();
+				const warpTarget = resolveWarpTarget();
 				ctx.ui.notify(
 					[
 						`pi-free-bridge warp: ${current} (config)${envOverride ? ` — env override wins: ${envOverride}` : ""}`,
 						onWire,
+						`target: ${describeWarpTarget(warpTarget)}`,
+						`health: ${warpTarget.healthUrl}`,
 						"off: direct only; auto: direct first, WARP on rate limit; on: always WARP.",
 					].join("\n"),
 					"info",
@@ -1869,7 +2041,7 @@ export default function (pi: ExtensionAPI) {
 					// `on` is WARP-only; switching without a working WARP would
 					// fail every request until WARP comes up.
 					ctx.ui.notify(
-						`Not switching to on: WARP is not up. Set it again when warp-minimal answers on 127.0.0.1:${WARP_DEFAULT_PORT}.`,
+						`Not switching to on: WARP is not up. Set it again when warp-minimal answers on ${resolveWarpTarget().healthUrl}.`,
 						"warning",
 					);
 					return;
@@ -1893,6 +2065,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args: string, ctx) => {
 			// S34: the effective id lives on the wire, so read it from the relay.
 			const health = await fetchRelayHealth(RELAY_PORT);
+			const warpTarget = resolveWarpTarget();
 			const lines = [
 				"pi-free-bridge doctor",
 				`  provider:   ${PROVIDER}`,
@@ -1910,6 +2083,8 @@ export default function (pi: ExtensionAPI) {
 						? `${health.warpMode} on the relay${health.lastEgress ? ` (last egress: ${health.lastEgress})` : ""}`
 						: `${resolveWarpMode()} (configured; the relay reports it once it runs)`
 				}`,
+				`  warp target: ${describeWarpTarget(warpTarget)}`,
+				`  warp health: ${warpTarget.healthUrl}`,
 				`  upstream:   ${UPSTREAM_URL}`,
 				`  live ids:   ${live.source}`,
 				`  skipped:    ${discovered.skipped.length ? discovered.skipped.join(", ") : "none"}`,

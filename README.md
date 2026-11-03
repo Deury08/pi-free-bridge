@@ -145,6 +145,33 @@ la última release de `github.com/Deury08/warp-minimal`, verifica su sha256 cont
 consentimiento explícito, y si el download falla el modo queda configurado con un
 warning (`auto` sigue funcionando directo).
 
+### Config compartida con `warp-minimal`
+
+El archivo `~/.pi/agent/pi-free-bridge/warp/config.json` es **del binario**:
+`warp-minimal` lo obedece, y la extensión lee **el mismo archivo** para las claves
+que ambos tienen que acordar. **No se crea ni se reescribe nunca**: si no existe,
+todo va a los defaults compilados (`127.0.0.1:8789`, `/health`). Lo escribís a
+mano (o el plugin, si algún día lo necesita) solo para una configuración especial.
+
+Merge **por clave**, no todo-o-nada: lo que está en el archivo manda, lo que
+falta cae al default.
+
+| Clave | Quién la lee | Default |
+|---|---|---|
+| `listen` | ambos (`host:puerto`, también `:puerto`, `puerto` o `[::1]:puerto`) | `127.0.0.1:8789` |
+| `health_path` | ambos | `/health` |
+| `pool_size`, `stack`, `log_path` | solo `warp-minimal` | — |
+
+**Destino remoto:** si `listen` apunta fuera de loopback (otra PC o contenedor),
+es válido. En ese caso la extensión **solo verifica**: nunca intenta lanzar un
+binario que vive en otra máquina. Con destino loopback sí lo lanza cuando no
+responde.
+
+Un valor ilegible (typo, tipo equivocado) cae al default y `/free-bridge-doctor`
+lo reporta como `defaults`, no como si hubiera salido del archivo. Si movés el
+`listen`, el relay arranca con la nueva URL y se reinicia solo cuando la URL
+resuelta cambia respecto de la que tenía al nacer.
+
 ## Qué registra
 
 Nueve modelos, descubiertos desde el registry de OpenCode
@@ -193,7 +220,7 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `/free-bridge-session` | Muestra el session id que el relay está mandando y su origen (`env`, `config`, `opencode.db` o `session-diff`) | Si los requests empiezan a fallar — mirá el id antes de tocar código |
 | `/free-bridge-session ses_…` | Cambia el session id de esta sesión **y lo persiste** en `~/.pi/agent/pi-free-bridge.json` | El gate responde `403` porque el id quedó viejo |
 | `/free-bridge-refresh` | Pide `GET /inference/v1/models`, lo cruza con los gratis del registry, persiste el resultado y re-registra el provider | OpenCode agregó o sacó un modelo gratis |
-| `/free-bridge-warp` | Muestra el modo de salida WARP (`off` por defecto) y el último egress usado | Diagnóstico de red o grandes rate limits |
+| `/free-bridge-warp` | Muestra el modo de salida WARP (`off` por defecto), el endpoint efectivo y el último egress usado | Diagnóstico de red o grandes rate limits |
 | `/free-bridge-warp off\|auto\|on` | Cambia y persiste el modo: `off` directo; `auto` directo primero, WARP ante rate limit; `on` siempre WARP. **Hot reload:** sin reiniciar el relay — aplica en el próximo request | Requiere `warp-minimal` en `127.0.0.1:8789` para modos no-`off`. Si no está y no hay ruta configurada, Pi **te pregunta** y ofrece descargar e instalar la release oficial (checksum verificado) |
 | `/free-bridge-warp bin <ruta>` | Configura la ruta del binario `warp-minimal` (queda en `warpBin` de la config) | Cuando ya lo tenés compilado o descargado y preferís apuntarlo a mano |
 
