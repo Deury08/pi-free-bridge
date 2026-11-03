@@ -1536,13 +1536,24 @@ async function ensureWarpWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
 		return false;
 	}
 	ctx.ui.notify(`warp-minimal installed to ${installed}`, "info");
-	if (!(await ensureWarp())) {
+
+	// Start it right away so the current Pi session can use the proxy without a
+	// restart. ensureWarp probes /health, then spawns the binary; the extra probe
+	// gives a first run on a fresh machine time to bring the tunnel up.
+	ctx.ui.notify("Starting warp-minimal…", "info");
+	const up = (await ensureWarp()) || (await probeWarp(WARP_DEFAULT_PORT, 20));
+	if (!up) {
 		ctx.ui.notify(
-			`warp-minimal was installed but did not answer /health on 127.0.0.1:${WARP_DEFAULT_PORT}`,
+			`warp-minimal was installed but did not answer /health on 127.0.0.1:${WARP_DEFAULT_PORT}.\n` +
+				`Check that the binary runs on this system, then retry with /free-bridge-warp.`,
 			"warning",
 		);
 		return false;
 	}
+	ctx.ui.notify(
+		`WARP is up on 127.0.0.1:${WARP_DEFAULT_PORT}. Choose mode on or auto to route through it.`,
+		"info",
+	);
 	return true;
 }
 
