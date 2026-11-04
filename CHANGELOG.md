@@ -6,6 +6,20 @@
 
 ## Unreleased
 
+- **Resend once after a confirmed WARP exit rotation**: a response that would
+  deliver a gate `429` now rotates the WARP exit and, only once that rotation is
+  confirmed (`recycling` was observed during the poll, or `exits[]` changed
+  against the pre-`POST` snapshot — `recycling: false` alone is not proof),
+  resends the request exactly once through WARP. Only a non-error resend
+  (`status < 400`) is delivered: any refused resend (`429`, `5xx`, other `4xx`
+  such as `400`/`401`/`403`) logs its real status and delivers the original
+  `429` byte-exact, as do an unconfirmed rotation and a timeout, and only ever
+  before the first downstream byte. `off` is untouched (`sawWarp429`
+  can never be true there), `/health` gains `warpResends` and
+  `warpResendEnabled`, and `RELAY_WARP_RETRY_AFTER_RECYCLE=0` is the kill switch.
+  The health path is warp-minimal's own, passed as `RELAY_WARP_HEALTH_PATH` from
+  the shared config instead of being hardcoded.
+
 - **`RELAY_WARP_RECYCLE_THRESHOLD` removed**: the recycle meter has exactly one
   correct value — rotate on the first warp-egress 429 — so the knob was dead
   configuration. The relay now rotates on the first observed warp 429; only

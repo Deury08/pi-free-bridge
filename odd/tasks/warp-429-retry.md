@@ -27,9 +27,12 @@ ni de los caminos `auto` que hoy funcionan.
 - S5 El relay debe reenviar el request **una sola vez** cuando la respuesta que
   iba a entregar es un 429 y la rotación de la IP de egress warp quedó
   confirmada. Reenvío único; nunca loop.
-- S6 La rotación se confirma cuando `GET <warpProxy><health_path>` deja de
-  reportar `recycling: true` **y** el nombre del exit en `exits[]` cambió
-  respecto del observado antes del request. `recycling: false` solo no alcanza.
+- S6 La rotación se confirma con `GET <warpProxy><RELAY_WARP_HEALTH_PATH>`
+  cuando deja de reportar `recycling: true` **y** hay evidencia positiva de que
+  el recycle corrió: se observó `recycling: true` al menos una vez durante el
+  poll, o la lista de `exits[]` cambió contra el snapshot tomado antes del
+  `POST /recycle`. `recycling: false` solo no alcanza. El nombre del exit no
+  sirve como señal (ver L26).
 - S7 Si la rotación no se confirma dentro del timeout (10s), o el reenvío vuelve
   a dar 429, se entrega el 429 original byte-exact. Nunca se entrega un error
   sintético nuevo ni se oculta el 429 real.
@@ -71,7 +74,7 @@ ni de los caminos `auto` que hoy funcionan.
   con guarda de in-flight, y un cliente que se va a mitad del stream cancela el
   reader en vez de drenarlo. RED observado en ambos contratos, suite 65/65.
   S14 se movió a T2: es plomería que solo usa el poll de readiness.
-- T2 (S5,S6,S7,S8,S10,S18): retry tras rotación confirmada — poll de `/health`, reenvío único, fallback al 429 original, disparador ancho, kill switch. Route: parent inline, test-first. Commit: `feat(relay): resend once after a confirmed warp exit rotation`.
+- T2 (S5,S6,S7,S8,S10,S14,S18) DONE: retry tras rotación confirmada — poll de health, reenvío único, fallback al 429 original, disparador ancho, kill switch. Route: gentle-ai-worker + gentle-ai-verify (concurrencia). Commit: `feat(relay): resend once after a confirmed warp exit rotation`. Test-first: rojo observado (el import de los helpers nuevos no existía) y verde 78/78 en `test/relay.test.mjs` (65 existentes + 13 nuevos). Archivos: `relay.mjs`, `index.ts`, `test/relay.test.mjs`, `README.md`, `CHANGELOG.md`.
 - T3 (S15): forward del header `retry-after` al cliente. Route: parent inline. Commit: `fix(relay): forward retry-after on upstream errors`.
 - T4 (S16,S17): parking de la IP local leyendo `retry-after` + margen 10s, estado en memoria. Route: parent inline, test-first. Commit: `feat(relay): park a rate-limited local egress until its reset`.
 - T5 (S2,S3) DONE 2026-11-04: la perilla `RELAY_WARP_RECYCLE_THRESHOLD` se eliminó (config muerta: un solo valor correcto), `needsWarpRecycle(streak, onCooldown)` rota en el primer warp 429, y README/CHANGELOG/`warp-auto-recycle.md` S4 se alinearon. Test-first: rojo observado con la firma nueva, verde 65/65 en `test/relay.test.mjs`. Commit `02ca375` (código) + el commit de documentación.
@@ -138,3 +141,25 @@ ni de los caminos `auto` que hoy funcionan.
   saber dónde escribirlo ni qué esperar después. Las capturas son de una
   instalación real; el orden de los archivos no era el orden del recorrido
   (`Activando` va antes que `Instalando`).
+- L26 Evidencia (fuente primaria: `~/.pi/agent/pi-free-bridge/warp/warp-minimal.log`
+  y el binario). El nombre del exit **no** es observable: `/health` publica
+  `"exits":["warp-18e (in_use, streams=1)"]`, un label de 8 caracteres
+  (`warp-18e`) idéntico para todos los exits, mientras el log nombra los reales
+  (`warp-18e4af9b4c1ce26c`, `warp-18e4afddebe59310`, `warp-18e4afe2edeaed54`,
+  `warp-18e4afeb81071da8`). El formato interno es `%s (%s, streams=%d)`
+  (nombre, estado, streams). Por eso S6 se reescribió: la señal usable es la
+  ventana de `recycling`, no el nombre. Ciclo real medido en el log:
+  `recycle requested: started=true` → enroll → `WARP exit replaced: viejo ->
+  nuevo (healthy=1 cooling=0)` → `WARP pool recycle complete: fresh egress
+  addresses enrolled`, en ~4s. Un poll de 250ms con timeout de 10s lo ve.
+- L27 Incidente y regla derivada: probar rutas desconocidas en el proxy
+  (`/status`, `/pool`, `/exits`) las reenvía al upstream y **mata el exit**
+  (`dial :80` → `healthy:1` pasa a `cooling_down:1`), porque el relay del
+  usuario está ruteado por ahí en modo `on`. Nunca se sondean rutas del proxy
+  que no estén documentadas, y no se llama `/recycle` con tráfico vivo encima.
+- L28 (verbatim): "porque no delegas nada?"
+- L29 Decisión derivada de L28: T2 pasa de "parent inline" a writer delegado
+  (`gentle-ai-worker`) por el backstop de contexto, y su verificación a
+  `gentle-ai-verify` porque el cambio toca estado mutable compartido entre
+  handlers concurrentes (item 4). T3 y T4 siguen inline por tamaño y
+  dependencia, no por preferencia.

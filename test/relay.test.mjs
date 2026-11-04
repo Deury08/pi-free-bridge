@@ -472,6 +472,398 @@ test("readFileWarpMode: a missing config file never throws", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Resend after a confirmed warp rotation (S5, S6, S7, S10, S18)
+// ---------------------------------------------------------------------------
+// The relay only spends its one resend once the proxy has proven that a fresh
+// exit was enrolled. These helpers are that whole decision, kept pure so the
+// `recycling: false` false-positive cannot come back.
+
+import {
+	isRotationConfirmed,
+	resetWarpStateForTests,
+	resendAfterRotation,
+	rotateWarpExit,
+	setWarpRotationTimingForTests,
+	warpHealthState,
+	warpHealthUrl,
+	warpResendEnabled,
+	warpStateForTests,
+} from "../relay.mjs";
+
+// Verbatim shape of warp-minimal's /health (L26). The published entry is
+// `<name> (<state>, streams=N)`: only the name is identity (D1), and for this
+// proxy even that name is a fixed pool label (L26), so the usable signal is the
+// `recycling` window, never the entry.
+const WARP_HEALTH_SAMPLE =
+	'{"active":1,"cooling_down":0,"exits":["warp-18e (in_use, streams=1)"],"healthy":1,"ok":true,"pool_size":2,"recycling":false}';
+
+test("warpHealthUrl: defaults to /health on the default proxy", () => {
+	assert.equal(warpHealthUrl(undefined, undefined), "http://127.0.0.1:8789/health");
+	assert.equal(warpHealthUrl("", ""), "http://127.0.0.1:8789/health");
+});
+
+test("warpHealthUrl: trims the proxy and strips trailing slashes", () => {
+	assert.equal(warpHealthUrl(" http://127.0.0.1:8789/ ", "/health"), "http://127.0.0.1:8789/health");
+	assert.equal(warpHealthUrl("http://127.0.0.1:8789///", "/health"), "http://127.0.0.1:8789/health");
+});
+
+test("warpHealthUrl: honours the health_path from the shared config", () => {
+	assert.equal(warpHealthUrl("http://127.0.0.1:9000", "/status"), "http://127.0.0.1:9000/status");
+});
+
+test("warpHealthUrl: a path without a leading slash falls back to the default", () => {
+	assert.equal(warpHealthUrl("http://127.0.0.1:9000", "status"), "http://127.0.0.1:9000/health");
+	assert.equal(warpHealthUrl("http://127.0.0.1:9000", 42), "http://127.0.0.1:9000/health");
+});
+
+test("warpHealthState: the real /health sample reduces to recycling + exit names", () => {
+	assert.deepEqual(warpHealthState(JSON.parse(WARP_HEALTH_SAMPLE)), {
+		recycling: false,
+		exits: ["warp-18e"],
+	});
+});
+
+test("warpHealthState: a non-object body is undefined", () => {
+	for (const value of [undefined, null, "body", 42, true, []]) {
+		assert.equal(warpHealthState(value), undefined, `${String(value)} must not parse`);
+	}
+});
+
+test("warpHealthState: recycling is a strict boolean and non-string exits are dropped", () => {
+	assert.deepEqual(warpHealthState({ recycling: "true" }), { recycling: false, exits: [] });
+	assert.deepEqual(warpHealthState({ recycling: true, exits: ["a", 2, null, {}, "b"] }), {
+		recycling: true,
+		exits: ["a", "b"],
+	});
+	assert.deepEqual(warpHealthState({ exits: "warp-18e" }), { recycling: false, exits: [] });
+});
+
+const EXIT_NAME = "warp-18e";
+const BEFORE = { recycling: false, exits: [EXIT_NAME] };
+const NOT_RECYCLING = { recycling: false, exits: [EXIT_NAME] };
+
+test("warpHealthState: an exit name is cut at the first space or paren and empties are dropped", () => {
+	assert.deepEqual(
+		warpHealthState({ exits: ["  warp-18e4af (idle, streams=0) ", "warp-19a\t(in_use)", "native", ""] }),
+		{ recycling: false, exits: ["warp-18e4af", "warp-19a", "native"] },
+	);
+	assert.deepEqual(warpHealthState({ exits: ["   ", "(in_use, streams=1)"] }), {
+		recycling: false,
+		exits: [],
+	});
+});
+
+test("isRotationConfirmed: an invalid health or an in-progress recycle is not a confirmation", () => {
+	assert.equal(isRotationConfirmed(BEFORE, undefined, true), false);
+	assert.equal(
+		isRotationConfirmed(BEFORE, { recycling: true, exits: [EXIT_NAME] }, true),
+		false,
+		"still recycling: the exit is not in service yet",
+	);
+	assert.equal(
+		isRotationConfirmed(BEFORE, { recycling: false, exits: [] }, true),
+		false,
+		"no exit at all: nothing to resend on",
+	);
+});
+
+test("isRotationConfirmed: observing recycling during the poll confirms the rotation", () => {
+	assert.equal(isRotationConfirmed(BEFORE, NOT_RECYCLING, true), true);
+});
+
+test("isRotationConfirmed: a changed exit list confirms the rotation", () => {
+	assert.equal(
+		isRotationConfirmed(BEFORE, { recycling: false, exits: ["warp-19a"] }, false),
+		true,
+	);
+});
+
+test("isRotationConfirmed: recycling: false with unchanged exits is NOT a rotation", () => {
+	// The regression that matters (S6): the exit label is a stable pool label
+	// (L26), so `recycling: false` alone would "confirm" a rotation that never
+	// ran and spend the one resend on the same burnt IP.
+	assert.equal(isRotationConfirmed(BEFORE, NOT_RECYCLING, false), false);
+	assert.equal(
+		isRotationConfirmed(undefined, NOT_RECYCLING, false),
+		false,
+		"no pre-POST snapshot means no evidence",
+	);
+	assert.equal(isRotationConfirmed({}, NOT_RECYCLING, false), false);
+});
+
+test("isRotationConfirmed: the same exit with another stream count never confirms", () => {
+	// D1, on the raw bodies: the label carries the runtime annotation, so a
+	// poll that reads `streams=1` before and `streams=2` after would look like a
+	// new exit and confirm a rotation that never happened. Identity is the name.
+	const before = warpHealthState(JSON.parse(WARP_HEALTH_SAMPLE));
+	const later = warpHealthState(
+		JSON.parse(WARP_HEALTH_SAMPLE.replace("streams=1", "streams=2")),
+	);
+	assert.deepEqual(later, { recycling: false, exits: ["warp-18e"] });
+	assert.equal(isRotationConfirmed(before, later, false), false);
+});
+
+test("warpResendEnabled: only an explicit 0 disables the resend", () => {
+	for (const value of [undefined, null, "", "1", "true", "no"]) {
+		assert.equal(warpResendEnabled(value), true, `${String(value)} must keep the resend on`);
+	}
+	for (const value of ["0", " 0 ", 0]) {
+		assert.equal(warpResendEnabled(value), false, `${String(value)} must disable the resend`);
+	}
+});
+
+// ---------------------------------------------------------------------------
+// The request path: rotation, resend and fallback with a fake network (S5, S7,
+// S8, S10, S13)
+// ---------------------------------------------------------------------------
+// `relay.mjs` reaches the network through the global `fetch`, so replacing it
+// drives the real `rotateWarpExit` / `resendAfterRotation` instead of a copy of
+// their logic. Each case starts from reset module state and a rotation window
+// shrunk to milliseconds; a real 10s poll would cost the suite seconds.
+
+const GATE_429_BODY =
+	'{"type":"FreeUsageLimitError","message":"Free usage limit reached."}';
+const ORIGINAL_429 = {
+	status: 429,
+	contentType: "application/json",
+	body: Buffer.from(GATE_429_BODY),
+};
+const RESEND_PATH = "/v1/messages";
+const WARP_CONFIG = {
+	upstream: "https://gate.example.test",
+	userAgent: "pi-free-bridge-test",
+	apiKey: "public",
+	session: "ses_test",
+	warpMode: "auto",
+	warpProxy: "http://127.0.0.1:8789",
+	warpHealthPath: "/health",
+};
+
+const healthJson = (state) =>
+	new Response(JSON.stringify(state), { status: 200, headers: { "content-type": "application/json" } });
+
+/** Install a recording fake `fetch`; the caller restores it in `finally`. */
+function installFakeFetch(handler) {
+	const calls = [];
+	const original = globalThis.fetch;
+	globalThis.fetch = async (url, opts = {}) => {
+		const call = { url: String(url), method: String(opts.method ?? "GET").toUpperCase() };
+		calls.push(call);
+		return handler(call);
+	};
+	return { calls, restore: () => (globalThis.fetch = original) };
+}
+
+/** One case: fresh warp state, fake network, millisecond rotation window. */
+async function driveWarp(handler, run) {
+	resetWarpStateForTests();
+	setWarpRotationTimingForTests(500, 1);
+	const fake = installFakeFetch(handler);
+	try {
+		return await run(fake);
+	} finally {
+		fake.restore();
+		setWarpRotationTimingForTests();
+	}
+}
+
+/** Health bodies that walk a full recycle: quiet, recycling, quiet again. The
+ *  entry name never changes, so only the observed window can confirm it. */
+function recyclingThenQuiet() {
+	const states = [
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+		{ recycling: true, exits: ["warp-18e (in_use, streams=0)"] },
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+	];
+	let index = 0;
+	return () => states[Math.min(index++, states.length - 1)];
+}
+
+const recyclePosts = (calls) =>
+	calls.filter((call) => call.method === "POST" && call.url.endsWith("/recycle"));
+const upstreamCalls = (calls) =>
+	calls.filter((call) => call.url.startsWith(WARP_CONFIG.upstream));
+
+test("resendAfterRotation: a confirmed rotation posts /recycle once and resends once", async () => {
+	const nextHealth = recyclingThenQuiet();
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return healthJson(nextHealth());
+			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			return new Response('{"ok":true}', {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		},
+		async (fake) => {
+			const delivered = await resendAfterRotation(
+				WARP_CONFIG,
+				RESEND_PATH,
+				{ model: "m", messages: [] },
+				ORIGINAL_429,
+				undefined,
+			);
+
+			assert.equal(delivered.response.status, 200);
+			assert.equal(delivered.egress, "warp", "a resend only ever leaves through warp");
+			assert.equal(recyclePosts(fake.calls).length, 1, "exactly one POST /recycle");
+			assert.equal(upstreamCalls(fake.calls).length, 1, "exactly one upstream resend");
+			const state = warpStateForTests();
+			assert.equal(state.warpResends, 1);
+			assert.equal(state.warpRecycles, 1);
+			assert.equal(state.warp429Streak, 0, "the delivered success resets the streak");
+		},
+	);
+});
+
+test("rotateWarpExit: a rotation inside its cooldown never posts /recycle again", async () => {
+	// B1: two warp 429s a moment apart used to POST twice, and the second POST
+	// tore down the first request's in-flight resend stream.
+	const nextHealth = recyclingThenQuiet();
+	const stderr = [];
+	const originalWrite = process.stderr.write;
+	process.stderr.write = (chunk) => (stderr.push(String(chunk)), true);
+	try {
+		await driveWarp(
+			(call) => {
+				if (call.url.endsWith("/health")) return healthJson(nextHealth());
+				return new Response("", { status: 200 });
+			},
+			async (fake) => {
+				assert.equal(await rotateWarpExit(WARP_CONFIG, undefined), true);
+				assert.equal(
+					warpStateForTests().warpRecycleNotBefore > Date.now(),
+					true,
+					"the 2xx armed the cooldown",
+				);
+
+				assert.equal(await rotateWarpExit(WARP_CONFIG, undefined), false);
+				assert.equal(recyclePosts(fake.calls).length, 1, "no second POST /recycle");
+				assert.equal(
+					stderr.filter((line) => /already within its cooldown/.test(line)).length,
+					1,
+					"one line says why the original 429 is what gets delivered",
+				);
+			},
+		);
+	} finally {
+		process.stderr.write = originalWrite;
+	}
+});
+
+test("resendAfterRotation: a 429 resend delivers the original bytes, status and content-type", async () => {
+	const nextHealth = recyclingThenQuiet();
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return healthJson(nextHealth());
+			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			return new Response('{"type":"FreeUsageLimitError"}', { status: 429 });
+		},
+		async (fake) => {
+			const delivered = await resendAfterRotation(
+				WARP_CONFIG,
+				RESEND_PATH,
+				{ model: "m", messages: [] },
+				ORIGINAL_429,
+				undefined,
+			);
+
+			assert.equal(upstreamCalls(fake.calls).length, 1, "the resend happened");
+			assert.equal(delivered.response.status, 429);
+			assert.equal(delivered.egress, undefined, "the original keeps its own egress");
+			assert.equal(delivered.response.headers.get("content-type"), "application/json");
+			assert.equal(await delivered.response.text(), GATE_429_BODY);
+			const state = warpStateForTests();
+			assert.equal(state.warp429Streak, 1, "A2: the resend's own 429 counts");
+			assert.equal(state.warpResends, 0, "a refused resend is not a delivered resend");
+		},
+	);
+});
+
+test("resendAfterRotation: a 4xx resend is refused and the original 429 is delivered", async () => {
+	// B2: adopting anything below 500 delivered a 400/401/403 from the fresh
+	// exit in place of the real rate limit.
+	const nextHealth = recyclingThenQuiet();
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return healthJson(nextHealth());
+			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			return new Response('{"error":"forbidden"}', { status: 403 });
+		},
+		async (fake) => {
+			const delivered = await resendAfterRotation(
+				WARP_CONFIG,
+				RESEND_PATH,
+				{ model: "m", messages: [] },
+				ORIGINAL_429,
+				undefined,
+			);
+
+			assert.equal(upstreamCalls(fake.calls).length, 1, "the resend happened");
+			assert.equal(delivered.response.status, 429);
+			assert.equal(await delivered.response.text(), GATE_429_BODY);
+			assert.equal(warpStateForTests().warpResends, 0);
+		},
+	);
+});
+
+test("resendAfterRotation: a rotation that never confirms delivers the original and resends nothing", async () => {
+	await driveWarp(
+		(call) => {
+			// recycling stays true: the exit never comes back into service.
+			if (call.url.endsWith("/health"))
+				return healthJson({ recycling: true, exits: ["warp-18e (in_use, streams=0)"] });
+			return new Response("", { status: 200 });
+		},
+		async (fake) => {
+			setWarpRotationTimingForTests(120, 5); // deadline, not patience
+			const delivered = await resendAfterRotation(
+				WARP_CONFIG,
+				RESEND_PATH,
+				{ model: "m", messages: [] },
+				ORIGINAL_429,
+				undefined,
+			);
+
+			assert.equal(recyclePosts(fake.calls).length, 1, "the rotation was attempted");
+			assert.equal(upstreamCalls(fake.calls).length, 0, "an unconfirmed rotation buys no resend");
+			assert.equal(delivered.response.status, 429);
+			assert.equal(await delivered.response.text(), GATE_429_BODY);
+			assert.equal(warpStateForTests().warpResends, 0);
+		},
+	);
+});
+
+test("resendAfterRotation: it reports the egress instead of writing the module global", async () => {
+	// A1: `lastEgress` is request state, so a handler may only publish it once,
+	// from its own value. The helper must not touch it.
+	const nextHealth = recyclingThenQuiet();
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return healthJson(nextHealth());
+			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			return new Response("", { status: 200 });
+		},
+		async () => {
+			assert.equal(warpStateForTests().lastEgress, undefined);
+			const delivered = await resendAfterRotation(
+				WARP_CONFIG,
+				RESEND_PATH,
+				{ model: "m", messages: [] },
+				ORIGINAL_429,
+				undefined,
+			);
+			assert.equal(delivered.egress, "warp");
+			assert.equal(
+				warpStateForTests().lastEgress,
+				undefined,
+				"only forward() publishes lastEgress, once per finished request",
+			);
+		},
+	);
+});
+
+// ---------------------------------------------------------------------------
 // Extension relay wiring (relay-warp-hot-reload, T3/T5)
 // ---------------------------------------------------------------------------
 // The extension module is TypeScript; it is imported here the same way
@@ -716,5 +1108,32 @@ test("relayEnv: a resolved proxy leaves the existing relay env contract intact",
 	} finally {
 		delete process.env.PI_FREE_BRIDGE_WARP_MODE;
 		delete process.env.RELAY_WARP_PROXY;
+	}
+});
+
+// S14: the health path is warp-minimal's, read through resolveWarpTarget, so the
+// relay must never inherit a stale one and must never hardcode /health itself.
+test("relayEnv: RELAY_WARP_HEALTH_PATH carries the resolved target and never a stale value", async () => {
+	const mod = await withIndex();
+	process.env.RELAY_WARP_HEALTH_PATH = "/bogus";
+	try {
+		const withoutTarget = mod.relayEnv({ port: 8788, upstream: "https://example.test", cwd: "." });
+		assert.equal(
+			withoutTarget.RELAY_WARP_HEALTH_PATH,
+			undefined,
+			"no resolved target means no health path to pass",
+		);
+
+		const env = mod.relayEnv({
+			port: 8788,
+			upstream: "https://example.test",
+			cwd: ".",
+			warpProxy: "http://127.0.0.1:9000",
+		});
+		assert.equal(typeof env.RELAY_WARP_HEALTH_PATH, "string");
+		assert.ok(env.RELAY_WARP_HEALTH_PATH.startsWith("/"));
+		assert.notEqual(env.RELAY_WARP_HEALTH_PATH, "/bogus", "a stale inherited value must be replaced");
+	} finally {
+		delete process.env.RELAY_WARP_HEALTH_PATH;
 	}
 });

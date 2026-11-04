@@ -217,6 +217,34 @@ de cuota diaria que una ya establecida: rotar de IP también preserva el
 presupuesto de la IP local. Fuente y detalle en `odd/tasks/warp-429-retry.md`
 S2-S3.
 
+### Reenvío tras rotación
+
+Cuando la respuesta que iba a entregarse es un `429`, el relay rota la IP de
+egress de WARP (`POST /recycle`) y espera a que la rotación quede **confirmada**:
+`recycling` volvió a `false` **y** además se observó `recycling: true` en algún
+momento del poll, o la lista de `exits[]` cambió contra el snapshot tomado justo
+antes del `POST`. `recycling: false` solo no alcanza: es el estado de reposo de
+un pool sano, así que no prueba que el recycle haya corrido.
+
+Con la rotación confirmada hace **un** reenvío, y nada más:
+
+- Sale siempre por el egress WARP, porque la IP nueva vive ahí sin importar el
+  orden que haya usado `auto` (el disparador es todo el request: basta un `429`
+  observado en WARP, aunque después un fallback local haya respondido).
+- Solo antes del primer byte downstream: durante los hasta 10s de la ventana de
+  rotación el cliente no recibe nada. Es la misma regla de siempre — un stream
+  empezado no se puede replicar.
+- Solo se entrega un reenvío **sin error** (`status < 400`). Cualquier reenvío
+  rechazado — `429`, `5xx` u otro `4xx` (`400`/`401`/`403`) — se descarta: se
+  entrega el `429` original **byte-exact** y el status real queda en el `stderr`.
+  Nunca un error sintético y nunca un `429` real escondido. Lo mismo si la
+  rotación no se confirma dentro del timeout o si el reenvío ni siquiera sale.
+- `off` no cambia en nada: su orden de egress es solo local, así que nunca hay
+  un `429` de WARP que dispare el reenvío.
+- `/health` publica `warpResends` (reenvíos que salieron bien) y
+  `warpResendEnabled` (si el mecanismo está activo en este proceso).
+- `RELAY_WARP_RETRY_AFTER_RECYCLE=0` lo apaga del todo, sin tocar el resto.
+
 **Instalación desde Pi (opción 2):** si activás `auto` u `on` y no hay WARP vivo
 ni binario configurado, Pi abre un diálogo de confirmación y, si aceptás, descarga
 la última release de `github.com/Deury08/warp-minimal`, verifica su sha256 contra
@@ -326,6 +354,7 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `~/.pi/agent/pi-free-bridge.json` → `warpEnabled` | Modo de egress WARP: `off`, `auto` u `on` (por defecto `off`) |
 | `PI_FREE_BRIDGE_WARP_MODE` | Pisa el modo de egress WARP (también `off`, `auto`, `on`; máxima precedencia). Mientras exista, el relay **no** lee el `warpEnabled` del config — el modo queda fijado (estático por diseño) |
 | `RELAY_WARP_RECYCLE_COOLDOWN_MS` | Relay-only: cool-down entre recycles (default `300000`). La rotación en sí **no** es configurable: ocurre en el primer `429` observado en el egress warp, porque cualquier umbral mayor entregaría ese tanto de `429` antes de rotar. El relay degrada con gracia si el proxy no tiene endpoint `/recycle`. |
+| `RELAY_WARP_RETRY_AFTER_RECYCLE` | Relay-only: kill switch del reenvío único tras una rotación confirmada. `0` lo desactiva (se entrega el `429` original tal cual); ausente o cualquier otro valor lo mantiene activo. |
 | `PI_FREE_BRIDGE_WARP_PROXY` | URL del proxy WARP (por defecto `http://127.0.0.1:8789`) |
 | `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` (precedencia sobre `warpBin` en config) |
 | `~/.pi/agent/pi-free-bridge.json` → `warpBin` | Ruta al binario; si no hay ninguna y no responde, Pi ofrece descargar e instalar la release oficial (te lo pregunta antes) |

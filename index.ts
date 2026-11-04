@@ -641,6 +641,14 @@ export function relayEnv(options: RelayOptions): Record<string, string | undefin
 		env.RELAY_WARP_PROXY = options.warpProxy;
 	}
 
+	// S14: the health path belongs to warp-minimal's shared config, so the relay
+	// gets it from here instead of hardcoding /health. Same rule as the proxy:
+	// clear an inherited value, then pass what this process actually resolved.
+	delete env.RELAY_WARP_HEALTH_PATH;
+	if (typeof options.warpProxy === "string" && options.warpProxy.length > 0) {
+		env.RELAY_WARP_HEALTH_PATH = resolveWarpTarget().healthPath;
+	}
+
 	const envWarpOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
 	delete env.RELAY_WARP_MODE;
 	if (envWarpOverride) env.RELAY_WARP_MODE = envWarpOverride;
