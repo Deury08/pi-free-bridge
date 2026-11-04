@@ -4,6 +4,20 @@
 > `pi install` pulls this repository directly from `master`, so binary releases
 > were no longer needed). Content is verbatim from the GitHub release bodies.
 
+## Unreleased
+
+- **`RELAY_WARP_RECYCLE_THRESHOLD` removed**: the recycle meter has exactly one
+  correct value — rotate on the first warp-egress 429 — so the knob was dead
+  configuration. The relay now rotates on the first observed warp 429; only
+  `RELAY_WARP_RECYCLE_COOLDOWN_MS` remains as the burst-tolerance knob. The
+  v0.2.0 note below claimed a default of 3; the shipped default was 1.
+- **Gate quota model documented**: the free tier meters per egress IP and per
+  UTC calendar day (`ipRateLimiter.ts` → `getRetryAfterDay`), returns
+  `Retry-After` pointing at the next 00:00 UTC, has no idle decay, and gives a
+  double daily allowance to IPs that are still "new"
+  (`lifetimeCount < dailyLimit * 7`). Resting a burnt IP frees nothing; rotating
+  it to a new one does.
+
 ## v0.3.0 — WARP network-error fallback (2026-11-01)
 
 In warp mode "on", when the WARP fetch rejects with a network/socket error (not HTTP 429/403 quota error), fall back to the local egress before the first downstream byte so the client does not get a 502.
