@@ -267,6 +267,10 @@ async function readBody(req) {
 // 127.0.0.1:8789 (upstream env RELAY_WARP_PROXY).
 
 const WARP_PROXY_DEFAULT = "http://127.0.0.1:8789";
+/** warp-minimal's health path when the shared config does not name one. The
+ *  configured value arrives as `RELAY_WARP_HEALTH_PATH` (S14), so `/health`
+ *  only exists here as the last resort, never as a second source of truth. */
+const WARP_HEALTH_PATH_DEFAULT = "/health";
 
 /** Allowed modes, exported for validation in the extension config too. */
 export const WARP_MODES = ["off", "auto", "on"];
@@ -276,19 +280,40 @@ function normalizeWarpMode(value) {
 	return WARP_MODES.includes(mode) ? mode : undefined;
 }
 
-/** Pure: the egress order for one request. */
-export function egressOrder(mode, warpPreferred) {
+/** Pure: the egress order for one request. A parked local egress is
+ *  deprioritised, not excluded: a rejected request costs no quota (S4), so
+ *  local stays in the chain as the last resort when WARP is down. Excluding it
+ *  would turn a burnt local IP into a hard 502 for the rest of the window. */
+export function egressOrder(mode, warpPreferred, localParked = false) {
 	if (mode === "on") return ["warp"];
-	if (mode === "auto") return warpPreferred ? ["warp", "local"] : ["local", "warp"];
+	if (mode === "auto") return warpPreferred || localParked ? ["warp", "local"] : ["local", "warp"];
 	return ["local"];
 }
 
+/** The margin added on top of `retry-after`. The reset lands on a whole second
+ *  and the gate's clock is not ours, so the last second of the window is not
+ *  worth gambling a request on. */
+export const PARK_MARGIN_MS = 10_000;
+
+/** Pure: how long the local egress stays parked, derived from its own 429.
+ *  A missing or non-integer `retry-after` parks nothing: guessing the reset is
+ *  the exact bug this replaces (S16). */
+export function parkDurationMs(retryAfter) {
+	const raw = String(retryAfter ?? "").trim();
+	if (!/^\d+$/.test(raw)) return undefined;
+	const seconds = Number.parseInt(raw, 10);
+	if (!Number.isSafeInteger(seconds)) return undefined;
+	return seconds * 1000 + PARK_MARGIN_MS;
+}
+
 /** Pure: the next warp preference after one request.
- *  `used` names the egress that produced the final response, `ok` says whether
- *  it was not a rate limit. */
-export function updateWarpPreference(mode, used, ok) {
+ *  `used` names the egress that produced the final response, `status` is that
+ *  response's own HTTP status: only a success may elevate warp. Taking the
+ *  status rather than a boolean keeps the call site from hardcoding "ok",
+ *  which is exactly how a delivered 429 used to pin warp as preferred. */
+export function updateWarpPreference(mode, used, status) {
 	if (mode !== "auto") return false;
-	if (!ok) return false;
+	if (!(typeof status === "number" && status < 400)) return false;
 	return used === "warp";
 }
 
@@ -393,22 +418,81 @@ function refreshWarpMode(config) {
 }
 
 /** relay-warp-auto-recycle (user-approved): the opencode free gate counts
- *  quota per (session, egress IP). A 429 observed via the warp egress means
- *  that exit IP burnt its window, and only the proxy can re-enroll it. The
- *  relay counts 429s OBSERVED on the warp egress (even when a local fallback
- *  delivered the response) and fires a POST /recycle at the threshold —
- *  default 1, so the burnt IP rotates right away; the cooldown and
- *  RELAY_WARP_RECYCLE_THRESHOLD remain the burst-tolerance knobs. If the
- *  proxy does not expose that endpoint yet, the relay degrades: one warning,
- *  requests keep flowing exactly as before. Pure helpers exported for tests. */
-const RECYCLE_THRESHOLD = (() => {
-	const n = Number.parseInt(process.env.RELAY_WARP_RECYCLE_THRESHOLD ?? "", 10);
-	return Number.isInteger(n) && n > 0 ? n : 1;
-})();
+ *  quota per (session, egress IP) and per UTC day. A 429 observed via the warp
+ *  egress means that exit IP burnt its day, and only the proxy can re-enroll
+ *  it. The relay counts 429s OBSERVED on the warp egress (even when a local
+ *  fallback delivered the response) and rotates on the FIRST one — the meter
+ *  has a single correct value, so it is not configurable; only the cooldown
+ *  (`RELAY_WARP_RECYCLE_COOLDOWN_MS`) remains as the burst-tolerance knob. If
+ *  the proxy does not expose that endpoint yet, the relay degrades: one
+ *  warning, requests keep flowing exactly as before. Pure helpers exported
+ *  for tests. */
 const RECYCLE_COOLDOWN_MS = (() => {
 	const n = Number.parseInt(process.env.RELAY_WARP_RECYCLE_COOLDOWN_MS ?? "", 10);
 	return Number.isInteger(n) && n >= 0 ? n : 5 * 60_000;
 })();
+
+/** Pure: the proxy's health URL. The path is warp-minimal's own (`health_path`
+ *  in its config, handed over as `RELAY_WARP_HEALTH_PATH`); a missing or
+ *  shapeless value falls back to the documented default, because probing an
+ *  invented route forwards it upstream and kills the exit (L27). */
+export function warpHealthUrl(proxy, path) {
+	const base = String(proxy ?? "").trim().replace(/\/+$/, "") || WARP_PROXY_DEFAULT;
+	const healthPath = typeof path === "string" && path.startsWith("/") ? path : WARP_HEALTH_PATH_DEFAULT;
+	return `${base}${healthPath}`;
+}
+
+/** Pure: reduce a /health body to the two fields the poll reads. A body that is
+ *  not an object (an HTML error page, an array) is not a health report at all.
+ *  An exit entry is the name followed by its live state
+ *  (`warp-18e4af... (in_use, streams=1)`), so the name is the whole identity:
+ *  keeping the annotation would make a stream count that moved from 1 to 2 look
+ *  like a brand new exit and confirm a rotation that never ran. */
+export function warpHealthState(body) {
+	if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+	const exits = Array.isArray(body.exits)
+		? body.exits
+				.filter((exit) => typeof exit === "string")
+				.map((exit) => exit.trim().split(/[\s(]/, 1)[0])
+				.filter((name) => name.length > 0)
+		: [];
+	return { recycling: body.recycling === true, exits };
+}
+
+/** Pure: did the recycle actually replace an exit (S6)? `recycling: false` is
+ *  the resting state of a healthy pool, so it proves nothing on its own. The
+ *  primary proof is the recycle window being observed at least once during the
+ *  poll. The secondary one is an exit NAME absent from the pre-POST snapshot:
+ *  names are compared, never the raw label, because the label carries the
+ *  live state (`streams=1` -> `streams=2`) and that changes constantly. For
+ *  this proxy the name is a fixed pool label too (L26), so that branch is only
+ *  a fallback for a proxy whose exits do have distinct names. */
+export function isRotationConfirmed(before, health, seenRecycling) {
+	if (!health || typeof health !== "object") return false;
+	if (health.recycling === true) return false;
+	const current = Array.isArray(health.exits) ? health.exits : [];
+	if (current.length === 0) return false;
+	if (seenRecycling === true) return true;
+	// No usable snapshot means no evidence, so a rotation without one is only
+	// confirmable through the observed recycle window.
+	const known = before && Array.isArray(before.exits) ? new Set(before.exits) : undefined;
+	if (!known) return false;
+	return current.some((exit) => !known.has(exit));
+}
+
+/** Pure: S18's kill switch. Only an explicit `0` turns the resend off; unset,
+ *  empty or garbage all mean "on", so a typo cannot silently disable it. */
+export function warpResendEnabled(value) {
+	return String(value ?? "").trim() !== "0";
+}
+
+const WARP_RESEND_ENABLED = warpResendEnabled(process.env.RELAY_WARP_RETRY_AFTER_RECYCLE);
+/** A rotation takes ~4s end to end (L26). 10s covers a slow enroll without
+ *  holding the client past its own patience. */
+const ROTATION_TIMEOUT_MS = 10_000;
+const ROTATION_POLL_MS = 250;
+let rotationTimeoutMs = ROTATION_TIMEOUT_MS;
+let rotationPollMs = ROTATION_POLL_MS;
 
 /** Pure: only WARP-egress outcomes move the streak — a warp 429 extends it and
  *  a warp success resets it. LOCAL results say nothing about the exit IP: a
@@ -421,21 +505,113 @@ export function bumpWarp429Streak(streak, status, egress) {
 	return streak;
 }
 
-/** Pure: fire when the streak reaches the threshold and not on cooldown. */
-export function needsWarpRecycle(streak, threshold = RECYCLE_THRESHOLD, onCooldown = false) {
-	return !onCooldown && streak >= threshold;
+/** Pure: rotate on the first warp 429 of a burst, never while cooling down. */
+export function needsWarpRecycle(streak, onCooldown = false) {
+	return !onCooldown && streak > 0;
 }
 
 let warp429Streak = 0;
 let warpRecycles = 0;
+let warpResends = 0;
 let warpRecycleNotBefore = 0;
+let warpRecycleInFlight = false;
 let warpRecycleUnavailableWarned = false;
+// S16/S17: when the LOCAL egress gets a 429, that IP spent its day. The header
+// says when it resets, so local stops being offered first until then. In memory
+// only — a restart re-learns it with one request that costs no quota (S4).
+let localParkedUntil = 0;
+
+// How many responses we are DELIVERING right now over the warp tunnel — not how
+// many requests are in flight. The distinction is the whole point: a rotation
+// replaces the exit, and that kills every stream multiplexed over it. A response
+// we already hold has passed the gate and will complete on its own, so it is
+// worth protecting. A request still waiting for headers on a burnt IP will get
+// its own 429 no matter what we do, so waiting for that one buys nothing.
+// Counting ours is also the only honest source: the proxy publishes
+// `streams=N`, but it lags (it reports 1 on an idle bridge).
+let deliveringWarpStreams = 0;
+
+/** The valve on the drain wait, and it is a valve, not a budget. The wait itself
+ *  has no clock: a peer that takes 40s to finish gets its 40s. This only exists
+ *  so a stream that hangs forever cannot trap the request that ate the 429 — Pi
+ *  gives up at 5 minutes, so 2 of them is already past the point of no return
+ *  and well short of losing both turns. */
+const DRAIN_VALVE_MS = 120_000;
+const DRAIN_POLL_MS = 50;
+let drainValveMs = DRAIN_VALVE_MS;
+
+// ---------------------------------------------------------------------------
+// Test-only hooks (test/relay.test.mjs)
+// ---------------------------------------------------------------------------
+// The relay reaches the network through the global `fetch` and keeps the warp
+// counters in module state, so the request path is testable under plain Node by
+// swapping one and reading the other. Nothing in the relay calls what follows:
+// it exists only so a test can start from a known state, shrink the 10s window
+// and see the numbers `/health` would publish.
+
+/** Test-only: reset the module-level warp state between cases. */
+export function resetWarpStateForTests() {
+	warp429Streak = 0;
+	warpRecycles = 0;
+	warpRecycleNotBefore = 0;
+	warpRecycleInFlight = false;
+	warpResends = 0;
+	warpPreferred = false;
+	lastEgress = undefined;
+	localParkedUntil = 0;
+	deliveringWarpStreams = 0;
+}
+
+/** Test-only: the state `/health` reports, without standing a server up. */
+export function warpStateForTests() {
+	return {
+		warp429Streak,
+		warpRecycles,
+		warpResends,
+		warpRecycleNotBefore,
+		warpRecycleInFlight,
+		warpPreferred,
+		lastEgress,
+		localParkedUntil,
+		deliveringWarpStreams,
+	};
+}
+
+/** Test-only: shrink the rotation window; a real rotation poll would cost the
+ *  suite 10s per case. Called with no arguments it restores the production
+ *  defaults (10_000ms timeout, 250ms poll, 120_000ms drain valve), which are the
+ *  contract. */
+export function setWarpRotationTimingForTests(timeoutMs, pollMs, valveMs) {
+	rotationTimeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : ROTATION_TIMEOUT_MS;
+	rotationPollMs = Number.isFinite(pollMs) ? pollMs : ROTATION_POLL_MS;
+	drainValveMs = Number.isFinite(valveMs) ? valveMs : DRAIN_VALVE_MS;
+}
+
+/** Test-only: pretend `count` responses are being delivered over warp now. */
+export function setDeliveringStreamsForTests(count) {
+	deliveringWarpStreams = Number.isFinite(count) ? count : 0;
+}
 
 async function maybeRecycleWarp(config) {
-	if (!needsWarpRecycle(warp429Streak, RECYCLE_THRESHOLD, Date.now() < warpRecycleNotBefore)) return;
-	warp429Streak = 0;
-	warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
+	// One recycle at a time: a burst of concurrent 429s must not stack POSTs.
+	// The cooldown is only armed once the proxy actually accepted the rotation —
+	// arming it up front burnt five minutes on a /recycle that never landed.
+	if (warpRecycleInFlight) return;
+	if (!needsWarpRecycle(warp429Streak, Date.now() < warpRecycleNotBefore)) return;
 	if (!config.warpProxy) return;
+	// This is the everyday `auto` rotation: a warp 429 the chain already absorbed
+	// (warp 429, then a local success) lands here, not in the resend path. The
+	// wait belongs to the POST, not to one of its callers, so it happens here too
+	// — and still before the POST, never after.
+	// No `client` is passed on purpose: this rotation repairs the exit for every
+	// later request, not to serve a resend, so a caller that left is not a reason
+	// to leave the burnt IP in place.
+	if (!(await drainBeforeRotation())) return;
+	// The wait is an await: a peer may have rotated meanwhile.
+	if (warpRecycleInFlight) return;
+	if (!needsWarpRecycle(warp429Streak, Date.now() < warpRecycleNotBefore)) return;
+	warp429Streak = 0;
+	warpRecycleInFlight = true;
 	try {
 		const res = await fetch(`${config.warpProxy}/recycle`, {
 			method: "POST",
@@ -443,9 +619,10 @@ async function maybeRecycleWarp(config) {
 		});
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		await res.arrayBuffer();
+		warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
 		warpRecycles += 1;
 		process.stderr.write(
-			`pi-free-bridge relay: warp exit recycled (fresh egress IP) after ${RECYCLE_THRESHOLD} warp 429 response(s)\n`,
+			`pi-free-bridge relay: warp exit recycled (fresh egress IP) after a warp 429\n`,
 		);
 	} catch (err) {
 		const reason = err && err.message ? err.message : String(err);
@@ -459,10 +636,210 @@ async function maybeRecycleWarp(config) {
 			process.stderr.write(`pi-free-bridge relay: warp auto-recycle attempt failed — ${reason}
 `);
 		}
+	} finally {
+		warpRecycleInFlight = false;
 	}
 }
 
-async function forward(req, res, pathname, config) {
+/** GET the proxy's health and reduce it to what the rotation poll reads. Every
+ *  failure (refused, timeout, non-2xx, unparseable body) is just "no report":
+ *  the poll keeps waiting and eventually falls back to the original 429. */
+async function readWarpHealth(config) {
+	try {
+		const res = await fetch(warpHealthUrl(config.warpProxy, config.warpHealthPath), {
+			signal: AbortSignal.timeout(2_000),
+		});
+		if (!res.ok) return undefined;
+		return warpHealthState(await res.json());
+	} catch {
+		return undefined;
+	}
+}
+
+/** Wait until nothing is being delivered over the warp tunnel, because the
+ *  POST that follows tears the tunnel down. No clock on the wait itself — only
+ *  the valve, which is there for a stream that hung, not for a peer that is
+ *  slow. Returns whether the rotation may proceed.
+ *  `client` is the request that asked for the rotation. If it left, nobody is
+ *  waiting for the resend, so rotating up to two minutes later would only cost
+ *  the other tenants their own retry. */
+async function drainBeforeRotation(client) {
+	if (deliveringWarpStreams <= 0) return true;
+	const startedAt = Date.now();
+	const valve = startedAt + drainValveMs;
+	let valveHit = false;
+	while (deliveringWarpStreams > 0) {
+		if (client && client.gone) {
+			process.stderr.write(
+				`pi-free-bridge relay: client left ${Date.now() - startedAt}ms into the drain wait — not rotating\n`,
+			);
+			return false;
+		}
+		if (Date.now() >= valve) {
+			valveHit = true;
+			break;
+		}
+		await new Promise((resolve) => setTimeout(resolve, DRAIN_POLL_MS));
+	}
+	const stuck = valveHit ? `, ${deliveringWarpStreams} still delivering — valve hit` : "";
+	process.stderr.write(
+		`pi-free-bridge relay: waited ${Date.now() - startedAt}ms for in-flight warp responses before rotating${stuck}\n`,
+	);
+	return true;
+}
+
+/** Rotate the warp exit and wait until the rotation is CONFIRMED (S6). Returns
+ *  true only then: an unconfirmed rotation must not buy a resend, because the
+ *  resend would leave through the same burnt IP and burn the one attempt.
+ *  Concurrency: a rotation already in flight belongs to another handler, and
+ *  the correct degradation is today's behaviour (deliver the 429) rather than
+ *  stacking POSTs on the proxy. */
+export async function rotateWarpExit(config, client) {
+	// A rotation already inside its cooldown belongs to another handler: a second
+	// POST would rotate the exit out from under that handler's in-flight resend
+	// and hand this request a stream nobody can serve. The original 429 is the
+	// honest answer, exactly as when a rotation is already in flight.
+	if (Date.now() < warpRecycleNotBefore) {
+		process.stderr.write(
+			`pi-free-bridge relay: warp rotation is already within its cooldown — delivering the original 429\n`,
+		);
+		return false;
+	}
+	if (warpRecycleInFlight) return false;
+	if (!config.warpProxy) return false;
+	// The wait runs BEFORE the guard is taken: holding `warpRecycleInFlight` for
+	// the whole drain would stretch every peer's "no resend" window from one
+	// rotation (~12s) to one drain (~2 minutes), and a peer that ate its own 429
+	// meanwhile has no second chance.
+	if (!(await drainBeforeRotation(client))) return false;
+	// The wait is an await: a peer may have rotated while we held on.
+	if (Date.now() < warpRecycleNotBefore) {
+		process.stderr.write(
+			`pi-free-bridge relay: a warp rotation completed during the drain wait — delivering the original 429\n`,
+		);
+		return false;
+	}
+	if (warpRecycleInFlight) return false;
+	warpRecycleInFlight = true;
+	// This rotation pays for the 429s that asked for it.
+	warp429Streak = 0;
+	try {
+		// Snapshot BEFORE the POST: the exit list is the only observable proof
+		// that an exit was actually replaced.
+		const before = await readWarpHealth(config);
+		const res = await fetch(`${config.warpProxy}/recycle`, {
+			method: "POST",
+			signal: AbortSignal.timeout(10_000),
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		await res.arrayBuffer();
+		// S12: the cooldown is armed only once the proxy accepted the rotation.
+		warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
+		warpRecycles += 1;
+
+		const deadline = Date.now() + rotationTimeoutMs;
+		let seenRecycling = false;
+		while (Date.now() < deadline) {
+			if (client && client.gone) return false; // S13: nobody to answer
+			const state = await readWarpHealth(config);
+			if (state && state.recycling) seenRecycling = true;
+			if (isRotationConfirmed(before, state, seenRecycling)) return true;
+			await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
+		}
+		return false;
+	} catch (err) {
+		const reason = err && err.message ? err.message : String(err);
+		process.stderr.write(`pi-free-bridge relay: warp rotation failed — ${reason}\n`);
+		return false;
+	} finally {
+		warpRecycleInFlight = false;
+	}
+}
+
+/** S5/S7/S10: one resend, only after a confirmed rotation, and always on the
+ *  warp egress — the fresh IP lives there whatever order the chain used. Never
+ *  a loop: the attempt happens once and only a non-error answer is adopted.
+ *  Every refused resend — the same 429, a 5xx, or a 4xx from the fresh exit —
+ *  hands back the original 429 byte-exact with its real status on stderr, so a
+ *  real rate limit is never hidden behind a different error. Returns what it
+ *  delivered and the egress that delivered it; `egress` is undefined when the
+ *  original comes back, because then the original's own egress still stands. */
+export async function resendAfterRotation(config, pathname, body, original, client) {
+	const rebuildOriginal = () => ({
+		egress: undefined,
+		response: new Response(original.body, {
+			status: original.status,
+			headers: original.contentType ? { "content-type": original.contentType } : {},
+		}),
+	});
+
+	if (!(await rotateWarpExit(config, client))) {
+		process.stderr.write(
+			`pi-free-bridge relay: warp rotation not confirmed — delivering the original ${original.status}\n`,
+		);
+		return rebuildOriginal();
+	}
+
+	let attempt;
+	try {
+		attempt = await egressFetch(config, pathname, { body: JSON.stringify(body) }, "warp");
+	} catch (err) {
+		const reason = err && err.message ? err.message : String(err);
+		process.stderr.write(`pi-free-bridge relay: warp resend after rotation failed — ${reason}\n`);
+		return rebuildOriginal();
+	}
+
+	if (attempt.status < 400) {
+		warp429Streak = bumpWarp429Streak(warp429Streak, attempt.status, "warp");
+		warpResends += 1;
+		process.stderr.write(
+			`pi-free-bridge relay: warp resend after rotation delivered ${attempt.status} on the fresh exit IP\n`,
+		);
+		return { egress: "warp", response: attempt };
+	}
+
+	await attempt.arrayBuffer(); // drain for connection reuse
+	// A 429 from the fresh exit is exit evidence like any other warp 429, so the
+	// same helper the loop uses must count it; otherwise a second burnt exit
+	// under-reports the streak and the next burst rotates late.
+	warp429Streak = bumpWarp429Streak(warp429Streak, attempt.status, "warp");
+	process.stderr.write(
+		`pi-free-bridge relay: warp resend after rotation got ${attempt.status} — delivering the original ${original.status}\n`,
+	);
+	return rebuildOriginal();
+}
+
+/** Pure: the upstream headers the relay forwards downstream. `content-type`
+ *  keeps the body readable; `retry-after` is what makes a gate 429 actionable,
+ *  because it carries the seconds until the quota resets. Without it the client
+ *  can only guess, and guessing midnight UTC is exactly the wrong answer for a
+ *  user in any other time zone. Everything else stays upstream: it is the
+ *  upstream's business, not the client's. */
+export function forwardedHeaders(source) {
+	const headers = {};
+	if (!source || typeof source.get !== "function") return headers;
+	const contentType = source.get("content-type");
+	if (contentType) headers["content-type"] = contentType;
+	const retryAfter = source.get("retry-after");
+	if (retryAfter) headers["retry-after"] = retryAfter;
+	return headers;
+}
+
+/** S13: marks a client that went away before the response finished. `close`
+ *  also fires after a normal finish, so the `writableEnded` guard matters. */
+function trackClient(res) {
+	const tracker = { gone: false };
+	res.on("close", () => {
+		if (!res.writableEnded) tracker.gone = true;
+	});
+	return tracker;
+}
+
+// Exported for the request-path tests: the counter and the drain order are only
+// observable from a real `forward()` call.
+export async function forward(req, res, pathname, config) {
+	const client = trackClient(res);
+	let countedDelivering = false;
 	try {
 		const raw = await readBody(req);
 		const incoming = JSON.parse(raw);
@@ -479,12 +856,17 @@ async function forward(req, res, pathname, config) {
 		// S5: walk the egress chain, failover only while nothing has reached
 		// the client. Whatever response ends the loop is delivered verbatim by
 		// the code below (error body byte-exact included).
-		const order = egressOrder(config.warpMode, warpPreferred);
+		const order = egressOrder(config.warpMode, warpPreferred, Date.now() < localParkedUntil);
 		const errors = [];
 		let response = undefined;
 		let last429 = undefined;
+		let sawWarp429 = false;
+		// Request-local: a long rotation waits next to other requests, so the
+		// egress that answered THIS request cannot live in a module global that
+		// another handler overwrites in the meantime.
+		let egressUsed = undefined;
 		for (const egress of order) {
-			lastEgress = egress;
+			egressUsed = egress;
 			let candidate;
 			try {
 				candidate = await egressFetch(config, pathname, { body: JSON.stringify(body) }, egress);
@@ -493,6 +875,24 @@ async function forward(req, res, pathname, config) {
 				// success must still extend the streak.
 				if (egress === "warp") {
 					warp429Streak = bumpWarp429Streak(warp429Streak, candidate.status, "warp");
+					// S10: the trigger is the whole request, not the last egress — in
+					// either `auto` order, a 429 observed through warp is exit evidence
+					// even when a local fallback delivered something else. Mode `off`
+					// never reaches warp at all, so it keeps today's behavior by
+					// construction (S9).
+					if (candidate.status === 429) sawWarp429 = true;
+				}
+				// S16: a local 429 is the local IP's own quota, and its `retry-after`
+				// is the only honest source for when that ends. Park it, so the next
+				// turns do not spend themselves on an IP the gate already refused.
+				if (egress === "local" && candidate.status === 429) {
+					const parked = parkDurationMs(candidate.headers.get("retry-after"));
+					if (parked) {
+						localParkedUntil = Date.now() + parked;
+						process.stderr.write(
+							`pi-free-bridge relay: local egress parked for ${Math.round(parked / 1000)}s after its own 429\n`,
+						);
+					}
 				}
 			} catch (err) {
 				// S7: modo "on" y WARP falla con error de red (no 429/403 de
@@ -503,7 +903,7 @@ async function forward(req, res, pathname, config) {
 						candidate = await egressFetch(config, pathname, {
 							body: JSON.stringify(body),
 						}, "local");
-						lastEgress = "local";
+						egressUsed = "local";
 						response = candidate;
 						break;
 					} catch (err2) {
@@ -531,6 +931,38 @@ async function forward(req, res, pathname, config) {
 			response = candidate;
 			break;
 		}
+		// S5/S7/S8: nothing has been written downstream, so a confirmed rotation
+		// can buy exactly one resend. The original is buffered BEFORE the wait: a
+		// rotation takes seconds, nothing may reach the client meanwhile, and if
+		// the resend is refused those exact bytes are what gets delivered.
+		if (response && response.status === 429 && sawWarp429 && WARP_RESEND_ENABLED && !client.gone) {
+			const resend = await resendAfterRotation(
+				config,
+				pathname,
+				body,
+				{
+					status: response.status,
+					contentType: response.headers.get("content-type"),
+					body: Buffer.from(await response.arrayBuffer()),
+				},
+				client,
+			);
+			response = resend.response;
+			// No egress means the original 429 was handed back, so it keeps the
+			// egress that produced it.
+			if (resend.egress) egressUsed = resend.egress;
+		}
+
+		// Count this response for as long as it is being delivered over warp. A
+		// rotation would kill it, and it already passed the gate, so it is exactly
+		// what the drain wait protects. Counted BEFORE the rotation below, so that no
+		// await added between here and there can leave a fresh delivery invisible.
+		// Errors are not counted: they are short and not worth making a wait for.
+		if (response && egressUsed === "warp" && response.status < 400) {
+			deliveringWarpStreams += 1;
+			countedDelivering = true;
+		}
+
 		// relay-warp-auto-recycle: evaluate after the whole chain, and whatever
 		// we deliver — a fully rate-limited chain (502 below) still rotates the
 		// burnt exit before the client retries.
@@ -548,12 +980,16 @@ async function forward(req, res, pathname, config) {
 			sendJson(res, 502, { error: { message } });
 			return;
 		}
-		warpPreferred = updateWarpPreference(config.warpMode, lastEgress, true);
+		warpPreferred = updateWarpPreference(config.warpMode, egressUsed, response.status);
+		// The module global is written once per finished request, from this
+		// request's own value: `/health` reports the last egress of the last
+		// completed request, and a concurrent one cannot leak into it.
+		lastEgress = egressUsed;
 
 		// S20: status and content-type pass through, the body is piped unparsed.
-		const headers = {};
-		const contentType = response.headers.get("content-type");
-		if (contentType) headers["content-type"] = contentType;
+		// S15: `retry-after` rides along, so a 429 arrives with its own reset
+		// window instead of forcing the client to guess.
+		const headers = forwardedHeaders(response.headers);
 
 		// Error diagnostics (bun-upgrades S3): a gate rejection carries the
 		// usable evidence in its JSON body. Snapshot it (bounded) before piping,
@@ -563,7 +999,7 @@ async function forward(req, res, pathname, config) {
 			const errorBody = Buffer.from(await response.arrayBuffer());
 			const snapshot = errorBody.subarray(0, 4096);
 			process.stderr.write(
-				`pi-free-bridge relay: upstream ${response.status} via ${lastEgress} ${toUpstreamUrl(config.upstream, pathname)}
+				`pi-free-bridge relay: upstream ${response.status} via ${egressUsed} ${toUpstreamUrl(config.upstream, pathname)}
 ` +
 					`pi-free-bridge relay: session ${config.session} (from ${config.sessionSource})
 ` +
@@ -575,7 +1011,7 @@ async function forward(req, res, pathname, config) {
 			return;
 		}
 
-		res.writeHead(response.status, { ...headers, "x-egress-used": lastEgress });
+		res.writeHead(response.status, { ...headers, "x-egress-used": egressUsed });
 
 		if (!response.body) {
 			res.end();
@@ -586,11 +1022,18 @@ async function forward(req, res, pathname, config) {
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
+			if (client.gone) {
+				// Nobody is listening: stop draining the upstream into a dead socket.
+				await reader.cancel();
+				return;
+			}
 			res.write(Buffer.from(value));
 		}
 		res.end();
 	} catch (err) {
 		sendJson(res, 502, { error: { message: err && err.message ? err.message : String(err) } });
+	} finally {
+		if (countedDelivering) deliveringWarpStreams -= 1;
 	}
 }
 
@@ -614,6 +1057,12 @@ async function handle(req, res, config) {
 			warpProxy: config.warpProxy,
 			warp429Streak: warp429Streak,
 			warpRecycles: warpRecycles,
+			warpResends: warpResends,
+			warpResendEnabled: WARP_RESEND_ENABLED,
+			// S16: 0 means the local egress is free to use again. Reported as a
+			// remaining window rather than a timestamp, because that is the number
+			// a human reading /health actually wants.
+			localParkedForMs: Math.max(0, localParkedUntil - Date.now()),
 			lastEgress: lastEgress,
 			pid: process.pid,
 		});
@@ -659,6 +1108,7 @@ async function startServer() {
 		warpModeSource: envOverride ? "env" : "config",
 		warpConfigPath: process.env.RELAY_CONFIG_PATH || "",
 		warpProxy: process.env.RELAY_WARP_PROXY || WARP_PROXY_DEFAULT,
+		warpHealthPath: process.env.RELAY_WARP_HEALTH_PATH || WARP_HEALTH_PATH_DEFAULT,
 	};
 
 	const server = createServer((req, res) => {

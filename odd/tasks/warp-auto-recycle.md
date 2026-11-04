@@ -9,9 +9,11 @@
   warp" — automatic recycle, not manual.
 - S3 The relay counts consecutive 429s DELIVERED through the warp egress only;
   local-egress 429s never count; any success resets the streak.
-- S4 At the default threshold (3, `RELAY_WARP_RECYCLE_THRESHOLD`) the relay POSTs
-  `/recycle` to the proxy (`RELAY_WARP_PROXY`), then cools down (default 5 min,
-  `RELAY_WARP_RECYCLE_COOLDOWN_MS`).
+- S4 The relay POSTs `/recycle` to the proxy (`RELAY_WARP_PROXY`) on the FIRST
+  warp-egress 429 of a burst, then cools down (default 5 min,
+  `RELAY_WARP_RECYCLE_COOLDOWN_MS`). The threshold knob was removed on
+  2026-11-04: rotate-on-first is the only value that can recover the turn, so
+  it is not configurable.
 - S5 If the proxy does not expose `/recycle` yet, the relay degrades: one warning
   for the lifetime of the process, requests keep flowing exactly as before.
 - S6 `/health` exposes `warp429Streak` and `warpRecycles` for live diagnosis.
@@ -33,3 +35,8 @@
 - L3 Warp agent later suggested deferring; the user decision (L2) stands, so the
   bridge side ships with graceful degradation (S5) instead of waiting for the
   proxy endpoint.
+- L4 (2026-11-04) User verbatim: "si asi mismo entonces arregla en la documentacion
+  y es mas si esto no influye oes ino demas la quitas," — decision: the
+  `RELAY_WARP_RECYCLE_THRESHOLD` knob is removed (dead config with a single
+  correct value) and the docs are aligned to rotate-on-first. Supersedes the
+  "default 3" wording in S4 and in the v0.2.0 CHANGELOG entry.

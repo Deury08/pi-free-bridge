@@ -4,6 +4,62 @@
 > `pi install` pulls this repository directly from `master`, so binary releases
 > were no longer needed). Content is verbatim from the GitHub release bodies.
 
+## Unreleased
+
+- **Rotation waits for in-flight WARP deliveries**: `/recycle` replaces the exit,
+  and that kills every stream multiplexed over it. A response that already
+  passed the gate completes on its own, so the relay now waits until nothing is
+  being delivered over WARP before rotating — no clock on that wait, only a
+  120s valve for a hung stream (well under Pi's 5-minute idle timeout). The
+  `POST /recycle` goes *after* the wait: sending it first tears the tunnel down
+  and makes the wait pointless. Only accepted responses (`status < 400`) are
+  counted; a request still waiting for headers already gets its own `429` on the
+  burnt IP and waiting for it would buy nothing. Both rotation paths wait — the
+  resend and the `auto` streak rotation that fires when a warp 429 already fell
+  back to a local success — and a client that already left aborts the rotation
+  instead of costing every other tenant its retry.
+
+- **Park a rate-limited local egress until its reset**: a `429` on the LOCAL
+  egress means that physical IP spent its day and the relay cannot rotate it,
+  so it now parks local until `retry-after` (read from that response, plus a 10s
+  margin) instead of offering it first turn after turn. Local is
+  deprioritised, never excluded — with WARP down the request still egresses
+  local and gets its `429` rather than a `502`, and a rejected request costs no
+  quota. `off` and `on` are unchanged, `/health` gains `localParkedForMs`, and
+  the state is in-memory only.
+
+- **`retry-after` forwarded on upstream errors**: a gate `429` carries the real
+  seconds until the quota resets, and the relay used to drop it — only
+  `content-type` was forwarded, so the client was left to guess midnight UTC
+  (wrong for every other time zone). Status, `content-type` and `retry-after`
+  now pass through; every other upstream header still stays upstream.
+
+- **Resend once after a confirmed WARP exit rotation**: a response that would
+  deliver a gate `429` now rotates the WARP exit and, only once that rotation is
+  confirmed (`recycling` was observed during the poll, or `exits[]` changed
+  against the pre-`POST` snapshot — `recycling: false` alone is not proof),
+  resends the request exactly once through WARP. Only a non-error resend
+  (`status < 400`) is delivered: any refused resend (`429`, `5xx`, other `4xx`
+  such as `400`/`401`/`403`) logs its real status and delivers the original
+  `429` byte-exact, as do an unconfirmed rotation and a timeout, and only ever
+  before the first downstream byte. `off` is untouched (`sawWarp429`
+  can never be true there), `/health` gains `warpResends` and
+  `warpResendEnabled`, and `RELAY_WARP_RETRY_AFTER_RECYCLE=0` is the kill switch.
+  The health path is warp-minimal's own, passed as `RELAY_WARP_HEALTH_PATH` from
+  the shared config instead of being hardcoded.
+
+- **`RELAY_WARP_RECYCLE_THRESHOLD` removed**: the recycle meter has exactly one
+  correct value — rotate on the first warp-egress 429 — so the knob was dead
+  configuration. The relay now rotates on the first observed warp 429; only
+  `RELAY_WARP_RECYCLE_COOLDOWN_MS` remains as the burst-tolerance knob. The
+  v0.2.0 note below claimed a default of 3; the shipped default was 1.
+- **Gate quota model documented**: the free tier meters per egress IP and per
+  UTC calendar day (`ipRateLimiter.ts` → `getRetryAfterDay`), returns
+  `Retry-After` pointing at the next 00:00 UTC, has no idle decay, and gives a
+  double daily allowance to IPs that are still "new"
+  (`lifetimeCount < dailyLimit * 7`). Resting a burnt IP frees nothing; rotating
+  it to a new one does.
+
 ## v0.3.0 — WARP network-error fallback (2026-11-01)
 
 In warp mode "on", when the WARP fetch rejects with a network/socket error (not HTTP 429/403 quota error), fall back to the local egress before the first downstream byte so the client does not get a 502.

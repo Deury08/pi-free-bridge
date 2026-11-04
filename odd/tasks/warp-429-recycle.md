@@ -26,7 +26,9 @@ a burnt IP is replaced before the next request instead of accumulating stale 429
 - [ ] T2 Chain accounting: count OBSERVED warp responses inside the `forward()` loop
       (before fallback), then run the recycle check after the loop so 502 paths also
       trigger it. Keep `maybeRecycleWarp` recycle-side logic unchanged.
-- [ ] T3 Threshold default 1 with unchanged `RELAY_WARP_RECYCLE_THRESHOLD` override;
+- [x] T3 Threshold default 1; superseded 2026-11-04 — the
+      `RELAY_WARP_RECYCLE_THRESHOLD` override was removed entirely (rotate on the
+      first warp 429 is the only correct value).
       cooldown stays 5 min; update README row.
 - [ ] T4 Update tests for new semantics; `node --test` green.
 - [ ] T5 Simulation (no real warp): mock gate + mock warp `/recycle`, spawn relay on a

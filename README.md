@@ -8,6 +8,76 @@ Bun, así que sobrevive a `pi update` y no depende de ningún puente de terceros
 
 ## Instalar
 
+Siete pasos, todos desde el terminal. Las capturas son de una instalación real
+en Windows: si tu pantalla se parece a la de la foto, vas bien.
+
+Los pasos 3 a 5 son solo para WARP. Si no lo querés, los podés saltear: el puente
+funciona igual contra tu IP directa.
+
+### 1. Instalar la extensión
+
+Escribí el comando en el terminal y dale Enter:
+
+```bash
+gentle-shell install git:github.com/Deury08/pi-free-bridge
+```
+
+![Escribiendo el comando de instalación](<Imagenes/Comando ParaInstalar.png>)
+
+### 2. Confirmar que quedó instalada
+
+El comando clona el repo y termina con `Installed
+git:github.com/Deury08/pi-free-bridge` en verde. Si no ves esa línea, no sigas:
+volvé a correr el paso 1.
+
+![Salida del comando con la línea Installed](<Imagenes/Instalado.png>)
+
+### 3. Activar WARP
+
+Dentro de Pi escribí `/free-bridge-warp` (con el `/` aparece el autocompletado;
+Enter lo selecciona).
+
+![Autocompletado del comando free-bridge-warp](<Imagenes/Activando%20Warp.png>)
+
+### 4. Aceptar la descarga de `warp-minimal`
+
+Si no tenés WARP corriendo ni el binario instalado, Pi te lo pregunta antes de
+bajar nada: te muestra la versión, el tamaño, de dónde lo baja y dónde lo
+instala. Elegí **`Yes`** y verifica el checksum solo.
+
+![Diálogo de confirmación de descarga de warp-minimal](<Imagenes/Instalando%20Warp.png>)
+
+### 5. Elegir el modo
+
+- **`auto`** — primero tu IP directa y WARP solo ante rate limit. Es el modo
+  recomendado para empezar.
+- **`on`** — siempre WARP.
+- **`off`** — siempre directo.
+
+El cambio aplica en el próximo request, sin reiniciar nada.
+
+![Menú con los tres modos de WARP](<Imagenes/Configurando%20Warp.png>)
+
+### 6. Elegir un modelo gratis
+
+`/model` abre el picker. Los del tier gratuito terminan en `-free` y vienen del
+provider `oc-sdk-zen`; en la captura están agrupados bajo `[oc-sdk-zen]` junto a
+los de `nvidia`. El panel de la derecha tiene que decir `pi-free-bridge · ready`.
+
+![Picker con los modelos gratuitos del provider oc-sdk-zen](<Imagenes/Modelos%20Disponibles.png>)
+
+### 7. Usarlo
+
+Escribí cualquier cosa y mirá el pie: `ctx` sube, el costo queda en **`$0.000`**.
+Eso es el tier gratuito funcionando a través del relay.
+
+![Conversación respondiendo con costo $0.000](<Imagenes/Usando%20Modelos.png>)
+
+### Alternativa: desde el repo clonado
+
+Si ya tenés el repo en disco, la instalación es la misma que cualquier
+extensión local:
+
 ```bash
 pi install C:\Users\Polanco\pi-free-bridge
 pi list
@@ -137,6 +207,79 @@ En los errores ≥ 400 el relay loguea un snapshot acotado del cuerpo del upstre
 (stderr) y lo devuelve byte-exacte, con pista específica de session id ante
 `429`.
 
+**Qué mide ese `429`:** el free tier cuenta por **IP de egress** y por **día
+calendario UTC**, no por cuenta ni por sesión. El 429 trae `Retry-After` con los
+segundos que faltan para las 00:00 UTC, y **no hay decaimiento por inactividad**:
+una IP quemada se libera en el cambio de día UTC, no antes, así que dejarla
+descansar no devuelve nada. Además una IP que sigue siendo "nueva"
+(`lifetimeCount < dailyLimit * 7`, contador que nunca se resetea) tiene el doble
+de cuota diaria que una ya establecida: rotar de IP también preserva el
+presupuesto de la IP local. Fuente y detalle en `odd/tasks/warp-429-retry.md`
+S2-S3.
+
+### Reenvío tras rotación
+
+Cuando la respuesta que iba a entregarse es un `429`, el relay rota la IP de
+egress de WARP (`POST /recycle`) y espera a que la rotación quede **confirmada**:
+`recycling` volvió a `false` **y** además se observó `recycling: true` en algún
+momento del poll, o la lista de `exits[]` cambió contra el snapshot tomado justo
+antes del `POST`. `recycling: false` solo no alcanza: es el estado de reposo de
+un pool sano, así que no prueba que el recycle haya corrido.
+
+Con la rotación confirmada hace **un** reenvío, y nada más:
+
+- Antes de rotar — por los **dos** caminos: el reenvío y la rotación automática
+  de `auto` cuando la cadena cayó al local — espera a que no queden respuestas
+  **entregándose** por WARP. Un
+  request que ya pasó el gate se completa solo; rotar lo mataría sin necesidad.
+  La espera no tiene reloj — si el otro tarda 40 segundos, esperás 40. Solo hay
+  una válvula de **120s** por si un stream quedó colgado, y cuando se dispara lo
+  deja escrito en el log. Un request que todavía espera headers no se cuenta:
+  esa IP ya está quemada y se va a comer su propio `429` igual.
+- El `POST /recycle` va **después** de esa espera. Si se manda antes, el túnel ya
+  se está cayendo y esperar no salva nada.
+- Si el cliente que comió el `429` ya se fue, no se rota: nadie va a reenviar,
+  y esperar para después tirar el túnel solo le costaría el reintento a los
+  demás.
+
+- Sale siempre por el egress WARP, porque la IP nueva vive ahí sin importar el
+  orden que haya usado `auto` (el disparador es todo el request: basta un `429`
+  observado en WARP, aunque después un fallback local haya respondido).
+- Solo antes del primer byte downstream: durante los hasta 10s de la ventana de
+  rotación el cliente no recibe nada. Es la misma regla de siempre — un stream
+  empezado no se puede replicar.
+- Solo se entrega un reenvío **sin error** (`status < 400`). Cualquier reenvío
+  rechazado — `429`, `5xx` u otro `4xx` (`400`/`401`/`403`) — se descarta: se
+  entrega el `429` original **byte-exact** y el status real queda en el `stderr`.
+  Nunca un error sintético y nunca un `429` real escondido. Lo mismo si la
+  rotación no se confirma dentro del timeout o si el reenvío ni siquiera sale.
+- `off` no cambia en nada: su orden de egress es solo local, así que nunca hay
+  un `429` de WARP que dispare el reenvío.
+- `/health` publica `warpResends` (reenvíos que salieron bien) y
+  `warpResendEnabled` (si el mecanismo está activo en este proceso).
+- `RELAY_WARP_RETRY_AFTER_RECYCLE=0` lo apaga del todo, sin tocar el resto.
+
+### Parking de la IP local
+
+Un `429` en el egress **local** no es lo mismo que uno en WARP: el relay no puede
+rotar la IP física de tu casa, así que la única salida honesta es esperar. Cuando
+el local devuelve `429`, el relay lee el `retry-after` **de esa misma respuesta**
+y no vuelve a ofrecer local primero hasta ese momento más 10s de margen.
+
+- El número sale siempre del header. Nunca de calcular medianoche UTC ni de
+  adivinar tu zona horaria.
+- Si el header falta o no es un entero de segundos, no se parkea nada: se
+  prefiere un intento de más antes que inventar un reset.
+- Local **no se saca** de la cadena, solo baja al segundo lugar: si WARP está
+  caído, el pedido igual sale por local y recibe su `429` en vez de un `502`. Un
+  request rechazado por el gate no consume cuota, así que ese fallback es gratis.
+- Solo aplica a `auto`. En `off` el orden sigue siendo solo local y en `on`
+  nunca se usa local.
+- `/health` publica `localParkedForMs`: 0 significa que local volvió a estar
+  disponible.
+- El estado vive en memoria: reiniciar el relay lo olvida y lo vuelve a aprender
+  con un request que no cuesta cuota.
+
 **Instalación desde Pi (opción 2):** si activás `auto` u `on` y no hay WARP vivo
 ni binario configurado, Pi abre un diálogo de confirmación y, si aceptás, descarga
 la última release de `github.com/Deury08/warp-minimal`, verifica su sha256 contra
@@ -245,8 +388,8 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `~/.pi/agent/pi-free-bridge.json` → `sessionId` | Session id persistido |
 | `~/.pi/agent/pi-free-bridge.json` → `warpEnabled` | Modo de egress WARP: `off`, `auto` u `on` (por defecto `off`) |
 | `PI_FREE_BRIDGE_WARP_MODE` | Pisa el modo de egress WARP (también `off`, `auto`, `on`; máxima precedencia). Mientras exista, el relay **no** lee el `warpEnabled` del config — el modo queda fijado (estático por diseño) |
-| `RELAY_WARP_RECYCLE_THRESHOLD` | Relay-only: respuestas 429 observadas en el egress warp que disparan un `POST /recycle` al proxy (default `1`: la IP rota apenas hay un 429 por warp). La cadena local no cuenta ni resetea. |
-| `RELAY_WARP_RECYCLE_COOLDOWN_MS` | Relay-only: cool-down entre recycles (default `300000`). El relay degrada con gracia si el proxy no tiene endpoint `/recycle`. |
+| `RELAY_WARP_RECYCLE_COOLDOWN_MS` | Relay-only: cool-down entre recycles (default `300000`). La rotación en sí **no** es configurable: ocurre en el primer `429` observado en el egress warp, porque cualquier umbral mayor entregaría ese tanto de `429` antes de rotar. El relay degrada con gracia si el proxy no tiene endpoint `/recycle`. |
+| `RELAY_WARP_RETRY_AFTER_RECYCLE` | Relay-only: kill switch del reenvío único tras una rotación confirmada. `0` lo desactiva (se entrega el `429` original tal cual); ausente o cualquier otro valor lo mantiene activo. |
 | `PI_FREE_BRIDGE_WARP_PROXY` | URL del proxy WARP (por defecto `http://127.0.0.1:8789`) |
 | `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` (precedencia sobre `warpBin` en config) |
 | `~/.pi/agent/pi-free-bridge.json` → `warpBin` | Ruta al binario; si no hay ninguna y no responde, Pi ofrece descargar e instalar la release oficial (te lo pregunta antes) |
@@ -370,6 +513,12 @@ con esta superficie: habla con el relay, que reenvía acá desde Bun.
 `x-opencode-client`, `x-opencode-project` y headers extra no son necesarios y **no
 existe** regla de conteo (una revisión anterior de este doc decía ≥7; eso se midió
 sobre un body inválido y está obsoleto).
+
+**Respuesta** — el status y el `content-type` del upstream pasan tal cual, y un
+error conserva además su `retry-after`: cuando el gate corta por cuota esa
+cabecera trae los segundos reales hasta el reset, así que el cliente no necesita
+calcular medianoche UTC ni adivinar su zona horaria. El resto de los headers del
+upstream no salen del relay.
 
 **Body:**
 
