@@ -280,11 +280,30 @@ function normalizeWarpMode(value) {
 	return WARP_MODES.includes(mode) ? mode : undefined;
 }
 
-/** Pure: the egress order for one request. */
-export function egressOrder(mode, warpPreferred) {
+/** Pure: the egress order for one request. A parked local egress is
+ *  deprioritised, not excluded: a rejected request costs no quota (S4), so
+ *  local stays in the chain as the last resort when WARP is down. Excluding it
+ *  would turn a burnt local IP into a hard 502 for the rest of the window. */
+export function egressOrder(mode, warpPreferred, localParked = false) {
 	if (mode === "on") return ["warp"];
-	if (mode === "auto") return warpPreferred ? ["warp", "local"] : ["local", "warp"];
+	if (mode === "auto") return warpPreferred || localParked ? ["warp", "local"] : ["local", "warp"];
 	return ["local"];
+}
+
+/** The margin added on top of `retry-after`. The reset lands on a whole second
+ *  and the gate's clock is not ours, so the last second of the window is not
+ *  worth gambling a request on. */
+export const PARK_MARGIN_MS = 10_000;
+
+/** Pure: how long the local egress stays parked, derived from its own 429.
+ *  A missing or non-integer `retry-after` parks nothing: guessing the reset is
+ *  the exact bug this replaces (S16). */
+export function parkDurationMs(retryAfter) {
+	const raw = String(retryAfter ?? "").trim();
+	if (!/^\d+$/.test(raw)) return undefined;
+	const seconds = Number.parseInt(raw, 10);
+	if (!Number.isSafeInteger(seconds)) return undefined;
+	return seconds * 1000 + PARK_MARGIN_MS;
 }
 
 /** Pure: the next warp preference after one request.
@@ -497,6 +516,10 @@ let warpResends = 0;
 let warpRecycleNotBefore = 0;
 let warpRecycleInFlight = false;
 let warpRecycleUnavailableWarned = false;
+// S16/S17: when the LOCAL egress gets a 429, that IP spent its day. The header
+// says when it resets, so local stops being offered first until then. In memory
+// only — a restart re-learns it with one request that costs no quota (S4).
+let localParkedUntil = 0;
 
 // ---------------------------------------------------------------------------
 // Test-only hooks (test/relay.test.mjs)
@@ -516,6 +539,7 @@ export function resetWarpStateForTests() {
 	warpResends = 0;
 	warpPreferred = false;
 	lastEgress = undefined;
+	localParkedUntil = 0;
 }
 
 /** Test-only: the state `/health` reports, without standing a server up. */
@@ -528,6 +552,7 @@ export function warpStateForTests() {
 		warpRecycleInFlight,
 		warpPreferred,
 		lastEgress,
+		localParkedUntil,
 	};
 }
 
@@ -744,7 +769,7 @@ async function forward(req, res, pathname, config) {
 		// S5: walk the egress chain, failover only while nothing has reached
 		// the client. Whatever response ends the loop is delivered verbatim by
 		// the code below (error body byte-exact included).
-		const order = egressOrder(config.warpMode, warpPreferred);
+		const order = egressOrder(config.warpMode, warpPreferred, Date.now() < localParkedUntil);
 		const errors = [];
 		let response = undefined;
 		let last429 = undefined;
@@ -769,6 +794,18 @@ async function forward(req, res, pathname, config) {
 					// never reaches warp at all, so it keeps today's behavior by
 					// construction (S9).
 					if (candidate.status === 429) sawWarp429 = true;
+				}
+				// S16: a local 429 is the local IP's own quota, and its `retry-after`
+				// is the only honest source for when that ends. Park it, so the next
+				// turns do not spend themselves on an IP the gate already refused.
+				if (egress === "local" && candidate.status === 429) {
+					const parked = parkDurationMs(candidate.headers.get("retry-after"));
+					if (parked) {
+						localParkedUntil = Date.now() + parked;
+						process.stderr.write(
+							`pi-free-bridge relay: local egress parked for ${Math.round(parked / 1000)}s after its own 429\n`,
+						);
+					}
 				}
 			} catch (err) {
 				// S7: modo "on" y WARP falla con error de red (no 429/403 de
@@ -923,6 +960,10 @@ async function handle(req, res, config) {
 			warpRecycles: warpRecycles,
 			warpResends: warpResends,
 			warpResendEnabled: WARP_RESEND_ENABLED,
+			// S16: 0 means the local egress is free to use again. Reported as a
+			// remaining window rather than a timestamp, because that is the number
+			// a human reading /health actually wants.
+			localParkedForMs: Math.max(0, localParkedUntil - Date.now()),
 			lastEgress: lastEgress,
 			pid: process.pid,
 		});

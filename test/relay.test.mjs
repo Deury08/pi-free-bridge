@@ -339,7 +339,7 @@ test("resolveRelaySession: without a Pi-supplied id, the relay harvests locally"
 // Egress selection (bun-upgrades S5)
 // ---------------------------------------------------------------------------
 
-import { egressOrder, updateWarpPreference, WARP_MODES } from "../relay.mjs";
+import { egressOrder, parkDurationMs, PARK_MARGIN_MS, updateWarpPreference, WARP_MODES } from "../relay.mjs";
 
 test("egressOrder: off is always local-only", () => {
 	assert.deepEqual(egressOrder("off", false), ["local"]);
@@ -357,6 +357,44 @@ test("egressOrder: auto starts local and elevates after a warp-only success", ()
 
 test("egressOrder: unknown mode falls back to off", () => {
 	assert.deepEqual(egressOrder("banana", false), ["local"]);
+});
+
+// ---------------------------------------------------------------------------
+// Local egress parking (S16, S17)
+// ---------------------------------------------------------------------------
+// A 429 on the LOCAL egress means that IP spent its day. `retry-after` says when
+// it resets, so the relay stops offering local first until then instead of
+// burning a real turn on a known-burnt IP. The window comes from the header —
+// never from midnight UTC, which is wrong in every other time zone.
+
+test("egressOrder: a parked local egress hands the first slot to warp", () => {
+	assert.deepEqual(egressOrder("auto", false, true), ["warp", "local"]);
+	assert.deepEqual(egressOrder("auto", true, true), ["warp", "local"]);
+});
+
+test("egressOrder: parking never removes local from the chain", () => {
+	// Deprioritised, not excluded: a dead WARP must still have somewhere to fall
+	// back to, and a request rejected by the gate costs no quota (S4).
+	assert.equal(egressOrder("auto", false, true).includes("local"), true);
+});
+
+test("egressOrder: parking cannot change off or on", () => {
+	assert.deepEqual(egressOrder("off", false, true), ["local"]);
+	assert.deepEqual(egressOrder("on", false, true), ["warp"]);
+});
+
+test("parkDurationMs: retry-after plus a margin", () => {
+	assert.equal(parkDurationMs("3600"), 3_600_000 + PARK_MARGIN_MS);
+	assert.equal(parkDurationMs("0"), PARK_MARGIN_MS);
+	assert.equal(PARK_MARGIN_MS, 10_000);
+});
+
+test("parkDurationMs: no usable header parks nothing", () => {
+	// Guessing the reset here is exactly the bug this replaces, so every shape
+	// that is not plain seconds parks nothing at all.
+	for (const value of [undefined, null, "", "   ", "later", "-60", "1.5", "3600s"]) {
+		assert.equal(parkDurationMs(value), undefined, `retry-after ${JSON.stringify(value)}`);
+	}
 });
 
 test("updateWarpPreference: auto elevates when warp was the final egress", () => {

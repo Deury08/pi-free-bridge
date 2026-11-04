@@ -6,6 +6,15 @@
 
 ## Unreleased
 
+- **Park a rate-limited local egress until its reset**: a `429` on the LOCAL
+  egress means that physical IP spent its day and the relay cannot rotate it,
+  so it now parks local until `retry-after` (read from that response, plus a 10s
+  margin) instead of offering it first turn after turn. Local is
+  deprioritised, never excluded — with WARP down the request still egresses
+  local and gets its `429` rather than a `502`, and a rejected request costs no
+  quota. `off` and `on` are unchanged, `/health` gains `localParkedForMs`, and
+  the state is in-memory only.
+
 - **`retry-after` forwarded on upstream errors**: a gate `429` carries the real
   seconds until the quota resets, and the relay used to drop it — only
   `content-type` was forwarded, so the client was left to guess midnight UTC

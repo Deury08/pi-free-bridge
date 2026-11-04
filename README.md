@@ -245,6 +245,27 @@ Con la rotación confirmada hace **un** reenvío, y nada más:
   `warpResendEnabled` (si el mecanismo está activo en este proceso).
 - `RELAY_WARP_RETRY_AFTER_RECYCLE=0` lo apaga del todo, sin tocar el resto.
 
+### Parking de la IP local
+
+Un `429` en el egress **local** no es lo mismo que uno en WARP: el relay no puede
+rotar la IP física de tu casa, así que la única salida honesta es esperar. Cuando
+el local devuelve `429`, el relay lee el `retry-after` **de esa misma respuesta**
+y no vuelve a ofrecer local primero hasta ese momento más 10s de margen.
+
+- El número sale siempre del header. Nunca de calcular medianoche UTC ni de
+  adivinar tu zona horaria.
+- Si el header falta o no es un entero de segundos, no se parkea nada: se
+  prefiere un intento de más antes que inventar un reset.
+- Local **no se saca** de la cadena, solo baja al segundo lugar: si WARP está
+  caído, el pedido igual sale por local y recibe su `429` en vez de un `502`. Un
+  request rechazado por el gate no consume cuota, así que ese fallback es gratis.
+- Solo aplica a `auto`. En `off` el orden sigue siendo solo local y en `on`
+  nunca se usa local.
+- `/health` publica `localParkedForMs`: 0 significa que local volvió a estar
+  disponible.
+- El estado vive en memoria: reiniciar el relay lo olvida y lo vuelve a aprender
+  con un request que no cuesta cuota.
+
 **Instalación desde Pi (opción 2):** si activás `auto` u `on` y no hay WARP vivo
 ni binario configurado, Pi abre un diálogo de confirmación y, si aceptás, descarga
 la última release de `github.com/Deury08/warp-minimal`, verifica su sha256 contra

@@ -80,7 +80,15 @@ ni de los caminos `auto` que hoy funcionan.
   de import: el helper se escribió primero con el comportamiento de hoy y los
   dos casos de `retry-after` quedaron rojos (89 verdes / 2 rojos); después
   91/91. Commit `fix(relay): forward retry-after on upstream errors`.
-- T4 (S16,S17): parking de la IP local leyendo `retry-after` + margen 10s, estado en memoria. Route: parent inline, test-first. Commit: `feat(relay): park a rate-limited local egress until its reset`.
+- T4 (S16,S17) DONE: `parkDurationMs()` puro lee `retry-after` de la respuesta
+  local y devuelve la ventana + `PARK_MARGIN_MS` (10s); un header ausente o no
+  entero no parkea nada. `egressOrder(mode, warpPreferred, localParked)`
+  depriorita local en `auto` sin sacarlo de la cadena (con WARP caído el pedido
+  sale igual por local y recibe su 429, no un 502; S4 dice que un rechazo no
+  cuesta cuota). Estado en memoria (`localParkedUntil`), expuesto en `/health`
+  como `localParkedForMs`. RED de comportamiento en dos ciclos (parking
+  ignorado; luego la aritmética del header) y finalmente 96/96. Commit
+  `feat(relay): park a rate-limited local egress until its reset`.
 - T5 (S2,S3) DONE 2026-11-04: la perilla `RELAY_WARP_RECYCLE_THRESHOLD` se eliminó (config muerta: un solo valor correcto), `needsWarpRecycle(streak, onCooldown)` rota en el primer warp 429, y README/CHANGELOG/`warp-auto-recycle.md` S4 se alinearon. Test-first: rojo observado con la firma nueva, verde 65/65 en `test/relay.test.mjs`. Commit `02ca375` (código) + el commit de documentación.
 - T6 (S19) DONE: guía visual de instalación en siete pasos con las capturas de `Imagenes/`, verificadas una por una contra el archivo en disco. Commit de documentación.
 - Verificación (S1-S18): tests de `off` intacto, disparador ancho, un solo reenvío, fallback al 429 original, cooldown tras 2xx. Los helpers puros se prueban en `test/relay.test.mjs`.
