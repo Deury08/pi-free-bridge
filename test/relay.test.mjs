@@ -359,13 +359,18 @@ test("egressOrder: unknown mode falls back to off", () => {
 });
 
 test("updateWarpPreference: auto elevates when warp was the final egress", () => {
-	assert.equal(updateWarpPreference("auto", "warp", true), true);
-	assert.equal(updateWarpPreference("auto", "local", true), false);
-	assert.equal(updateWarpPreference("off", "warp", true), false);
+	assert.equal(updateWarpPreference("auto", "warp", 200), true);
+	assert.equal(updateWarpPreference("auto", "local", 200), false);
+	assert.equal(updateWarpPreference("off", "warp", 200), false);
 });
 
-test("updateWarpPreference: a failure never elevates warp", () => {
-	assert.equal(updateWarpPreference("auto", "warp", false), false);
+test("updateWarpPreference: only a success status may elevate warp", () => {
+	// A 429 delivered via warp used to pin warp as preferred, because the call
+	// site passed `true` for `ok` unconditionally. The status is the argument
+	// now, so that mistake cannot be written again.
+	assert.equal(updateWarpPreference("auto", "warp", 429), false);
+	assert.equal(updateWarpPreference("auto", "warp", 500), false);
+	assert.equal(updateWarpPreference("auto", "warp", 200), true);
 });
 
 test("WARP_MODES: exactly off, auto, on", () => {
@@ -442,10 +447,15 @@ test("bumpWarp429Streak: only a warp-egress success resets it — a local fallba
 	assert.equal(bumpWarp429Streak(2, 502, "warp"), 2);
 });
 
-test("needsWarpRecycle: fires at the threshold, not during cooldown", () => {
-	assert.equal(needsWarpRecycle(2, 3, false), false);
-	assert.equal(needsWarpRecycle(3, 3, false), true);
-	assert.equal(needsWarpRecycle(5, 3, true), false);
+test("needsWarpRecycle: rotates on the FIRST warp 429, never during cooldown", () => {
+	// The meter has exactly one correct value: rotate on the first 429. Any
+	// larger threshold would deliver that many 429s before the exit rotates,
+	// which is strictly worse once the relay resends after a rotation.
+	assert.equal(needsWarpRecycle(0, false), false);
+	assert.equal(needsWarpRecycle(1, false), true);
+	assert.equal(needsWarpRecycle(4, false), true);
+	assert.equal(needsWarpRecycle(1, true), false);
+	assert.equal(needsWarpRecycle(9, true), false);
 });
 
 test("readFileWarpMode: tolerates a UTF-8 BOM in the config file", () => {

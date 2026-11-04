@@ -284,11 +284,13 @@ export function egressOrder(mode, warpPreferred) {
 }
 
 /** Pure: the next warp preference after one request.
- *  `used` names the egress that produced the final response, `ok` says whether
- *  it was not a rate limit. */
-export function updateWarpPreference(mode, used, ok) {
+ *  `used` names the egress that produced the final response, `status` is that
+ *  response's own HTTP status: only a success may elevate warp. Taking the
+ *  status rather than a boolean keeps the call site from hardcoding "ok",
+ *  which is exactly how a delivered 429 used to pin warp as preferred. */
+export function updateWarpPreference(mode, used, status) {
 	if (mode !== "auto") return false;
-	if (!ok) return false;
+	if (!(typeof status === "number" && status < 400)) return false;
 	return used === "warp";
 }
 
@@ -393,18 +395,15 @@ function refreshWarpMode(config) {
 }
 
 /** relay-warp-auto-recycle (user-approved): the opencode free gate counts
- *  quota per (session, egress IP). A 429 observed via the warp egress means
- *  that exit IP burnt its window, and only the proxy can re-enroll it. The
- *  relay counts 429s OBSERVED on the warp egress (even when a local fallback
- *  delivered the response) and fires a POST /recycle at the threshold —
- *  default 1, so the burnt IP rotates right away; the cooldown and
- *  RELAY_WARP_RECYCLE_THRESHOLD remain the burst-tolerance knobs. If the
- *  proxy does not expose that endpoint yet, the relay degrades: one warning,
- *  requests keep flowing exactly as before. Pure helpers exported for tests. */
-const RECYCLE_THRESHOLD = (() => {
-	const n = Number.parseInt(process.env.RELAY_WARP_RECYCLE_THRESHOLD ?? "", 10);
-	return Number.isInteger(n) && n > 0 ? n : 1;
-})();
+ *  quota per (session, egress IP) and per UTC day. A 429 observed via the warp
+ *  egress means that exit IP burnt its day, and only the proxy can re-enroll
+ *  it. The relay counts 429s OBSERVED on the warp egress (even when a local
+ *  fallback delivered the response) and rotates on the FIRST one — the meter
+ *  has a single correct value, so it is not configurable; only the cooldown
+ *  (`RELAY_WARP_RECYCLE_COOLDOWN_MS`) remains as the burst-tolerance knob. If
+ *  the proxy does not expose that endpoint yet, the relay degrades: one
+ *  warning, requests keep flowing exactly as before. Pure helpers exported
+ *  for tests. */
 const RECYCLE_COOLDOWN_MS = (() => {
 	const n = Number.parseInt(process.env.RELAY_WARP_RECYCLE_COOLDOWN_MS ?? "", 10);
 	return Number.isInteger(n) && n >= 0 ? n : 5 * 60_000;
@@ -421,21 +420,26 @@ export function bumpWarp429Streak(streak, status, egress) {
 	return streak;
 }
 
-/** Pure: fire when the streak reaches the threshold and not on cooldown. */
-export function needsWarpRecycle(streak, threshold = RECYCLE_THRESHOLD, onCooldown = false) {
-	return !onCooldown && streak >= threshold;
+/** Pure: rotate on the first warp 429 of a burst, never while cooling down. */
+export function needsWarpRecycle(streak, onCooldown = false) {
+	return !onCooldown && streak > 0;
 }
 
 let warp429Streak = 0;
 let warpRecycles = 0;
 let warpRecycleNotBefore = 0;
+let warpRecycleInFlight = false;
 let warpRecycleUnavailableWarned = false;
 
 async function maybeRecycleWarp(config) {
-	if (!needsWarpRecycle(warp429Streak, RECYCLE_THRESHOLD, Date.now() < warpRecycleNotBefore)) return;
+	// One recycle at a time: a burst of concurrent 429s must not stack POSTs.
+	// The cooldown is only armed once the proxy actually accepted the rotation —
+	// arming it up front burnt five minutes on a /recycle that never landed.
+	if (warpRecycleInFlight) return;
+	if (!needsWarpRecycle(warp429Streak, Date.now() < warpRecycleNotBefore)) return;
 	warp429Streak = 0;
-	warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
 	if (!config.warpProxy) return;
+	warpRecycleInFlight = true;
 	try {
 		const res = await fetch(`${config.warpProxy}/recycle`, {
 			method: "POST",
@@ -443,9 +447,10 @@ async function maybeRecycleWarp(config) {
 		});
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
 		await res.arrayBuffer();
+		warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
 		warpRecycles += 1;
 		process.stderr.write(
-			`pi-free-bridge relay: warp exit recycled (fresh egress IP) after ${RECYCLE_THRESHOLD} warp 429 response(s)\n`,
+			`pi-free-bridge relay: warp exit recycled (fresh egress IP) after a warp 429\n`,
 		);
 	} catch (err) {
 		const reason = err && err.message ? err.message : String(err);
@@ -459,10 +464,23 @@ async function maybeRecycleWarp(config) {
 			process.stderr.write(`pi-free-bridge relay: warp auto-recycle attempt failed — ${reason}
 `);
 		}
+	} finally {
+		warpRecycleInFlight = false;
 	}
 }
 
+/** S13: marks a client that went away before the response finished. `close`
+ *  also fires after a normal finish, so the `writableEnded` guard matters. */
+function trackClient(res) {
+	const tracker = { gone: false };
+	res.on("close", () => {
+		if (!res.writableEnded) tracker.gone = true;
+	});
+	return tracker;
+}
+
 async function forward(req, res, pathname, config) {
+	const client = trackClient(res);
 	try {
 		const raw = await readBody(req);
 		const incoming = JSON.parse(raw);
@@ -548,7 +566,7 @@ async function forward(req, res, pathname, config) {
 			sendJson(res, 502, { error: { message } });
 			return;
 		}
-		warpPreferred = updateWarpPreference(config.warpMode, lastEgress, true);
+		warpPreferred = updateWarpPreference(config.warpMode, lastEgress, response.status);
 
 		// S20: status and content-type pass through, the body is piped unparsed.
 		const headers = {};
@@ -586,6 +604,11 @@ async function forward(req, res, pathname, config) {
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
+			if (client.gone) {
+				// Nobody is listening: stop draining the upstream into a dead socket.
+				await reader.cancel();
+				return;
+			}
 			res.write(Buffer.from(value));
 		}
 		res.end();
