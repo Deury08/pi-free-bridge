@@ -521,6 +521,25 @@ let warpRecycleUnavailableWarned = false;
 // only — a restart re-learns it with one request that costs no quota (S4).
 let localParkedUntil = 0;
 
+// How many responses we are DELIVERING right now over the warp tunnel — not how
+// many requests are in flight. The distinction is the whole point: a rotation
+// replaces the exit, and that kills every stream multiplexed over it. A response
+// we already hold has passed the gate and will complete on its own, so it is
+// worth protecting. A request still waiting for headers on a burnt IP will get
+// its own 429 no matter what we do, so waiting for that one buys nothing.
+// Counting ours is also the only honest source: the proxy publishes
+// `streams=N`, but it lags (it reports 1 on an idle bridge).
+let deliveringWarpStreams = 0;
+
+/** The valve on the drain wait, and it is a valve, not a budget. The wait itself
+ *  has no clock: a peer that takes 40s to finish gets its 40s. This only exists
+ *  so a stream that hangs forever cannot trap the request that ate the 429 — Pi
+ *  gives up at 5 minutes, so 2 of them is already past the point of no return
+ *  and well short of losing both turns. */
+const DRAIN_VALVE_MS = 120_000;
+const DRAIN_POLL_MS = 50;
+let drainValveMs = DRAIN_VALVE_MS;
+
 // ---------------------------------------------------------------------------
 // Test-only hooks (test/relay.test.mjs)
 // ---------------------------------------------------------------------------
@@ -540,6 +559,7 @@ export function resetWarpStateForTests() {
 	warpPreferred = false;
 	lastEgress = undefined;
 	localParkedUntil = 0;
+	deliveringWarpStreams = 0;
 }
 
 /** Test-only: the state `/health` reports, without standing a server up. */
@@ -553,15 +573,23 @@ export function warpStateForTests() {
 		warpPreferred,
 		lastEgress,
 		localParkedUntil,
+		deliveringWarpStreams,
 	};
 }
 
 /** Test-only: shrink the rotation window; a real rotation poll would cost the
  *  suite 10s per case. Called with no arguments it restores the production
- *  defaults (10_000ms timeout, 250ms poll), which are the contract. */
-export function setWarpRotationTimingForTests(timeoutMs, pollMs) {
+ *  defaults (10_000ms timeout, 250ms poll, 120_000ms drain valve), which are the
+ *  contract. */
+export function setWarpRotationTimingForTests(timeoutMs, pollMs, valveMs) {
 	rotationTimeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : ROTATION_TIMEOUT_MS;
 	rotationPollMs = Number.isFinite(pollMs) ? pollMs : ROTATION_POLL_MS;
+	drainValveMs = Number.isFinite(valveMs) ? valveMs : DRAIN_VALVE_MS;
+}
+
+/** Test-only: pretend `count` responses are being delivered over warp now. */
+export function setDeliveringStreamsForTests(count) {
+	deliveringWarpStreams = Number.isFinite(count) ? count : 0;
 }
 
 async function maybeRecycleWarp(config) {
@@ -570,8 +598,19 @@ async function maybeRecycleWarp(config) {
 	// arming it up front burnt five minutes on a /recycle that never landed.
 	if (warpRecycleInFlight) return;
 	if (!needsWarpRecycle(warp429Streak, Date.now() < warpRecycleNotBefore)) return;
-	warp429Streak = 0;
 	if (!config.warpProxy) return;
+	// This is the everyday `auto` rotation: a warp 429 the chain already absorbed
+	// (warp 429, then a local success) lands here, not in the resend path. The
+	// wait belongs to the POST, not to one of its callers, so it happens here too
+	// — and still before the POST, never after.
+	// No `client` is passed on purpose: this rotation repairs the exit for every
+	// later request, not to serve a resend, so a caller that left is not a reason
+	// to leave the burnt IP in place.
+	if (!(await drainBeforeRotation())) return;
+	// The wait is an await: a peer may have rotated meanwhile.
+	if (warpRecycleInFlight) return;
+	if (!needsWarpRecycle(warp429Streak, Date.now() < warpRecycleNotBefore)) return;
+	warp429Streak = 0;
 	warpRecycleInFlight = true;
 	try {
 		const res = await fetch(`${config.warpProxy}/recycle`, {
@@ -617,6 +656,38 @@ async function readWarpHealth(config) {
 	}
 }
 
+/** Wait until nothing is being delivered over the warp tunnel, because the
+ *  POST that follows tears the tunnel down. No clock on the wait itself — only
+ *  the valve, which is there for a stream that hung, not for a peer that is
+ *  slow. Returns whether the rotation may proceed.
+ *  `client` is the request that asked for the rotation. If it left, nobody is
+ *  waiting for the resend, so rotating up to two minutes later would only cost
+ *  the other tenants their own retry. */
+async function drainBeforeRotation(client) {
+	if (deliveringWarpStreams <= 0) return true;
+	const startedAt = Date.now();
+	const valve = startedAt + drainValveMs;
+	let valveHit = false;
+	while (deliveringWarpStreams > 0) {
+		if (client && client.gone) {
+			process.stderr.write(
+				`pi-free-bridge relay: client left ${Date.now() - startedAt}ms into the drain wait — not rotating\n`,
+			);
+			return false;
+		}
+		if (Date.now() >= valve) {
+			valveHit = true;
+			break;
+		}
+		await new Promise((resolve) => setTimeout(resolve, DRAIN_POLL_MS));
+	}
+	const stuck = valveHit ? `, ${deliveringWarpStreams} still delivering — valve hit` : "";
+	process.stderr.write(
+		`pi-free-bridge relay: waited ${Date.now() - startedAt}ms for in-flight warp responses before rotating${stuck}\n`,
+	);
+	return true;
+}
+
 /** Rotate the warp exit and wait until the rotation is CONFIRMED (S6). Returns
  *  true only then: an unconfirmed rotation must not buy a resend, because the
  *  resend would leave through the same burnt IP and burn the one attempt.
@@ -636,6 +707,19 @@ export async function rotateWarpExit(config, client) {
 	}
 	if (warpRecycleInFlight) return false;
 	if (!config.warpProxy) return false;
+	// The wait runs BEFORE the guard is taken: holding `warpRecycleInFlight` for
+	// the whole drain would stretch every peer's "no resend" window from one
+	// rotation (~12s) to one drain (~2 minutes), and a peer that ate its own 429
+	// meanwhile has no second chance.
+	if (!(await drainBeforeRotation(client))) return false;
+	// The wait is an await: a peer may have rotated while we held on.
+	if (Date.now() < warpRecycleNotBefore) {
+		process.stderr.write(
+			`pi-free-bridge relay: a warp rotation completed during the drain wait — delivering the original 429\n`,
+		);
+		return false;
+	}
+	if (warpRecycleInFlight) return false;
 	warpRecycleInFlight = true;
 	// This rotation pays for the 429s that asked for it.
 	warp429Streak = 0;
@@ -751,8 +835,11 @@ function trackClient(res) {
 	return tracker;
 }
 
-async function forward(req, res, pathname, config) {
+// Exported for the request-path tests: the counter and the drain order are only
+// observable from a real `forward()` call.
+export async function forward(req, res, pathname, config) {
 	const client = trackClient(res);
+	let countedDelivering = false;
 	try {
 		const raw = await readBody(req);
 		const incoming = JSON.parse(raw);
@@ -866,6 +953,16 @@ async function forward(req, res, pathname, config) {
 			if (resend.egress) egressUsed = resend.egress;
 		}
 
+		// Count this response for as long as it is being delivered over warp. A
+		// rotation would kill it, and it already passed the gate, so it is exactly
+		// what the drain wait protects. Counted BEFORE the rotation below, so that no
+		// await added between here and there can leave a fresh delivery invisible.
+		// Errors are not counted: they are short and not worth making a wait for.
+		if (response && egressUsed === "warp" && response.status < 400) {
+			deliveringWarpStreams += 1;
+			countedDelivering = true;
+		}
+
 		// relay-warp-auto-recycle: evaluate after the whole chain, and whatever
 		// we deliver — a fully rate-limited chain (502 below) still rotates the
 		// burnt exit before the client retries.
@@ -935,6 +1032,8 @@ async function forward(req, res, pathname, config) {
 		res.end();
 	} catch (err) {
 		sendJson(res, 502, { error: { message: err && err.message ? err.message : String(err) } });
+	} finally {
+		if (countedDelivering) deliveringWarpStreams -= 1;
 	}
 }
 

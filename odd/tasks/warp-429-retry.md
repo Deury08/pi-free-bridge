@@ -67,6 +67,19 @@ ni de los caminos `auto` que hoy funcionan.
   descarga, elegir modo, elegir modelo, usarlo. La instalación tiene que ser
   fácil para alguien que nunca vio el repo.
 
+- S20 Antes de rotar, el relay espera a que no queden respuestas **entregándose**
+  por warp: un request que ya pasó el gate se completa solo, y rotar lo mata sin
+  necesidad. La espera no tiene reloj; `DRAIN_VALVE_MS` (120s) es una válvula por
+  si un stream queda colgado, no un presupuesto. El `POST /recycle` va siempre
+  **después** de esa espera: mandarlo antes derrumba el túnel y la espera no
+  salva nada. Cuenta solo respuestas aceptadas (`<400`), porque un request que
+  todavía espera headers va a comerse su propio 429 en la IP quemada y esperarlo
+  no compra nada. Vale para los dos caminos de rotación: el reenvío y la rotación
+  automática de `auto` (streak) que dispara cuando el 429 de warp ya cayó a un
+  local exitoso. Si el cliente del 429 ya se fue, no se rota: nadie va a
+  reenviar y esperar para después tirar el túnel le costaría el reintento a los
+  demás.
+
 ## Tasks
 
 - T1 (S11,S12,S13) DONE. Commit `02ca375`. `updateWarpPreference` recibe el
@@ -74,7 +87,12 @@ ni de los caminos `auto` que hoy funcionan.
   con guarda de in-flight, y un cliente que se va a mitad del stream cancela el
   reader en vez de drenarlo. RED observado en ambos contratos, suite 65/65.
   S14 se movió a T2: es plomería que solo usa el poll de readiness.
-- T2 (S5,S6,S7,S8,S10,S14,S18) DONE: retry tras rotación confirmada — poll de health, reenvío único, fallback al 429 original, disparador ancho, kill switch. Route: gentle-ai-worker + gentle-ai-verify (concurrencia). Commit: `feat(relay): resend once after a confirmed warp exit rotation`. Test-first: rojo observado (el import de los helpers nuevos no existía) y verde 78/78 en `test/relay.test.mjs` (65 existentes + 13 nuevos). Archivos: `relay.mjs`, `index.ts`, `test/relay.test.mjs`, `README.md`, `CHANGELOG.md`.
+- T2 (S5,S6,S7,S8,S10,S14,S18,S20) DONE: retry tras rotación confirmada — poll de health, reenvío único, fallback al 429 original, disparador ancho, kill switch. Route: gentle-ai-worker + gentle-ai-verify (concurrencia). Commit: `feat(relay): resend once after a confirmed warp exit rotation`. Test-first: rojo observado (el import de los helpers nuevos no existía) y verde 78/78 en `test/relay.test.mjs` (65 existentes + 13 nuevos). Archivos: `relay.mjs`, `index.ts`, `test/relay.test.mjs`, `README.md`, `CHANGELOG.md`.
+  
+  S20 se agregó después (L33-L36): contador propio de respuestas EN ENTREGA
+  (no requests en vuelo), espera sin reloj antes del `POST /recycle`, válvula de
+  120s. Dos tests lo pinnean (espera al peer; la válvula suelta al turno trabado)
+  y los dos quedaron rojos al anular la espera. Suite: 98/98.
 - T3 (S15) DONE: `forwardedHeaders()` puro reemplaza el copiado inline de
   `content-type` en `forward()` y suma `retry-after`. RED de comportamiento, no
   de import: el helper se escribió primero con el comportamiento de hoy y los
@@ -175,3 +193,31 @@ ni de los caminos `auto` que hoy funcionan.
   `gentle-ai-verify` porque el cambio toca estado mutable compartido entre
   handlers concurrentes (item 4). T3 y T4 siguen inline por tamaño y
   dependencia, no por preferencia.
+- L30 (verbatim): "Riesgo residual aceptado: /recycle corta todos los streams del proxy, no solo el del request que lo pidió. Si tenés dos turnos en vuelo y uno come un 429, la rotación puede abortar el otro. explica esto"
+- L31 (verbatim): "escogeria la 1 pero no termino de entender"
+- L32 (verbatim): "noentendi todo pero si hay un 429 entiendo que aunque haya uan secion hay que cambiar la ip porque igual no va a funcionar , entonces cmo entra aqui lo que me exolicas?"
+- L33 Corrección del usuario, y es la clave de S20: un `429` es un veredicto en la
+  puerta, no un interruptor que invalide lo ya aceptado. Un request que todavía
+  espera headers en la IP quemada está condenado (S4: probar cuesta un
+  round-trip, no cuota), pero una respuesta que ya entró pasó `check()` y se va a
+  completar sola. Rotar mata lo segundo. El primer diseño contaba los dos y
+  esperaba un tope de 2s: mal en las dos puntas.
+- L34 (verbatim): "pero si no se hace por tiempo, todas las solicitudes pasan por free bridge, asi que e sabe si hay una peticion en medio,asi que si ha una peticion en medio esperar que termine , pedir nueva ip y continuar normlmete, esto si ya se envio la solicitud de ka nueva io, dime si cuadra"
+- L35 Corrección aceptada de L34 (S20): sin reloj. Todas las requests pasan por el
+  relay, así que el contador es nuestro y no hace falta adivinar. El orden importa
+  y el usuario lo marcó: la espera va ANTES del `POST /recycle`; mandarlo primero
+  derrumba el túnel y después no hay nada que salvar. Se conserva una válvula
+  (`DRAIN_VALVE_MS`, 120s) porque sin tope un stream colgado cuelga también el
+  turno del 429, y Pi lo mata a los 5 minutos: se perderían los dos.
+- L36 (verbatim): "si me gusta, dale"
+- L37 Verificador independiente sobre `bea829d`: dos bloqueantes que la suite no veía.
+  (a) El `POST /recycle` de `maybeRecycleWarp` no esperaba nada, y ese es el camino
+  normal de `auto` (warp 429 -> local 200): el "siempre después de la espera" del
+  mensaje de commit era falso. (b) La espera no miraba `client.gone`: un cliente que
+  abandonaba igual tiraba el túnel hasta 120s después y retenía el guard. Además, el
+  guard single-flight tomado durante la espera estiraba de ~12s a ~134s la ventana en
+  que otro 429 pierde su reenvío. Arreglado: espera compartida
+  `drainBeforeRotation(client)` usada por los dos caminos, aborto si el cliente se
+  fue, y el guard se toma DESPUÉS de la espera. Cuatro tests nuevos (orden del POST
+  por timestamp, un solo POST con dos 429, contador por `forward()` real, cliente
+  ido); los cuatro quedan rojos al anular su arreglo. Suite: 103/103.

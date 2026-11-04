@@ -6,6 +6,19 @@
 
 ## Unreleased
 
+- **Rotation waits for in-flight WARP deliveries**: `/recycle` replaces the exit,
+  and that kills every stream multiplexed over it. A response that already
+  passed the gate completes on its own, so the relay now waits until nothing is
+  being delivered over WARP before rotating — no clock on that wait, only a
+  120s valve for a hung stream (well under Pi's 5-minute idle timeout). The
+  `POST /recycle` goes *after* the wait: sending it first tears the tunnel down
+  and makes the wait pointless. Only accepted responses (`status < 400`) are
+  counted; a request still waiting for headers already gets its own `429` on the
+  burnt IP and waiting for it would buy nothing. Both rotation paths wait — the
+  resend and the `auto` streak rotation that fires when a warp 429 already fell
+  back to a local success — and a client that already left aborts the rotation
+  instead of costing every other tenant its retry.
+
 - **Park a rate-limited local egress until its reset**: a `429` on the LOCAL
   egress means that physical IP spent its day and the relay cannot rotate it,
   so it now parks local until `retry-after` (read from that response, plus a 10s

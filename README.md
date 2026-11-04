@@ -228,6 +228,20 @@ un pool sano, así que no prueba que el recycle haya corrido.
 
 Con la rotación confirmada hace **un** reenvío, y nada más:
 
+- Antes de rotar — por los **dos** caminos: el reenvío y la rotación automática
+  de `auto` cuando la cadena cayó al local — espera a que no queden respuestas
+  **entregándose** por WARP. Un
+  request que ya pasó el gate se completa solo; rotar lo mataría sin necesidad.
+  La espera no tiene reloj — si el otro tarda 40 segundos, esperás 40. Solo hay
+  una válvula de **120s** por si un stream quedó colgado, y cuando se dispara lo
+  deja escrito en el log. Un request que todavía espera headers no se cuenta:
+  esa IP ya está quemada y se va a comer su propio `429` igual.
+- El `POST /recycle` va **después** de esa espera. Si se manda antes, el túnel ya
+  se está cayendo y esperar no salva nada.
+- Si el cliente que comió el `429` ya se fue, no se rota: nadie va a reenviar,
+  y esperar para después tirar el túnel solo le costaría el reintento a los
+  demás.
+
 - Sale siempre por el egress WARP, porque la IP nueva vive ahí sin importar el
   orden que haya usado `auto` (el disparador es todo el request: basta un `429`
   observado en WARP, aunque después un fallback local haya respondido).

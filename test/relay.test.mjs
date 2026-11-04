@@ -522,6 +522,7 @@ import {
 	resetWarpStateForTests,
 	resendAfterRotation,
 	rotateWarpExit,
+	setDeliveringStreamsForTests,
 	setWarpRotationTimingForTests,
 	warpHealthState,
 	warpHealthUrl,
@@ -902,6 +903,79 @@ test("resendAfterRotation: it reports the egress instead of writing the module g
 	);
 });
 
+test("rotateWarpExit: a rotation waits for the responses still being delivered", async () => {
+	// A rotation replaces the exit, and replacing it kills every response riding
+	// that tunnel. One that already passed the gate is going to succeed on its
+	// own, so it is worth the wait. The request that ate the 429 is not counted:
+	// it holds an error, not a delivery.
+	const nextHealth = recyclingThenQuiet();
+	const stderr = [];
+	const originalWrite = process.stderr.write;
+	process.stderr.write = (chunk) => (stderr.push(String(chunk)), true);
+	try {
+		await driveWarp(
+			(call) => {
+				if (call.url.endsWith("/health")) return healthJson(nextHealth());
+				return new Response("", { status: 200 });
+			},
+			async (fake) => {
+				setWarpRotationTimingForTests(500, 1, 10_000);
+				setDeliveringStreamsForTests(1);
+				const peerFinishes = setTimeout(() => setDeliveringStreamsForTests(0), 120);
+				const startedAt = Date.now();
+				const confirmed = await rotateWarpExit(WARP_CONFIG, undefined);
+				const elapsed = Date.now() - startedAt;
+				clearTimeout(peerFinishes);
+
+				assert.equal(confirmed, true);
+				assert.equal(recyclePosts(fake.calls).length, 1);
+				assert.ok(elapsed >= 100, `it waited for the peer, took ${elapsed}ms`);
+				assert.ok(
+					stderr.some((line) => line.includes("waited") && line.includes("in-flight warp responses")),
+					"the wait is observable in stderr",
+				);
+			},
+		);
+	} finally {
+		process.stderr.write = originalWrite;
+	}
+});
+
+test("rotateWarpExit: the drain valve releases a rotation the wait would trap", async () => {
+	// A stream that never finishes must not take the request that ate the 429
+	// down with it. The valve is that escape hatch, and it says so on stderr.
+	const nextHealth = recyclingThenQuiet();
+	const stderr = [];
+	const originalWrite = process.stderr.write;
+	process.stderr.write = (chunk) => (stderr.push(String(chunk)), true);
+	try {
+		await driveWarp(
+			(call) => {
+				if (call.url.endsWith("/health")) return healthJson(nextHealth());
+				return new Response("", { status: 200 });
+			},
+			async (fake) => {
+				setWarpRotationTimingForTests(500, 1, 80);
+				setDeliveringStreamsForTests(3);
+				const startedAt = Date.now();
+				const confirmed = await rotateWarpExit(WARP_CONFIG, undefined);
+				const elapsed = Date.now() - startedAt;
+
+				assert.equal(confirmed, true, "the rotation still happens");
+				assert.equal(recyclePosts(fake.calls).length, 1);
+				assert.ok(elapsed < 1_500, `the valve bounded it, took ${elapsed}ms`);
+				assert.ok(
+					stderr.some((line) => line.includes("valve hit")),
+					"a trapped rotation is visible in stderr",
+				);
+			},
+		);
+	} finally {
+		process.stderr.write = originalWrite;
+		setWarpRotationTimingForTests();
+	}
+});
+
 // ---------------------------------------------------------------------------
 // Forwarded upstream headers (S15)
 // ---------------------------------------------------------------------------
@@ -1219,5 +1293,291 @@ test("relayEnv: RELAY_WARP_HEALTH_PATH carries the resolved target and never a s
 		assert.notEqual(env.RELAY_WARP_HEALTH_PATH, "/bogus", "a stale inherited value must be replaced");
 	} finally {
 		delete process.env.RELAY_WARP_HEALTH_PATH;
+	}
+});
+
+// ---------------------------------------------------------------------------
+// The drain wait, end to end (S20)
+// ---------------------------------------------------------------------------
+// The two tests above pin the wait itself. These pin the things the first
+// version of this change got wrong and the suite still passed: the POST must
+// come AFTER the wait, only one POST may exist per rotation, and the counter is
+// only correct if a real `forward()` increments and releases it on every exit
+// path. `forward` is exported for exactly this.
+
+import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
+import { forward } from "../relay.mjs";
+
+test("rotateWarpExit: /recycle is posted only after the drain wait (S20)", async () => {
+	// Asserting `elapsed >= 100` is not enough: a POST-then-wait implementation
+	// satisfies it. Only the POST's own timestamp does.
+	const nextHealth = recyclingThenQuiet();
+	const postedAt = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		const u = String(url);
+		if (u.endsWith("/health")) return healthJson(nextHealth());
+		if (u.endsWith("/recycle")) {
+			postedAt.push(Date.now());
+			return new Response("", { status: 200 });
+		}
+		return new Response("", { status: 200 });
+	};
+	try {
+		resetWarpStateForTests();
+		setWarpRotationTimingForTests(500, 1, 5_000);
+		setDeliveringStreamsForTests(1);
+		const peerFinishes = setTimeout(() => setDeliveringStreamsForTests(0), 120);
+		const startedAt = Date.now();
+		const confirmed = await rotateWarpExit(WARP_CONFIG, undefined);
+		clearTimeout(peerFinishes);
+
+		assert.equal(confirmed, true);
+		assert.equal(postedAt.length, 1);
+		const postedAfter = postedAt[0] - startedAt;
+		assert.ok(postedAfter >= 100, `POST /recycle came ${postedAfter}ms in — it must come after the wait`);
+	} finally {
+		globalThis.fetch = originalFetch;
+		setWarpRotationTimingForTests();
+		resetWarpStateForTests();
+	}
+});
+
+test("rotateWarpExit: a client that left does not hold a rotation hostage (S20)", async () => {
+	// Nobody is waiting for the resend, so waiting out a peer and then tearing
+	// the tunnel down would cost the other tenants their own retry for a turn
+	// that is already abandoned. The wait stops, and no POST leaves.
+	const nextHealth = recyclingThenQuiet();
+	try {
+		await driveWarp(
+			(call) => {
+				if (call.url.endsWith("/health")) return healthJson(nextHealth());
+				return new Response("", { status: 200 });
+			},
+			async (fake) => {
+				setWarpRotationTimingForTests(500, 1, 10_000);
+				setDeliveringStreamsForTests(1); // a peer that never finishes
+				const startedAt = Date.now();
+				const confirmed = await rotateWarpExit(WARP_CONFIG, { gone: true });
+				const elapsed = Date.now() - startedAt;
+
+				assert.equal(confirmed, false, "no resend for a client that is gone");
+				assert.equal(recyclePosts(fake.calls).length, 0, "the tunnel is not torn down");
+				assert.ok(elapsed < 1_000, `it did not wait out the valve, took ${elapsed}ms`);
+			},
+		);
+	} finally {
+		setWarpRotationTimingForTests();
+	}
+});
+
+test("rotateWarpExit: a second 429 during the drain gets no second POST (C7)", async () => {
+	// The wait must not hold the single-flight guard: that would stretch every
+	// peer's "no resend" window from one rotation to one drain. The guard is
+	// taken after the wait, so the peer still loses its resend — as it always
+	// did — but only for the POST, not for the whole drain.
+	const nextHealth = recyclingThenQuiet();
+	const posts = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		const u = String(url);
+		if (u.endsWith("/health")) return healthJson(nextHealth());
+		if (u.endsWith("/recycle")) {
+			posts.push(u);
+			return new Response("", { status: 200 });
+		}
+		return new Response("", { status: 200 });
+	};
+	try {
+		resetWarpStateForTests();
+		setWarpRotationTimingForTests(500, 1, 5_000);
+		setDeliveringStreamsForTests(1);
+		const peerFinishes = setTimeout(() => setDeliveringStreamsForTests(0), 150);
+		const first = rotateWarpExit(WARP_CONFIG, undefined);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const second = await rotateWarpExit(WARP_CONFIG, undefined);
+		assert.equal(await first, true);
+		clearTimeout(peerFinishes);
+
+		assert.equal(second, false, "the loser delivers its original 429 instead of stacking a rotation");
+		assert.equal(posts.length, 1, "exactly one POST /recycle across both callers");
+	} finally {
+		globalThis.fetch = originalFetch;
+		setWarpRotationTimingForTests();
+		resetWarpStateForTests();
+	}
+});
+
+function fakeRelayRes() {
+	const res = new EventEmitter();
+	res.headersSent = false;
+	res.writableEnded = false;
+	res.status = 0;
+	const chunks = [];
+	res.writeHead = (status) => {
+		res.status = status;
+		res.headersSent = true;
+		return res;
+	};
+	res.write = (chunk) => (chunks.push(Buffer.from(chunk)), true);
+	res.end = (chunk) => {
+		if (chunk) chunks.push(Buffer.from(chunk));
+		res.writableEnded = true;
+		res.emit("close");
+		return res;
+	};
+	res.body = () => Buffer.concat(chunks).toString("utf8");
+	return res;
+}
+
+const fakeReq = (payload) => Readable.from([Buffer.from(JSON.stringify(payload))]);
+const FORWARD_CONFIG = { ...WARP_CONFIG, cwd: ".", warpMode: "on", sessionSource: "test" };
+
+test("forward: a warp delivery is counted once and released on every exit path (S20)", async () => {
+	// C1/C2/C4/C5 have no coverage from the tests above: they set the counter by
+	// hand instead of earning it. A leaked or double-decremented counter would
+	// pass everything else and hang or free a rotation at the wrong moment.
+	const originalFetch = globalThis.fetch;
+	let ctrl;
+	let upstreamStatus = 200;
+	let duringRotation = -1;
+	const install = (status) => {
+		upstreamStatus = status;
+		globalThis.fetch = async (url) => {
+			const u = String(url);
+			if (u.endsWith("/recycle")) {
+				duringRotation = warpStateForTests().deliveringWarpStreams;
+				return new Response("", { status: 200 });
+			}
+			if (u.endsWith("/health")) return new Response(JSON.stringify({ recycling: false, exits: ["warp-a"] }));
+			if (upstreamStatus >= 400) return new Response(GATE_429_BODY, { status: upstreamStatus });
+			return new Response(new ReadableStream({ start(c) { ctrl = c; } }), {
+				status: upstreamStatus,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+	};
+	try {
+		// A held-open delivery counts once and is released when it ends.
+		resetWarpStateForTests();
+		install(200);
+		let res = fakeRelayRes();
+		let done = forward(fakeReq({ marker: "held" }), res, RESEND_PATH, FORWARD_CONFIG);
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(warpStateForTests().deliveringWarpStreams, 1, "a held-open warp response is counted once");
+		ctrl.enqueue(Buffer.from("data: x\n\n"));
+		await new Promise((r) => setTimeout(r, 10));
+		assert.equal(warpStateForTests().deliveringWarpStreams, 1, "still counted while delivering");
+		ctrl.close();
+		await done;
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0, "released when the upstream stream ends");
+		assert.equal(res.status, 200);
+
+		// A client that walks away releases it exactly once.
+		resetWarpStateForTests();
+		install(200);
+		res = fakeRelayRes();
+		done = forward(fakeReq({ marker: "gone" }), res, RESEND_PATH, FORWARD_CONFIG);
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(warpStateForTests().deliveringWarpStreams, 1);
+		res.emit("close");
+		ctrl.enqueue(Buffer.from("data: y\n\n"));
+		await done;
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0, "a disconnect releases the count exactly once");
+
+		// The request that ate the 429 never counts itself.
+		resetWarpStateForTests();
+		setWarpRotationTimingForTests(150, 1, 5_000);
+		duringRotation = -1;
+		install(429);
+		res = fakeRelayRes();
+		await forward(fakeReq({ marker: "429" }), res, RESEND_PATH, FORWARD_CONFIG);
+		assert.equal(duringRotation, 0, "the request that ate the 429 never counts itself");
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+		assert.equal(res.status, 429);
+
+		// Off-tunnel traffic never enters the wait.
+		resetWarpStateForTests();
+		install(200);
+		res = fakeRelayRes();
+		done = forward(fakeReq({ marker: "local" }), res, RESEND_PATH, { ...FORWARD_CONFIG, warpMode: "off" });
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0, "local traffic never enters the drain wait");
+		res.emit("close");
+		ctrl.enqueue(Buffer.from("data: z\n\n"));
+		await done;
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+	} finally {
+		globalThis.fetch = originalFetch;
+		setWarpRotationTimingForTests();
+		resetWarpStateForTests();
+	}
+});
+
+test("maybeRecycleWarp: the auto fallback rotation waits too (S20)", async () => {
+	// `auto` with warp first is the everyday path: warp 429, then a local 200.
+	// That rotation comes from the streak, not from the resend path, and it POSTs
+	// from a different place. The wait has to live next to the POST, not inside
+	// one of its callers — this is the hole the first version of the change left.
+	const originalFetch = globalThis.fetch;
+	const postedAt = [];
+	let warpStatus = 200;
+	// `warp` is preferred in `auto` only after a turn that SUCCEEDED through it,
+	// so the warm-up has to be a local failure answered by warp.
+	let localStatus = 200;
+	globalThis.fetch = async (url, opts = {}) => {
+		const u = String(url);
+		if (u.endsWith("/recycle")) {
+			postedAt.push(Date.now());
+			return new Response("", { status: 200 });
+		}
+		if (u.endsWith("/health")) return new Response(JSON.stringify({ recycling: false, exits: ["warp-a"] }));
+		// warp and local hit the SAME upstream URL: the egress is the proxy option.
+		if (opts.proxy) {
+			if (warpStatus >= 400) return new Response(GATE_429_BODY, { status: warpStatus });
+			return new Response(
+				new ReadableStream({
+					start(c) {
+						c.enqueue(Buffer.from("data: w\n\n"));
+						c.close();
+					},
+				}),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}
+		if (localStatus >= 400) return new Response("{\"type\":\"rate_limit\"}", { status: localStatus });
+		return new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } });
+	};
+	try {
+		resetWarpStateForTests();
+		setWarpRotationTimingForTests(150, 1, 5_000);
+		const autoConfig = { ...FORWARD_CONFIG, warpMode: "auto" };
+
+		// Earn `warpPreferred`: local fails, warp answers, so the next turn starts
+		// with warp first — the everyday `auto` state.
+		localStatus = 429;
+		let res = fakeRelayRes();
+		await forward(fakeReq({ marker: "warm" }), res, RESEND_PATH, autoConfig);
+		assert.equal(res.status, 200, "warp answered the warm-up");
+		assert.equal(warpStateForTests().warpPreferred, true, "auto now prefers warp");
+
+		localStatus = 200;
+		warpStatus = 429;
+		setDeliveringStreamsForTests(1);
+		const peerFinishes = setTimeout(() => setDeliveringStreamsForTests(0), 120);
+		res = fakeRelayRes();
+		const startedAt = Date.now();
+		await forward(fakeReq({ marker: "fallback" }), res, RESEND_PATH, autoConfig);
+		clearTimeout(peerFinishes);
+
+		assert.equal(res.status, 200, "the local fallback delivered");
+		assert.equal(postedAt.length, 1, "the burnt exit was rotated");
+		const postedAfter = postedAt[0] - startedAt;
+		assert.ok(postedAfter >= 100, `POST /recycle came ${postedAfter}ms in — the streak rotation must wait too`);
+	} finally {
+		globalThis.fetch = originalFetch;
+		setWarpRotationTimingForTests();
+		resetWarpStateForTests();
 	}
 });
