@@ -6,6 +6,12 @@
 
 ## Unreleased
 
+- **`retry-after` forwarded on upstream errors**: a gate `429` carries the real
+  seconds until the quota resets, and the relay used to drop it — only
+  `content-type` was forwarded, so the client was left to guess midnight UTC
+  (wrong for every other time zone). Status, `content-type` and `retry-after`
+  now pass through; every other upstream header still stays upstream.
+
 - **Resend once after a confirmed WARP exit rotation**: a response that would
   deliver a gate `429` now rotates the WARP exit and, only once that rotation is
   confirmed (`recycling` was observed during the poll, or `exits[]` changed

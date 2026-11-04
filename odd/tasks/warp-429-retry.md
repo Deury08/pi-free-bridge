@@ -75,7 +75,11 @@ ni de los caminos `auto` que hoy funcionan.
   reader en vez de drenarlo. RED observado en ambos contratos, suite 65/65.
   S14 se movió a T2: es plomería que solo usa el poll de readiness.
 - T2 (S5,S6,S7,S8,S10,S14,S18) DONE: retry tras rotación confirmada — poll de health, reenvío único, fallback al 429 original, disparador ancho, kill switch. Route: gentle-ai-worker + gentle-ai-verify (concurrencia). Commit: `feat(relay): resend once after a confirmed warp exit rotation`. Test-first: rojo observado (el import de los helpers nuevos no existía) y verde 78/78 en `test/relay.test.mjs` (65 existentes + 13 nuevos). Archivos: `relay.mjs`, `index.ts`, `test/relay.test.mjs`, `README.md`, `CHANGELOG.md`.
-- T3 (S15): forward del header `retry-after` al cliente. Route: parent inline. Commit: `fix(relay): forward retry-after on upstream errors`.
+- T3 (S15) DONE: `forwardedHeaders()` puro reemplaza el copiado inline de
+  `content-type` en `forward()` y suma `retry-after`. RED de comportamiento, no
+  de import: el helper se escribió primero con el comportamiento de hoy y los
+  dos casos de `retry-after` quedaron rojos (89 verdes / 2 rojos); después
+  91/91. Commit `fix(relay): forward retry-after on upstream errors`.
 - T4 (S16,S17): parking de la IP local leyendo `retry-after` + margen 10s, estado en memoria. Route: parent inline, test-first. Commit: `feat(relay): park a rate-limited local egress until its reset`.
 - T5 (S2,S3) DONE 2026-11-04: la perilla `RELAY_WARP_RECYCLE_THRESHOLD` se eliminó (config muerta: un solo valor correcto), `needsWarpRecycle(streak, onCooldown)` rota en el primer warp 429, y README/CHANGELOG/`warp-auto-recycle.md` S4 se alinearon. Test-first: rojo observado con la firma nueva, verde 65/65 en `test/relay.test.mjs`. Commit `02ca375` (código) + el commit de documentación.
 - T6 (S19) DONE: guía visual de instalación en siete pasos con las capturas de `Imagenes/`, verificadas una por una contra el archivo en disco. Commit de documentación.

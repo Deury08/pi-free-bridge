@@ -700,6 +700,22 @@ export async function resendAfterRotation(config, pathname, body, original, clie
 	return rebuildOriginal();
 }
 
+/** Pure: the upstream headers the relay forwards downstream. `content-type`
+ *  keeps the body readable; `retry-after` is what makes a gate 429 actionable,
+ *  because it carries the seconds until the quota resets. Without it the client
+ *  can only guess, and guessing midnight UTC is exactly the wrong answer for a
+ *  user in any other time zone. Everything else stays upstream: it is the
+ *  upstream's business, not the client's. */
+export function forwardedHeaders(source) {
+	const headers = {};
+	if (!source || typeof source.get !== "function") return headers;
+	const contentType = source.get("content-type");
+	if (contentType) headers["content-type"] = contentType;
+	const retryAfter = source.get("retry-after");
+	if (retryAfter) headers["retry-after"] = retryAfter;
+	return headers;
+}
+
 /** S13: marks a client that went away before the response finished. `close`
  *  also fires after a normal finish, so the `writableEnded` guard matters. */
 function trackClient(res) {
@@ -837,9 +853,9 @@ async function forward(req, res, pathname, config) {
 		lastEgress = egressUsed;
 
 		// S20: status and content-type pass through, the body is piped unparsed.
-		const headers = {};
-		const contentType = response.headers.get("content-type");
-		if (contentType) headers["content-type"] = contentType;
+		// S15: `retry-after` rides along, so a 429 arrives with its own reset
+		// window instead of forcing the client to guess.
+		const headers = forwardedHeaders(response.headers);
 
 		// Error diagnostics (bun-upgrades S3): a gate rejection carries the
 		// usable evidence in its JSON body. Snapshot it (bounded) before piping,

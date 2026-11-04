@@ -479,6 +479,12 @@ con esta superficie: habla con el relay, que reenvía acá desde Bun.
 existe** regla de conteo (una revisión anterior de este doc decía ≥7; eso se midió
 sobre un body inválido y está obsoleto).
 
+**Respuesta** — el status y el `content-type` del upstream pasan tal cual, y un
+error conserva además su `retry-after`: cuando el gate corta por cuota esa
+cabecera trae los segundos reales hasta el reset, así que el cliente no necesita
+calcular medianoche UTC ni adivinar su zona horaria. El resto de los headers del
+upstream no salen del relay.
+
 **Body:**
 
 - `stream: true` (`stream: false` → 403)

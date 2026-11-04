@@ -15,6 +15,7 @@ import test from "node:test";
 
 import {
 	ensureEnvBlock,
+	forwardedHeaders,
 	ensureGateTools,
 	resolveRelaySession,
 	resolveSessionFromStore,
@@ -861,6 +862,51 @@ test("resendAfterRotation: it reports the egress instead of writing the module g
 			);
 		},
 	);
+});
+
+// ---------------------------------------------------------------------------
+// Forwarded upstream headers (S15)
+// ---------------------------------------------------------------------------
+// A gate 429 carries `retry-after` in seconds: it is the only thing that says
+// when the quota resets, and it is what the client — and our own egress parking
+// — needs in order to wait exactly once instead of guessing midnight UTC. The
+// relay forwarded only `content-type`, so that evidence was thrown away.
+
+/** The shape `forwardedHeaders` accepts: anything with a `get`. A real
+ *  `Headers` and this stub are interchangeable there. */
+const headerSource = (map) => ({ get: (name) => map[String(name).toLowerCase()] });
+
+test("forwardedHeaders: retry-after survives an upstream error", () => {
+	const headers = forwardedHeaders(
+		headerSource({ "content-type": "application/json", "retry-after": "3600" }),
+	);
+	assert.deepEqual(headers, { "content-type": "application/json", "retry-after": "3600" });
+});
+
+test("forwardedHeaders: a header the upstream did not send is not invented", () => {
+	assert.deepEqual(forwardedHeaders(headerSource({ "content-type": "application/json" })), {
+		"content-type": "application/json",
+	});
+});
+
+test("forwardedHeaders: retry-after alone is enough", () => {
+	assert.deepEqual(forwardedHeaders(headerSource({ "retry-after": "60" })), { "retry-after": "60" });
+});
+
+test("forwardedHeaders: every other upstream header stays upstream", () => {
+	const headers = forwardedHeaders(
+		headerSource({
+			"content-type": "text/event-stream",
+			"x-ratelimit-remaining": "0",
+		"set-cookie": "session=secret",
+		}),
+	);
+	assert.deepEqual(headers, { "content-type": "text/event-stream" });
+});
+
+test("forwardedHeaders: a source without get never throws", () => {
+	assert.deepEqual(forwardedHeaders(undefined), {});
+	assert.deepEqual(forwardedHeaders({}), {});
 });
 
 // ---------------------------------------------------------------------------
