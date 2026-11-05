@@ -67,12 +67,12 @@ cerrado con warp-minimal.
 | T2 | S3 | `POST /warp/recycle` sobre la rotación existente (drain incluido) + guard de sólo loopback | inline | `feat(relay): add manual warp recycle endpoint` |
 | T3 | S4 | Comando `/free-bridge-warp-recycle` en `index.ts` | inline | `feat(extension): add /free-bridge-warp-recycle` |
 | T4 | S1, S4 | README + CHANGELOG: comando nuevo y `RELAY_LOG_FILE` | inline | `docs(readme): document warp recycle command and relay log` |
-| T5 | S5 | Suite completa + prueba en vivo del comando contra el relay instalado | verify | — |
-| T6 | S6 | Parser de `/health` con `served`/`streams`, política de atribución y mapa túnel→exit como helpers puros + eventos de log | inline | `feat(relay): attribute warp 429s to an exit via a cached tunnel map` |
-| T7 | S7, S9 | `POST /swap` apuntado por id, con cooldown propio, single-flight y lectura de `target` | inline | `feat(relay): swap a single warp exit on a persistent 429` |
-| T8 | S8 | Escalera acotada integrada al reenvío existente | inline | `feat(relay): ladder a targeted swap before recycling the pool` |
-| T9 | S10 | Kill switch, degradación por 404 ausente y README/CHANGELOG | inline | `docs(readme): document the warp swap knobs` |
-| T10 | S6-S10 | Verificación en vivo de los criterios 1-4 con el binario nuevo en 8789 | verify | — |
+| T5 | S5 | Suite completa + prueba en vivo del comando contra el relay instalado | verify | suite `114/114` al cierre del slice 1; **prueba en vivo pendiente** (bloqueada: esta sesión egressa por ese mismo bridge) |
+| T6 | S6 | Parser de `/health` con `served`/`streams`, política de atribución y mapa túnel→exit como helpers puros + eventos de log | inline | `e32f3f4` · 18 tests |
+| T7 | S7, S9 | `POST /swap` apuntado por id, con cooldown propio, single-flight y lectura de `target` | inline | `3104ad0` · 5 tests · `a2e4641` (borra el poll de aceptación: el `202` ya publica el estado) · `b66665f` (`202` + `ok:false` es negativa) |
+| T8 | S8 | Escalera acotada integrada al reenvío existente | inline | `3c5fa33` (atribución cableada, 3 tests con RED probado) · `918cf88` (un recycle rechazado no es una rotación) · `91e2a67` (la escalera, 4 tests) |
+| T9 | S10 | Kill switch, degradación por 405/501/404 ausente y README/CHANGELOG | inline | `988071d` · `095991c` (el campo es `error`, no `reason`) |
+| T10 | S6-S10 | Verificación en vivo de los criterios 1-4 con el binario nuevo en 8789 | verify | **pendiente**: espera el deploy del operador (`754dcec`); contra 8789 sólo `GET /health` por política del dueño |
 
 ## Log
 
@@ -180,3 +180,16 @@ cerrado con warp-minimal.
   `POST /swap`, `X-Warp-Exit` y `served` en `/health`. Criterios de aceptación
   1-4 del lado del relay, sin push y con el binario de 8789 viejo: la
   verificación en vivo queda bloqueada hasta el deploy.
+
+- **L5** — Política del dueño (asentada en warp-minimal `66eade5`): se construye,
+  pero toda prueba que pueda tumbar el warp o el relay queda **pendiente** hasta
+  que él avise. Contra `8789` sólo `GET /health`; diferidos `POST /swap`,
+  `POST /recycle`, recompilar/reiniciar, matar procesos y levantar otra instancia
+  (enrola dispositivos propios y compite por el mismo rate limit de WARP).
+- **L6** — El campo del body es **`error`**, no `reason`. Un discriminador escrito
+  contra `reason` nunca matcheaba, así que todo `404` legítimo (`unknown_exit`)
+  caía en la rama "el proxy no tiene `/swap`" y apagaba el swap apuntado hasta
+  reiniciar: peor que el reintento eterno que esa rama vino a arreglar. Causa raíz
+  de que sobreviviera a la suite: los fixtures estaban escritos desde la misma
+  mala lectura, así que código y test coincidían entre sí y discrepaban del proxy.
+  Verificado reponiendo el nombre equivocado y viendo caer el test del id viejo.
