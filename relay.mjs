@@ -11,10 +11,13 @@
 // The module exports its pure helpers so `test/relay.test.mjs` can run them
 // under plain Node; the server only starts when this file is executed directly.
 import {
+	appendFileSync,
 	existsSync,
 	readFileSync,
 	readdirSync,
 	realpathSync,
+	renameSync,
+	rmSync,
 	statSync,
 } from "node:fs";
 import { createServer } from "node:http";
@@ -541,6 +544,133 @@ const DRAIN_POLL_MS = 50;
 let drainValveMs = DRAIN_VALVE_MS;
 
 // ---------------------------------------------------------------------------
+// Warp event log (S1, S2)
+// ---------------------------------------------------------------------------
+//
+// Every warp decision that costs something — a 429 observed, a rotation asked
+// for, the drain that refused to let it run, the exit that came back — is
+// written as one JSON object per line. This exists because the relay writes its
+// diagnostics to stderr, and stderr goes to a pipe the parent drains: when a
+// turn dies the evidence dies with it. A file survives.
+//
+// What is never written: request bodies, headers, prompts, or the gate's error
+// body. Those are the user's content. An event records the decision, not the
+// traffic.
+
+/** The size at which the log rolls. One file plus one `.1` is already weeks of
+ *  incidents; an unbounded file is unreadable exactly when it is needed. */
+export const LOG_LIMIT_BYTES = 5 * 1024 * 1024;
+
+/** Pure: one log record. `JSON.stringify` escapes newlines, so a reason that
+ *  carries one can never forge a second event. */
+export function logLine(ev, fields = {}, now = Date.now()) {
+	return `${JSON.stringify({ t: new Date(now).toISOString(), ev, ...fields })}\n`;
+}
+
+/** Pure: whether the live file has to roll before the next record. An
+ *  unreadable size (`NaN`) never rolls — a log that cannot measure itself is not
+ *  a reason to throw away the incident being written. */
+export function shouldRotateLog(size, limit = LOG_LIMIT_BYTES) {
+	return Number.isFinite(size) && size >= limit;
+}
+
+/** Build the writer. No path means no file and no work at all: the log is
+ *  opt-in (`RELAY_LOG_FILE`), and an unset value must cost nothing on the
+ *  request path. Every failure is swallowed on purpose — a full disk is not a
+ *  reason to fail a user's turn. */
+export function makeEventLogger(file, { limit = LOG_LIMIT_BYTES, now = Date.now } = {}) {
+	const path = String(file ?? "").trim();
+	if (!path) return () => {};
+	let size;
+	const measure = () => {
+		if (size !== undefined) return;
+		try {
+			size = statSync(path).size;
+		} catch {
+			size = 0;
+		}
+	};
+	return (ev, fields) => {
+		try {
+			measure();
+			if (shouldRotateLog(size, limit)) {
+				// Windows refuses `rename` onto an existing name, so the kept
+				// generation is removed first: the contract is one `.1`, always.
+				try {
+					rmSync(`${path}.1`, { force: true });
+				} catch {
+					/* best effort: a missing previous generation is the normal case */
+				}
+				renameSync(path, `${path}.1`);
+				size = 0;
+			}
+			const line = logLine(ev, fields, now());
+			appendFileSync(path, line);
+			size += Buffer.byteLength(line);
+		} catch {
+			/* a log that cannot write must never fail a request */
+		}
+	};
+}
+
+let logWarpEvent = makeEventLogger(process.env.RELAY_LOG_FILE);
+
+// ---------------------------------------------------------------------------
+// Manual rotation (S3)
+// ---------------------------------------------------------------------------
+//
+// The relay binds 127.0.0.1 only (`server.listen(port, "127.0.0.1")`), so a
+// control route is loopback by construction and needs no token: the only peer
+// that can reach it is a process on this machine.
+
+/** Pure: the one control request the relay answers. Anything that is not an
+ *  exact match keeps flowing to the proxy path — a control route that matched by
+ *  prefix would eat a user request. */
+export function warpControlRoute(method, pathname) {
+	if (method === "POST" && pathname === "/warp/recycle") return "recycle";
+	return undefined;
+}
+
+/** Best-effort: why a manual rotation was refused. The authoritative trace of
+ *  the decision is the event log (`rotate_skipped` with its reason); this only
+ *  spares the caller from reading the log for the common cases. The drain is not
+ *  one of them: it never refuses on its own — a valve that expires lets the
+ *  rotation run, because a hung stream must not trap the request that ate the
+ *  429. */
+function refusalReason(config, inFlightBefore, rotated) {
+	if (rotated) return undefined;
+	if (inFlightBefore || warpRecycleInFlight) return "in_flight";
+	if (Date.now() < warpRecycleNotBefore) return "cooldown";
+	if (!config.warpProxy) return "no_proxy";
+	return "not_confirmed";
+}
+
+/** S3: the manual trigger runs the automatic path — same cooldown, same
+ *  single-flight guard, same drain, same confirmation. Nothing here is a second
+ *  implementation of the rotation, and that is the whole point: a hand-rolled
+ *  `POST /recycle` straight to the proxy is exactly the bug this replaces. */
+export async function manualWarpRecycle(config) {
+	const inFlightBefore = warpRecycleInFlight;
+	const rotated = await rotateWarpExit(config, undefined);
+	const reason = refusalReason(config, inFlightBefore, rotated);
+	const result = {
+		ok: rotated,
+		rotated,
+		warpMode: config.warpMode,
+		warpRecycles,
+		warp429Streak,
+		cooldownMs: Math.max(0, warpRecycleNotBefore - Date.now()),
+		delivering: deliveringWarpStreams,
+	};
+	if (reason) result.reason = reason;
+	logWarpEvent(rotated ? "manual_recycle" : "manual_recycle_refused", {
+		warpRecycles,
+		...(reason ? { reason } : {}),
+	});
+	return result;
+}
+
+// ---------------------------------------------------------------------------
 // Test-only hooks (test/relay.test.mjs)
 // ---------------------------------------------------------------------------
 // The relay reaches the network through the global `fetch` and keeps the warp
@@ -590,6 +720,13 @@ export function setWarpRotationTimingForTests(timeoutMs, pollMs, valveMs) {
 /** Test-only: pretend `count` responses are being delivered over warp now. */
 export function setDeliveringStreamsForTests(count) {
 	deliveringWarpStreams = Number.isFinite(count) ? count : 0;
+}
+
+/** Test-only: point the event log somewhere writable, or silence it with an
+ *  empty string. The production writer is built once from `RELAY_LOG_FILE` at
+ *  load, which a test cannot re-read. */
+export function setLogFileForTests(file) {
+	logWarpEvent = makeEventLogger(file);
 }
 
 async function maybeRecycleWarp(config) {
@@ -703,25 +840,46 @@ export async function rotateWarpExit(config, client) {
 		process.stderr.write(
 			`pi-free-bridge relay: warp rotation is already within its cooldown — delivering the original 429\n`,
 		);
+		logWarpEvent("rotate_skipped", {
+			reason: "cooldown",
+			cooldownMs: Math.max(0, warpRecycleNotBefore - Date.now()),
+		});
 		return false;
 	}
-	if (warpRecycleInFlight) return false;
-	if (!config.warpProxy) return false;
-	// The wait runs BEFORE the guard is taken: holding `warpRecycleInFlight` for
-	// the whole drain would stretch every peer's "no resend" window from one
-	// rotation (~12s) to one drain (~2 minutes), and a peer that ate its own 429
-	// meanwhile has no second chance.
-	if (!(await drainBeforeRotation(client))) return false;
+	if (warpRecycleInFlight) {
+		logWarpEvent("rotate_skipped", { reason: "in_flight" });
+		return false;
+	}
+	if (!config.warpProxy) {
+		logWarpEvent("rotate_skipped", { reason: "no_proxy" });
+		return false;
+	}
+
+	if (!(await drainBeforeRotation(client))) {
+		logWarpEvent("rotate_skipped", {
+			reason: "drain_refused",
+			delivering: deliveringWarpStreams,
+		});
+		return false;
+	}
 	// The wait is an await: a peer may have rotated while we held on.
 	if (Date.now() < warpRecycleNotBefore) {
 		process.stderr.write(
 			`pi-free-bridge relay: a warp rotation completed during the drain wait — delivering the original 429\n`,
 		);
+		logWarpEvent("rotate_skipped", {
+			reason: "peer_rotated",
+			cooldownMs: Math.max(0, warpRecycleNotBefore - Date.now()),
+		});
 		return false;
 	}
-	if (warpRecycleInFlight) return false;
+	if (warpRecycleInFlight) {
+		logWarpEvent("rotate_skipped", { reason: "in_flight" });
+		return false;
+	}
 	warpRecycleInFlight = true;
 	// This rotation pays for the 429s that asked for it.
+	logWarpEvent("rotate_start", { streak: warp429Streak, delivering: deliveringWarpStreams });
 	warp429Streak = 0;
 	try {
 		// Snapshot BEFORE the POST: the exit list is the only observable proof
@@ -743,13 +901,18 @@ export async function rotateWarpExit(config, client) {
 			if (client && client.gone) return false; // S13: nobody to answer
 			const state = await readWarpHealth(config);
 			if (state && state.recycling) seenRecycling = true;
-			if (isRotationConfirmed(before, state, seenRecycling)) return true;
+			if (isRotationConfirmed(before, state, seenRecycling)) {
+				logWarpEvent("rotate_ok", { recycles: warpRecycles });
+				return true;
+			}
 			await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
 		}
+		logWarpEvent("rotate_failed", { reason: "not_confirmed" });
 		return false;
 	} catch (err) {
 		const reason = err && err.message ? err.message : String(err);
 		process.stderr.write(`pi-free-bridge relay: warp rotation failed — ${reason}\n`);
+		logWarpEvent("rotate_failed", { reason });
 		return false;
 	} finally {
 		warpRecycleInFlight = false;
@@ -777,6 +940,7 @@ export async function resendAfterRotation(config, pathname, body, original, clie
 		process.stderr.write(
 			`pi-free-bridge relay: warp rotation not confirmed — delivering the original ${original.status}\n`,
 		);
+		logWarpEvent("resend_skipped", { reason: "rotation_not_confirmed" });
 		return rebuildOriginal();
 	}
 
@@ -786,6 +950,7 @@ export async function resendAfterRotation(config, pathname, body, original, clie
 	} catch (err) {
 		const reason = err && err.message ? err.message : String(err);
 		process.stderr.write(`pi-free-bridge relay: warp resend after rotation failed — ${reason}\n`);
+		logWarpEvent("resend_failed", { reason });
 		return rebuildOriginal();
 	}
 
@@ -795,6 +960,7 @@ export async function resendAfterRotation(config, pathname, body, original, clie
 		process.stderr.write(
 			`pi-free-bridge relay: warp resend after rotation delivered ${attempt.status} on the fresh exit IP\n`,
 		);
+		logWarpEvent("resend_ok", { status: attempt.status, egress: "warp", resends: warpResends });
 		return { egress: "warp", response: attempt };
 	}
 
@@ -806,6 +972,7 @@ export async function resendAfterRotation(config, pathname, body, original, clie
 	process.stderr.write(
 		`pi-free-bridge relay: warp resend after rotation got ${attempt.status} — delivering the original ${original.status}\n`,
 	);
+	logWarpEvent("resend_refused", { status: attempt.status, delivered: original.status });
 	return rebuildOriginal();
 }
 
@@ -875,6 +1042,9 @@ export async function forward(req, res, pathname, config) {
 				// success must still extend the streak.
 				if (egress === "warp") {
 					warp429Streak = bumpWarp429Streak(warp429Streak, candidate.status, "warp");
+					if (candidate.status === 429) {
+						logWarpEvent("warp_429", { streak: warp429Streak, delivering: deliveringWarpStreams });
+					}
 					// S10: the trigger is the whole request, not the last egress — in
 					// either `auto` order, a 429 observed through warp is exit evidence
 					// even when a local fallback delivered something else. Mode `off`
@@ -892,6 +1062,7 @@ export async function forward(req, res, pathname, config) {
 						process.stderr.write(
 							`pi-free-bridge relay: local egress parked for ${Math.round(parked / 1000)}s after its own 429\n`,
 						);
+						logWarpEvent("local_parked", { parkedMs: parked });
 					}
 				}
 			} catch (err) {
@@ -985,6 +1156,7 @@ export async function forward(req, res, pathname, config) {
 		// request's own value: `/health` reports the last egress of the last
 		// completed request, and a concurrent one cannot leak into it.
 		lastEgress = egressUsed;
+		logWarpEvent("deliver", { status: response.status, egress: egressUsed });
 
 		// S20: status and content-type pass through, the body is piped unparsed.
 		// S15: `retry-after` rides along, so a 429 arrives with its own reset
@@ -1043,6 +1215,14 @@ async function handle(req, res, config) {
 	refreshWarpMode(config);
 
 	const { pathname } = new URL(req.url ?? "/", "http://127.0.0.1");
+
+	if (warpControlRoute(req.method, pathname) === "recycle") {
+		const result = await manualWarpRecycle(config);
+		// 409 is the honest status for a refused rotation: the request was well
+		// formed, the relay's own state says no, and the body says which state.
+		sendJson(res, result.ok ? 200 : 409, result);
+		return;
+	}
 
 	if (req.method === "GET" && pathname === "/health") {
 		// S33: the marker stays `service` + `ok`; the extra fields let the

@@ -7,7 +7,16 @@
 // helpers are exported and covered here under plain Node: importing the module
 // must not start a server.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -519,7 +528,14 @@ test("readFileWarpMode: a missing config file never throws", () => {
 
 import {
 	isRotationConfirmed,
+	LOG_LIMIT_BYTES,
+	logLine,
+	makeEventLogger,
+	manualWarpRecycle,
 	resetWarpStateForTests,
+	setLogFileForTests,
+	shouldRotateLog,
+	warpControlRoute,
 	resendAfterRotation,
 	rotateWarpExit,
 	setDeliveringStreamsForTests,
@@ -1580,4 +1596,186 @@ test("maybeRecycleWarp: the auto fallback rotation waits too (S20)", async () =>
 		setWarpRotationTimingForTests();
 		resetWarpStateForTests();
 	}
+});
+
+// ---------------------------------------------------------------------------
+// warp event log (S1, S2)
+// ---------------------------------------------------------------------------
+//
+// The relay writes one JSON object per line so an incident can be read back
+// later. The format is the contract: a human greps it, and a future watchdog
+// parses it. It must never carry a body, a header or a prompt — only the event
+// name and the small numbers that explain a decision.
+
+const logDir = () => mkdtempSync(join(tmpdir(), "pfb-relay-log-"));
+
+const readEvents = (file) =>
+	readFileSync(file, "utf8")
+		.trimEnd()
+		.split("\n")
+		.map((line) => JSON.parse(line));
+
+test("logLine: exactly one JSON line with its timestamp and fields", () => {
+	const line = logLine("warp_429", { egress: "warp", streak: 2 }, Date.UTC(2026, 10, 4, 22, 54, 16));
+	assert.ok(line.endsWith("\n"), "a line carries its own terminator");
+	assert.equal(line.trimEnd().includes("\n"), false, "one event is one line, not several");
+	const parsed = JSON.parse(line);
+	assert.equal(parsed.ev, "warp_429");
+	assert.equal(parsed.egress, "warp");
+	assert.equal(parsed.streak, 2);
+	assert.equal(parsed.t, "2026-11-04T22:54:16.000Z");
+});
+
+test("logLine: a reason carrying a newline cannot forge a second event", () => {
+	const line = logLine("rotate_failed", { reason: "HTTP 500\nev: deliver 200" });
+	assert.equal(line.trimEnd().includes("\n"), false, "the newline is escaped, not emitted");
+	assert.equal(JSON.parse(line).reason, "HTTP 500\nev: deliver 200");
+});
+
+test("shouldRotateLog: rolls at the limit, never before it", () => {
+	assert.equal(shouldRotateLog(0), false);
+	assert.equal(shouldRotateLog(LOG_LIMIT_BYTES - 1), false);
+	assert.equal(shouldRotateLog(LOG_LIMIT_BYTES), true);
+	assert.equal(shouldRotateLog(LOG_LIMIT_BYTES + 1), true);
+	assert.equal(shouldRotateLog(Number.NaN), false, "an unreadable size never rolls");
+});
+
+test("makeEventLogger: no path means no file is created", () => {
+	const dir = logDir();
+	const log = makeEventLogger("");
+	assert.equal(typeof log, "function");
+	log("warp_429", { streak: 1 });
+	assert.deepEqual(readdirSync(dir), [], "nothing was written anywhere");
+});
+
+test("makeEventLogger: appends one parseable line per event", () => {
+	const file = join(logDir(), "relay.jsonl");
+	const log = makeEventLogger(file);
+	log("warp_429", { streak: 1 });
+	log("rotate_ok", { recycles: 1 });
+	const events = readEvents(file);
+	assert.deepEqual(
+		events.map((event) => event.ev),
+		["warp_429", "rotate_ok"],
+	);
+	assert.equal(events[0].streak, 1);
+});
+
+test("makeEventLogger: past the limit it rolls to .1 and keeps only one generation", () => {
+	const file = join(logDir(), "relay.jsonl");
+	const log = makeEventLogger(file, { limit: 120 });
+	for (let i = 0; i < 20; i += 1) log("warp_429", { streak: i });
+	assert.ok(existsSync(`${file}.1`), "the previous generation is kept");
+	assert.ok(statSync(file).size < 400, "the live file restarted after rolling");
+	for (let i = 0; i < 40; i += 1) log("warp_429", { streak: i });
+	assert.ok(existsSync(`${file}.1`), "the roll never removes the kept generation");
+	assert.equal(existsSync(`${file}.2`), false, "only one previous generation is kept");
+});
+
+test("resendAfterRotation: the recycle it runs is on disk for later (S1)", async () => {
+	const file = join(logDir(), "relay.jsonl");
+	const nextHealth = recyclingThenQuiet();
+	setLogFileForTests(file);
+	try {
+		await driveWarp(
+			(call) => {
+				if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+				if (call.url.includes("/health")) return healthJson(nextHealth());
+				return new Response("ok", { status: 200 });
+			},
+			async () => {
+				await resendAfterRotation(WARP_CONFIG, RESEND_PATH, {}, { ...ORIGINAL_429 }, undefined);
+			},
+		);
+	} finally {
+		setLogFileForTests("");
+	}
+	const names = readEvents(file).map((event) => event.ev);
+	assert.ok(names.includes("rotate_start"), `the request for a rotation was recorded: ${names}`);
+	assert.ok(names.includes("rotate_ok"), `the confirmed rotation was recorded: ${names}`);
+	assert.equal(
+		JSON.stringify(readEvents(file)).includes(GATE_429_BODY),
+		false,
+		"the gate body never reaches the log",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Manual rotation (S3)
+// ---------------------------------------------------------------------------
+//
+// The escape hatch. It exists because today the only manual recovery is a raw
+// `POST /recycle` straight to the proxy, which skips the drain and tears down
+// every stream multiplexed over the tunnel. The manual path must be the automatic
+// path, invoked by hand: same guards, same drain, same confirmation.
+
+test("warpControlRoute: only the exact manual path is a control request", () => {
+	assert.equal(warpControlRoute("POST", "/warp/recycle"), "recycle");
+	assert.equal(warpControlRoute("GET", "/warp/recycle"), undefined, "a GET never rotates");
+	assert.equal(warpControlRoute("POST", "/v1/messages"), undefined, "a proxied path is never eaten");
+	assert.equal(warpControlRoute("POST", "/warp/recyclex"), undefined, "no prefix matching");
+	assert.equal(warpControlRoute("POST", "/health"), undefined);
+});
+
+test("manualWarpRecycle: it rotates once, reports it and confirms the new exit", async () => {
+	const nextHealth = recyclingThenQuiet();
+	const result = await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			if (call.url.includes("/health")) return healthJson(nextHealth());
+			return new Response("ok", { status: 200 });
+		},
+		(fake) => manualWarpRecycle(WARP_CONFIG).then((out) => ({ out, fake })),
+	);
+	assert.equal(result.out.ok, true, "a confirmed rotation reports ok");
+	assert.equal(result.out.warpRecycles, 1, "the counter the command prints moved");
+	assert.equal(recyclePosts(result.fake.calls).length, 1, "exactly one POST");
+	assert.equal(result.out.cooldownMs > 0, true, "the cooldown is armed and reported");
+});
+
+test("manualWarpRecycle: a second call inside the cooldown rotates nothing and says why", async () => {
+	const nextHealth = recyclingThenQuiet();
+	const handler = (call) => {
+		if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+		if (call.url.includes("/health")) return healthJson(nextHealth());
+		return new Response("ok", { status: 200 });
+	};
+	const both = await driveWarp(handler, async (fake) => {
+		const first = await manualWarpRecycle(WARP_CONFIG);
+		const second = await manualWarpRecycle(WARP_CONFIG);
+		return { first, second, calls: fake.calls };
+	});
+	assert.equal(both.first.ok, true);
+	assert.equal(both.second.ok, false, "the cooldown refuses the second rotation");
+	assert.equal(both.second.reason, "cooldown");
+	assert.equal(recyclePosts(both.calls).length, 1, "the burnt cooldown spent no POST");
+});
+
+test("manualWarpRecycle: it waits for in-flight warp streams before cutting the tunnel", async () => {
+	const nextHealth = recyclingThenQuiet();
+	const postedAt = [];
+	const startedAt = Date.now();
+	const out = await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/recycle")) {
+				postedAt.push(Date.now());
+				return new Response("{}", { status: 200 });
+			}
+			if (call.url.includes("/health")) return healthJson(nextHealth());
+			return new Response("ok", { status: 200 });
+		},
+		async () => {
+			setDeliveringStreamsForTests(1);
+			const peerFinishes = setTimeout(() => setDeliveringStreamsForTests(0), 120);
+			try {
+				return await manualWarpRecycle(WARP_CONFIG);
+			} finally {
+				clearTimeout(peerFinishes);
+			}
+		},
+	);
+	assert.equal(out.ok, true, "the manual rotation completed once the stream was done");
+	assert.equal(postedAt.length, 1, "exactly one POST");
+	const waited = postedAt[0] - startedAt;
+	assert.ok(waited >= 100, `the POST came ${waited}ms in — it must wait for the stream`);
 });
