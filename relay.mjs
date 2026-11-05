@@ -1263,40 +1263,42 @@ export async function swapWarpExit(config, exitId, client) {
  *  real rate limit is never hidden behind a different error. Returns what it
  *  delivered and the egress that delivered it; `egress` is undefined when the
  *  original comes back, because then the original's own egress still stands. */
-export async function resendAfterRotation(config, pathname, body, original, client) {
-	const rebuildOriginal = () => ({
+function rebuildOriginal(original) {
+	return {
 		egress: undefined,
 		response: new Response(original.body, {
 			status: original.status,
 			headers: original.contentType ? { "content-type": original.contentType } : {},
 		}),
-	});
+	};
+}
 
-	if (!(await rotateWarpExit(config, client))) {
-		process.stderr.write(
-			`pi-free-bridge relay: warp rotation not confirmed — delivering the original ${original.status}\n`,
-		);
-		logWarpEvent("resend_skipped", { reason: "rotation_not_confirmed" });
-		return rebuildOriginal();
-	}
-
+/** S5: the one attempt a fresh exit buys. Returns the adopted response, or
+ *  `undefined` when that exit refused as well, so the caller decides whether
+ *  anything harder is still worth it and the original 429 is rebuilt once, in
+ *  the only place that delivers it. */
+async function resendWarpOnce(config, pathname, body, original, via) {
+	// S6: the same window, on the resend. After a swap the tunnel is a NEW exit,
+	// so the map relearns from this attempt instead of keeping the id that was
+	// just replaced.
+	const before = await readWarpSnapshot(config);
 	let attempt;
 	try {
 		attempt = await egressFetch(config, pathname, { body: JSON.stringify(body) }, "warp");
 	} catch (err) {
 		const reason = err && err.message ? err.message : String(err);
-		process.stderr.write(`pi-free-bridge relay: warp resend after rotation failed — ${reason}\n`);
-		logWarpEvent("resend_failed", { reason });
-		return rebuildOriginal();
+		process.stderr.write(`pi-free-bridge relay: warp resend after ${via} failed — ${reason}\n`);
+		logWarpEvent("resend_failed", { reason, via });
+		return undefined;
 	}
 
 	if (attempt.status < 400) {
 		warp429Streak = bumpWarp429Streak(warp429Streak, attempt.status, "warp");
 		warpResends += 1;
 		process.stderr.write(
-			`pi-free-bridge relay: warp resend after rotation delivered ${attempt.status} on the fresh exit IP\n`,
+			`pi-free-bridge relay: warp resend after ${via} delivered ${attempt.status} on the fresh exit IP\n`,
 		);
-		logWarpEvent("resend_ok", { status: attempt.status, egress: "warp", resends: warpResends });
+		logWarpEvent("resend_ok", { status: attempt.status, egress: "warp", resends: warpResends, via });
 		return { egress: "warp", response: attempt };
 	}
 
@@ -1305,11 +1307,56 @@ export async function resendAfterRotation(config, pathname, body, original, clie
 	// same helper the loop uses must count it; otherwise a second burnt exit
 	// under-reports the streak and the next burst rotates late.
 	warp429Streak = bumpWarp429Streak(warp429Streak, attempt.status, "warp");
+	if (attempt.status === 429) await noteWarpAttribution(config, before);
 	process.stderr.write(
-		`pi-free-bridge relay: warp resend after rotation got ${attempt.status} — delivering the original ${original.status}\n`,
+		`pi-free-bridge relay: warp resend after ${via} got ${attempt.status} — delivering the original ${original.status}\n`,
 	);
-	logWarpEvent("resend_refused", { status: attempt.status, delivered: original.status });
-	return rebuildOriginal();
+	logWarpEvent("resend_refused", { status: attempt.status, delivered: original.status, via });
+	return undefined;
+}
+
+export async function resendAfterRotation(config, pathname, body, original, client) {
+	if (!(await rotateWarpExit(config, client))) {
+		process.stderr.write(
+			`pi-free-bridge relay: warp rotation not confirmed — delivering the original ${original.status}\n`,
+		);
+		logWarpEvent("resend_skipped", { reason: "rotation_not_confirmed" });
+		return rebuildOriginal(original);
+	}
+	return (await resendWarpOnce(config, pathname, body, original, "rotation")) ?? rebuildOriginal(original);
+}
+
+/** S8: the bounded ladder, in ascending cost. A targeted swap replaces ONLY the
+ *  exit that served the 429 and keeps the pool serving through the other one:
+ *  one enrollment instead of N, no stream cut, nothing left empty. One resend on
+ *  the fresh exit decides whether that was enough.
+ *
+ *  The harder rotation runs last and only when the fresh exit refused too,
+ *  because it is the only step that tears down our own tunnel and every stream
+ *  riding it. Bounded by construction: at most two attempts per request, and the
+ *  original 429 is delivered byte-exact when neither works.
+ *
+ *  No attribution means no target, and a body-less swap picks by live streams —
+ *  which, by the time a 429 is being diagnosed, points at the wrong exit. So the
+ *  ladder skips straight to the rotation instead of guessing. */
+export async function recoverWarp429(config, pathname, body, original, client) {
+	const decision = decideWarpSwap({
+		exitId: tunnelExit,
+		retryAfterMs: original.retryAfterMs,
+		enabled: WARP_SWAP_ENABLED,
+		onCooldown: Date.now() < warpSwapNotBefore,
+		inFlight: warpSwapInFlight,
+	});
+	if (!decision.swap) {
+		logWarpEvent("ladder_swap_skipped", { reason: decision.reason, exit: tunnelExit });
+		return resendAfterRotation(config, pathname, body, original, client);
+	}
+	const swap = await swapWarpExit(config, tunnelExit, client);
+	if (swap.swapped) {
+		const attempt = await resendWarpOnce(config, pathname, body, original, "swap");
+		if (attempt) return attempt;
+	}
+	return resendAfterRotation(config, pathname, body, original, client);
 }
 
 /** Pure: the upstream headers the relay forwards downstream. `content-type`
@@ -1447,7 +1494,7 @@ export async function forward(req, res, pathname, config) {
 		// rotation takes seconds, nothing may reach the client meanwhile, and if
 		// the resend is refused those exact bytes are what gets delivered.
 		if (response && response.status === 429 && sawWarp429 && WARP_RESEND_ENABLED && !client.gone) {
-			const resend = await resendAfterRotation(
+			const resend = await recoverWarp429(
 				config,
 				pathname,
 				body,
@@ -1455,6 +1502,9 @@ export async function forward(req, res, pathname, config) {
 					status: response.status,
 					contentType: response.headers.get("content-type"),
 					body: Buffer.from(await response.arrayBuffer()),
+					// Read here, while the header still exists: the decision to spend an
+					// enrollment instead of waiting depends on how long the wait is.
+					retryAfterMs: parkDurationMs(response.headers.get("retry-after")),
 				},
 				client,
 			);

@@ -709,7 +709,7 @@ function installFakeFetch(handler) {
 	const calls = [];
 	const original = globalThis.fetch;
 	globalThis.fetch = async (url, opts = {}) => {
-		const call = { url: String(url), method: String(opts.method ?? "GET").toUpperCase() };
+		const call = { url: String(url), method: String(opts.method ?? "GET").toUpperCase(), body: opts.body };
 		calls.push(call);
 		return handler(call);
 	};
@@ -720,8 +720,7 @@ function installFakeFetch(handler) {
 async function driveWarp(handler, run) {
 	resetWarpStateForTests();
 	setWarpRotationTimingForTests(500, 1);
-	const fake = installFakeFetch(handler);
-	try {
+	const fake = installFakeFetch(handler);	try {
 		return await run(fake);
 	} finally {
 		fake.restore();
@@ -2271,6 +2270,162 @@ test("forward: another exit's traffic does not steal a valid map (S6)", async ()
 				EXIT_A,
 				"a delta on another exit is foreign traffic, never a correction",
 			);
+		},
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Slice 2 — the bounded ladder (S8)
+// ---------------------------------------------------------------------------
+// Ascending cost: a targeted swap replaces only the exit that served the 429 and
+// keeps the pool serving, then one resend. Only if the fresh exit refuses too
+// does the harder rotation run, because that is the one step that tears down our
+// own tunnel and every stream riding it. At most two attempts per request.
+
+const swapPosts = (calls) => calls.filter((call) => call.method === "POST" && call.url.endsWith("/swap"));
+
+/** The 429, then whatever the next attempt gets. */
+function upstreamThen(statuses) {
+	let index = 0;
+	return () => {
+		const status = statuses[Math.min(index++, statuses.length - 1)];
+		return status === 429
+			? new Response(GATE_429_BODY, { status: 429 })
+			: new Response('{"ok":true}', { status, headers: { "content-type": "application/json" } });
+	};
+}
+
+test("ladder: a targeted swap and one resend need no recycle (S8)", async () => {
+	const nextHealth = sequencedHealth([
+		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (draining, served=0, streams=0)`],
+	]);
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: "warp-new" }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async (fake) => {
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "ladder" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(res.status, 200, "the fresh exit delivered");
+			assert.equal(swapPosts(fake.calls).length, 1);
+			assert.deepEqual(
+				JSON.parse(swapPosts(fake.calls)[0].body),
+				{ exit: EXIT_A },
+				"the swap names the exit that served the 429, not whichever has streams",
+			);
+			assert.equal(recyclePosts(fake.calls).length, 0, "the recycle is the last resort, never the first step");
+			assert.equal(warpStateForTests().warpSwaps, 1);
+		},
+	);
+});
+
+test("ladder: without an attributed exit it never guesses a target (S7)", async () => {
+	// A body-less swap picks by live streams, and by the time a 429 is being
+	// diagnosed the burnt exit is the idle one. Guessing costs an enrollment on
+	// the wrong exit, so the ladder skips to the rotation instead.
+	// The chain reads twice (before the attempt, after the 429) without a served
+	// counter, so the map stays empty. The rotation then needs its own window: the
+	// entry name never changes, so only "recycling seen, then quiet again" proves
+	// it.
+	const bodies = [
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+		{ recycling: true, exits: ["warp-18e (in_use, streams=0)"] },
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+	];
+	let index = 0;
+	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) return new Response(JSON.stringify({ ok: true }), { status: 202 });
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async (fake) => {
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "no-target" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(res.status, 200, "the rotation still bought a working resend");
+			assert.equal(swapPosts(fake.calls).length, 0, "no target means no swap");
+			assert.equal(recyclePosts(fake.calls).length, 1);
+		},
+	);
+});
+
+test("ladder: a refused swap falls through to the rotation (S8)", async () => {
+	const nextHealth = sequencedHealth([
+		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		// the rotation's own before-snapshot, then the confirmed replacement
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`warp-fresh (healthy, served=0, streams=0)`, `${EXIT_B} (in_use, served=7, streams=1)`],
+	]);
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: false, reason: "no_standby" }), { status: 409 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async (fake) => {
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "no-standby" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(res.status, 200, "the harder step still recovered the request");
+			assert.equal(swapPosts(fake.calls).length, 1);
+			assert.equal(recyclePosts(fake.calls).length, 1, "a 409 is an answer: move to the next step, do not insist");
+		},
+	);
+});
+
+test("ladder: when the fresh exit refuses too, the recycle is still there (S8)", async () => {
+	// The whole point of a ladder: each step is allowed to fail, and the last one
+	// is only reached because the cheaper ones did.
+	const nextHealth = sequencedHealth([
+		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		// after the swap: our tunnel moved to the new exit
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (draining, served=0, streams=0)`],
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (in_use, served=1, streams=1)`],
+		// the rotation: quiet, then recycling, then a new id
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (healthy, served=1, streams=0)`],
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (healthy, served=1, streams=0)`],
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-newer (healthy, served=0, streams=0)`],
+	]);
+	const nextUpstream = upstreamThen([429, 429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: "warp-new" }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async (fake) => {
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "both" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(res.status, 200, "three attempts, two recoveries, one delivered turn");
+			assert.equal(swapPosts(fake.calls).length, 1, "one swap, no loop");
+			assert.equal(recyclePosts(fake.calls).length, 1, "one recycle, no loop");
+			assert.equal(upstreamCalls(fake.calls).length, 3, "original, after the swap, after the rotation");
 		},
 	);
 });
