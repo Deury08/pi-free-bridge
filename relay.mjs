@@ -1180,21 +1180,6 @@ export async function swapWarpExit(config, exitId, client) {
  *  proxy took the work, so waiting for the target to stop accepting (it goes
  *  `draining`, or the id disappears and comes back new) is the evidence the
  *  resend needs. A timeout is not a failure — one resend is still worth it. */
-async function waitForSwapAcceptance(config, target) {
-	if (!target) return false;
-	const deadline = Date.now() + Math.min(rotationTimeoutMs, 5_000);
-	while (Date.now() < deadline) {
-		const snapshot = await readWarpSnapshot(config);
-		if (snapshot) {
-			const exit = snapshot.exits.find((candidate) => candidate.id === target);
-			if (!exit || exit.state === "draining" || exit.state === "cooldown") return true;
-		}
-		await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
-	}
-	logWarpEvent("swap_unconfirmed", { target });
-	return false;
-}
-
 /** S5/S7/S10: one resend, only after a confirmed rotation, and always on the
  *  warp egress — the fresh IP lives there whatever order the chain used. Never
  *  a loop: the attempt happens once and only a non-error answer is adopted.
