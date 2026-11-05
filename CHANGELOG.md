@@ -6,6 +6,22 @@
 
 ## Unreleased
 
+- **Manual WARP rotation, by the same path as the automatic one**: new
+  `/free-bridge-warp-recycle` command, backed by a loopback `POST /warp/recycle`
+  route on the relay. It exists because the only manual recovery a burnt exit had
+  was a raw `POST /recycle` straight to the proxy, which skips the drain and tears
+  down every stream multiplexed over the tunnel. The command now waits for
+  in-flight deliveries, respects the cool-down, confirms the new exit through
+  `/health`, and reports streak, recycles, result and remaining cool-down. The
+  relay binds `127.0.0.1` only, so the route needs no token.
+- **The relay can keep an event log on disk**: `RELAY_LOG_FILE` writes one JSON
+  object per line for every WARP decision that costs something — a `429`
+  observed, a rotation asked for or refused (with its reason), the resend, the
+  local-egress parking, the final delivery. Until now every one of those
+  diagnostics went to a pipe the parent drained, so an incident died with the
+  turn that hit it. Off by default, rolls at 5 MB keeping one `.1`, and never
+  records bodies, headers or prompts.
+
 - **Rotation waits for in-flight WARP deliveries**: `/recycle` replaces the exit,
   and that kills every stream multiplexed over it. A response that already
   passed the gate completes on its own, so the relay now waits until nothing is

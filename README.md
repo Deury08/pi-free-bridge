@@ -366,6 +366,7 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `/free-bridge-warp` | Muestra el modo de salida WARP (`off` por defecto), el endpoint efectivo y el último egress usado | Diagnóstico de red o grandes rate limits |
 | `/free-bridge-warp off\|auto\|on` | Cambia y persiste el modo: `off` directo; `auto` directo primero, WARP ante rate limit; `on` siempre WARP. **Hot reload:** sin reiniciar el relay — aplica en el próximo request | Requiere `warp-minimal` en `127.0.0.1:8789` para modos no-`off`. Si no está y no hay ruta configurada, Pi **te pregunta** y ofrece descargar e instalar la release oficial (checksum verificado) |
 | `/free-bridge-warp bin <ruta>` | Configura la ruta del binario `warp-minimal` (queda en `warpBin` de la config) | Cuando ya lo tenés compilado o descargado y preferís apuntarlo a mano |
+| `/free-bridge-warp-recycle` | Rota el exit WARP ahora mismo, por el mismo camino que la rotación automática: respeta el cool-down, **espera a que no haya respuestas entregándose** por el túnel y confirma el exit nuevo por `/health`. Informa streak, recycles, resultado y cool-down restante | Cuando un `429` te mató el turno y la rotación automática no llegó (o no querés gastar un turno para que llegue). **No lo corras desde una sesión que esté usando el bridge**: la rotación cambia el exit debajo de tu propia respuesta |
 
 ### Terminal (fuera de Pi)
 
@@ -390,6 +391,7 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `PI_FREE_BRIDGE_WARP_MODE` | Pisa el modo de egress WARP (también `off`, `auto`, `on`; máxima precedencia). Mientras exista, el relay **no** lee el `warpEnabled` del config — el modo queda fijado (estático por diseño) |
 | `RELAY_WARP_RECYCLE_COOLDOWN_MS` | Relay-only: cool-down entre recycles (default `300000`). La rotación en sí **no** es configurable: ocurre en el primer `429` observado en el egress warp, porque cualquier umbral mayor entregaría ese tanto de `429` antes de rotar. El relay degrada con gracia si el proxy no tiene endpoint `/recycle`. |
 | `RELAY_WARP_RETRY_AFTER_RECYCLE` | Relay-only: kill switch del reenvío único tras una rotación confirmada. `0` lo desactiva (se entrega el `429` original tal cual); ausente o cualquier otro valor lo mantiene activo. |
+| `RELAY_LOG_FILE` | Relay-only: ruta del log de eventos de WARP en JSONL (un objeto por línea: `429` observado, rotación pedida/confirmada/fallida con motivo, reenvío, parking local, entrega final). Sin valor **no escribe nada**. Rota a los 5 MB conservando un `.1`. Nunca registra bodies, cabeceras ni prompts: solo el evento y los contadores que explican la decisión |
 | `PI_FREE_BRIDGE_WARP_PROXY` | URL del proxy WARP (por defecto `http://127.0.0.1:8789`) |
 | `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` (precedencia sobre `warpBin` en config) |
 | `~/.pi/agent/pi-free-bridge.json` → `warpBin` | Ruta al binario; si no hay ninguna y no responde, Pi ofrece descargar e instalar la release oficial (te lo pregunta antes) |
