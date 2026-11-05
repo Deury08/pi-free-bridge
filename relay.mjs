@@ -1190,15 +1190,30 @@ export async function swapWarpExit(config, exitId, client) {
 			body = undefined;
 		}
 		const target = body && typeof body.target === "string" ? body.target : undefined;
-		if (res.status === 202) {
+		// `ok:false` is the proxy saying nothing happened: a swap or a recycle is
+		// already in flight and this one was refused. A 202 alone is not enough to
+		// call it accepted, and neither is an exit in `cooldown` — a target in
+		// cooldown is rejected as `no_standby`, so it can never prove a swap
+		// started. Only `ok` and the 202 that carries it do that.
+		const blocked = res.status === 202 && Boolean(body && body.ok === false);
+		if (res.status === 202 && !blocked) {
 			warpSwapNotBefore = Date.now() + SWAP_COOLDOWN_MS;
 			warpSwaps += 1;
 			logWarpEvent("swap_ok", { exit: exitId, target });
 			return { swapped: true, target };
 		}
-		warpSwapNotBefore = Date.now() + SWAP_COOLDOWN_MS;
-		const reason =
-			res.status === 409 ? "no_standby" : res.status === 404 ? "unknown_exit" : `HTTP ${res.status}`;
+		const reason = blocked
+			? typeof body.reason === "string" && body.reason
+				? body.reason
+				: "blocked"
+			: res.status === 409
+				? "no_standby"
+				: res.status === 404
+					? "unknown_exit"
+					: `HTTP ${res.status}`;
+		// Nothing happened, so nothing is spent: the same reasoning as a failed
+		// POST, and it keeps the short cooldown from being burnt on a refusal.
+		if (!blocked) warpSwapNotBefore = Date.now() + SWAP_COOLDOWN_MS;
 		if (res.status !== 409 && res.status !== 404) {
 			process.stderr.write(`pi-free-bridge relay: warp swap failed — HTTP ${res.status}\n`);
 		}

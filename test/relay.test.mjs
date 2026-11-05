@@ -2053,6 +2053,28 @@ test("swapWarpExit: two handlers at once stack nothing", () => {
 	);
 });
 
+test("swapWarpExit: a 202 that says ok:false was not accepted (S7)", () => {
+	// The status code alone cannot tell an accepted swap from a refused one, and
+	// the refused case is invisible by design: another swap or a recycle owns the
+	// proxy state. Counting it as accepted would spend the short cooldown and arm
+	// a resend against an exit nobody replaced.
+	return withWarpFetch(
+		async (url) => {
+			if (String(url).endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: false, reason: "swap_in_flight" }), { status: 202 });
+			}
+			return new Response("{}", { status: 200 });
+		},
+		async () => {
+			const result = await swapWarpExit(WARP_CONFIG, EXIT_A);
+			assert.equal(result.swapped, false, "a 202 with ok:false is a refusal that wears the success status");
+			assert.equal(result.reason, "swap_in_flight", "the proxy's own reason is kept instead of invented");
+			assert.equal(warpStateForTests().warpSwapNotBefore, 0, "a refusal spends nothing");
+			assert.equal(warpStateForTests().warpSwaps, 0);
+		},
+	);
+});
+
 test("swapWarpExit: without a proxy there is nothing to ask", () => {
 	return withWarpFetch(
 		async () => {
