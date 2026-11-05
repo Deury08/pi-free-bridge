@@ -1236,14 +1236,16 @@ export async function swapWarpExit(config, exitId, client) {
 			body = undefined;
 		}
 		const target = body && typeof body.target === "string" ? body.target : undefined;
-		// Not every non-2xx is JSON: a 405 and a 501 answer in plain text, and a 404
-		// without our own `unknown_exit` reason is a route that does not exist. Those
+		// Not every non-2xx is JSON, and the reason lives in `error`, never in
+		// `reason`: that field does not exist in the contract. A 405 and a 501 answer
+		// in plain text, and a 404 without our own `unknown_exit` error is a route
+		// that does not exist. Those
 		// are not exit problems, so retrying would burn a cooldown every minute for
 		// the life of the process: the ladder steps aside once and stays aside.
 		const unsupported =
 			res.status === 405 ||
 			res.status === 501 ||
-			(res.status === 404 && !(body && body.reason === "unknown_exit"));
+			(res.status === 404 && !(body && body.error === "unknown_exit"));
 		if (unsupported) {
 			warpSwapUnsupported = true;
 			if (!warpSwapUnsupportedWarned) {
@@ -1268,8 +1270,8 @@ export async function swapWarpExit(config, exitId, client) {
 			return { swapped: true, target };
 		}
 		const reason = blocked
-			? typeof body.reason === "string" && body.reason
-				? body.reason
+			? typeof body.error === "string" && body.error
+				? body.error
 				: "blocked"
 			: res.status === 409
 				? "no_standby"

@@ -2000,13 +2000,13 @@ test("swapWarpExit: 409 no standby is an answer, never something to retry", () =
 		async (url) => {
 			calls.push(String(url));
 			if (String(url).endsWith("/swap")) {
-				return new Response(JSON.stringify({ ok: false, reason: "no_standby" }), { status: 409 });
+				return new Response(JSON.stringify({ ok: false, error: "no_standby", target: EXIT_A }), { status: 409 });
 			}
 			return new Response("{}", { status: 200 });
 		},
 		async () => {
 			const first = await swapWarpExit(WARP_CONFIG, EXIT_A);
-			assert.deepEqual(first, { swapped: false, reason: "no_standby", status: 409, target: undefined });
+			assert.deepEqual(first, { swapped: false, reason: "no_standby", status: 409, target: EXIT_A });
 			const second = await swapWarpExit(WARP_CONFIG, EXIT_A);
 			assert.equal(second.reason, "cooldown", "a 409 arms the cooldown: insisting burns enrollments while the gate is rate-limiting");
 			assert.equal(calls.length, 1, "the second call never reached the proxy");
@@ -2018,7 +2018,7 @@ test("swapWarpExit: an unknown exit is reported instead of hidden", () => {
 	return withWarpFetch(
 		async (url) => {
 			if (String(url).endsWith("/swap")) {
-				return new Response(JSON.stringify({ ok: false, reason: "unknown_exit" }), { status: 404 });
+				return new Response(JSON.stringify({ ok: false, error: "unknown_exit" }), { status: 404 });
 			}
 			return new Response("{}", { status: 200 });
 		},
@@ -2061,7 +2061,7 @@ test("swapWarpExit: a 202 that says ok:false was not accepted (S7)", () => {
 	return withWarpFetch(
 		async (url) => {
 			if (String(url).endsWith("/swap")) {
-				return new Response(JSON.stringify({ ok: false, reason: "swap_in_flight" }), { status: 202 });
+				return new Response(JSON.stringify({ ok: false, error: "swap_in_flight" }), { status: 202 });
 			}
 			return new Response("{}", { status: 200 });
 		},
@@ -2379,7 +2379,7 @@ test("ladder: a refused swap falls through to the rotation (S8)", async () => {
 		(call) => {
 			if (call.url.endsWith("/health")) return nextHealth();
 			if (call.url.endsWith("/swap")) {
-				return new Response(JSON.stringify({ ok: false, reason: "no_standby" }), { status: 409 });
+				return new Response(JSON.stringify({ ok: false, error: "no_standby" }), { status: 409 });
 			}
 			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
 			return nextUpstream();
@@ -2468,7 +2468,7 @@ test("swapWarpExit: a 404 that names unknown_exit is not a missing route (S10)",
 	return withWarpFetch(
 		async (url) => {
 			if (String(url).endsWith("/swap")) {
-				return new Response(JSON.stringify({ ok: false, reason: "unknown_exit" }), { status: 404 });
+				return new Response(JSON.stringify({ ok: false, error: "unknown_exit" }), { status: 404 });
 			}
 			return new Response("{}", { status: 200 });
 		},
