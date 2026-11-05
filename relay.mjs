@@ -892,6 +892,37 @@ export function setLogFileForTests(file) {
 	logWarpEvent = makeEventLogger(file);
 }
 
+/** POST /recycle and read the answer, because the status alone cannot tell an
+ *  accepted rotation from a refused one. A `202` with `ok:false` means the proxy
+ *  refused: a swap or another recycle already owns its state, and nothing
+ *  happened. Nothing happened means nothing may be spent — no cooldown, no
+ *  counter — and no waiting for a confirmation that cannot come.
+ *
+ *  The body also says which one refused it, without any new surface: only a swap
+ *  publishes an exit in `draining`, so an exit in that state is the swap and its
+ *  absence is the recycle. */
+async function postRecycle(config) {
+	const res = await fetch(`${config.warpProxy}/recycle`, {
+		method: "POST",
+		signal: AbortSignal.timeout(10_000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	let body;
+	try {
+		body = await res.json();
+	} catch {
+		body = undefined;
+	}
+	if (body && body.ok === false) {
+		const reason = warpExitSnapshot(body).exits.some((exit) => exit.state === "draining")
+			? "blocked_by_swap"
+			: "blocked_by_recycle";
+		logWarpEvent("recycle_refused", { reason });
+		return { accepted: false, reason };
+	}
+	return { accepted: true };
+}
+
 async function maybeRecycleWarp(config) {
 	// One recycle at a time: a burst of concurrent 429s must not stack POSTs.
 	// The cooldown is only armed once the proxy actually accepted the rotation —
@@ -913,12 +944,10 @@ async function maybeRecycleWarp(config) {
 	warp429Streak = 0;
 	warpRecycleInFlight = true;
 	try {
-		const res = await fetch(`${config.warpProxy}/recycle`, {
-			method: "POST",
-			signal: AbortSignal.timeout(10_000),
-		});
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		await res.arrayBuffer();
+		const recycle = await postRecycle(config);
+		// A refused recycle is not a rotation: it must not arm the cooldown that
+		// would keep every later request from trying again for five minutes.
+		if (!recycle.accepted) return;
 		warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
 		warpRecycles += 1;
 		process.stderr.write(
@@ -1048,12 +1077,8 @@ export async function rotateWarpExit(config, client) {
 		// Snapshot BEFORE the POST: the exit list is the only observable proof
 		// that an exit was actually replaced.
 		const before = await readWarpHealth(config);
-		const res = await fetch(`${config.warpProxy}/recycle`, {
-			method: "POST",
-			signal: AbortSignal.timeout(10_000),
-		});
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		await res.arrayBuffer();
+		const recycle = await postRecycle(config);
+		if (!recycle.accepted) return false;
 		// S12: the cooldown is armed only once the proxy accepted the rotation.
 		warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
 		warpRecycles += 1;

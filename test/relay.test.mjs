@@ -2088,6 +2088,89 @@ test("swapWarpExit: without a proxy there is nothing to ask", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Slice 2 — a refused recycle costs nothing (S9, S12)
+// ---------------------------------------------------------------------------
+// While a swap is replacing an exit the proxy refuses a rotation with a 202 and
+// `ok:false`: a silent no-op. Counting it as accepted used to arm the five
+// minute cooldown on nothing and then wait ten seconds for a confirmation that
+// could not arrive.
+
+const REFUSED_SWAP_BODY = {
+	ok: false,
+	exits: [`${EXIT_A} (draining, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
+};
+
+test("rotateWarpExit: an ok:false recycle is refused and spends nothing (S12)", async () => {
+	const file = join(logDir(), "relay-refused-swap.jsonl");
+	setLogFileForTests(file);
+	try {
+		await driveWarp(
+			(call) => {
+				if (call.url.endsWith("/recycle")) {
+					return new Response(JSON.stringify(REFUSED_SWAP_BODY), { status: 202 });
+				}
+				if (call.url.includes("/health")) {
+					return healthJson({ recycling: false, exits: [`${EXIT_A} (draining, served=42, streams=1)`] });
+				}
+				return new Response("ok", { status: 200 });
+			},
+			async () => {
+				const startedAt = Date.now();
+				const confirmed = await rotateWarpExit(WARP_CONFIG, undefined);
+				assert.equal(confirmed, false, "a no-op must not buy a resend");
+				assert.equal(warpStateForTests().warpRecycleNotBefore, 0, "nothing happened, so nothing is spent");
+				assert.equal(warpStateForTests().warpRecycles, 0);
+				assert.ok(
+					Date.now() - startedAt < 1_000,
+					"and it does not poll for a confirmation that cannot come",
+				);
+			},
+		);
+	} finally {
+		setLogFileForTests("");
+	}
+	const events = readEvents(file).map((event) => event.ev);
+	assert.ok(events.includes("recycle_refused"), `the refusal is on disk: ${events}`);
+	assert.ok(
+		JSON.stringify(readEvents(file)).includes("blocked_by_swap"),
+		"the draining exit names the swap as the blocker, using the body it already sends",
+	);
+	assert.equal(
+		JSON.stringify(readEvents(file)).includes("rotate_ok"),
+		false,
+		"a refused rotation is never recorded as confirmed",
+	);
+	assert.equal(
+		JSON.stringify(readEvents(file)).includes("rotate_failed"),
+		false,
+		"and it is not a failure either: it never got to poll for a confirmation",
+	);
+});
+
+test("rotateWarpExit: without a draining exit the blocker is the recycle (S9)", async () => {
+	const file = join(logDir(), "relay-refused-recycle.jsonl");
+	setLogFileForTests(file);
+	try {
+		await driveWarp(
+			(call) => {
+				if (call.url.endsWith("/recycle")) {
+					return new Response(JSON.stringify({ ok: false }), { status: 202 });
+				}
+				if (call.url.includes("/health")) return healthJson({ recycling: true, exits: [`${EXIT_A} (in_use, streams=1)`] });
+				return new Response("ok", { status: 200 });
+			},
+			async () => {
+				assert.equal(await rotateWarpExit(WARP_CONFIG, undefined), false);
+			},
+		);
+	} finally {
+		setLogFileForTests("");
+	}
+	const raw = JSON.stringify(readEvents(file));
+	assert.ok(raw.includes("blocked_by_recycle"), `no draining exit means the recycle refused: ${raw}`);
+	assert.equal(raw.includes("blocked_by_swap"), false);
+});
+// ---------------------------------------------------------------------------
 // Slice 2 — attribution is wired into the request path (S6)
 // ---------------------------------------------------------------------------
 // The pure helpers above are necessary and not sufficient: without the wiring
