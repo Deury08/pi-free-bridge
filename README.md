@@ -259,6 +259,41 @@ Con la rotación confirmada hace **un** reenvío, y nada más:
   `warpResendEnabled` (si el mecanismo está activo en este proceso).
 - `RELAY_WARP_RETRY_AFTER_RECYCLE=0` lo apaga del todo, sin tocar el resto.
 
+### Escalera de recuperación: swap apuntado antes que recycle
+
+Un `429` de WARP ya no tiene la rotación dura como único paso. La escalera va de
+menor a mayor costo:
+
+1. **Un intento por IP.** El `429` se atribuye a un exit concreto leyendo el
+   contador `served` de `/health` —túneles abiertos por ese exit, no requests—:
+   snapshot antes del intento, snapshot después del `429`, y sólo un delta de
+   exactamente 1 sobre un único exit cuenta como evidencia. Con el mapa dudoso o
+   vacío **no se rota**: se entrega el `429`, y el escape forzado es el comando
+   manual.
+2. **`POST /swap` apuntado por id.** Reemplaza sólo ese exit: un enrolamiento en
+   vez de N, y el pool sigue sirviendo por el otro. Un `202` es aceptación y ya
+   trae el estado publicado (el `target` en `draining`), así que no hay nada que
+   esperar. `409` (no hay standby) y `404` (id desconocido) son respuestas: no se
+   insisten.
+3. **Un reintento** en el exit nuevo. Si entrega, terminó.
+4. **`/recycle`** sólo si ese reintento también da `429`. Es el único paso que
+   corta los streams en vuelo —incluido el tuyo—, así que va último.
+5. **Un reintento más**, y si tampoco: el `429` original byte-exacto.
+
+Acotada por construcción: dos intentos extra como máximo, nunca un loop.
+
+Dos detalles que costaron encontrar:
+
+- Un `202` con `{"ok":false}` (o un `/recycle` rechazado) significa que **otro**
+  swap o recycle tiene el estado del proxy: no pasó nada, así que no se arma
+  cooldown y no se cuenta como acción. Sólo un `202` puede decir `ok:false` y
+  significarlo; un `409`/`404` llega con status de error y ahí el status es la
+  respuesta.
+- Si el proxy no tiene `/swap` (binario viejo, o stack WireGuard que responde
+  `501` en texto plano, o un `404` sin el motivo `unknown_exit`), el relay lo
+  detecta, avisa **una vez** y sigue rotando duro. Reintentar cada minuto contra
+  una ruta que no existe sólo quema cooldowns.
+
 ### Parking de la IP local
 
 Un `429` en el egress **local** no es lo mismo que uno en WARP: el relay no puede
@@ -391,6 +426,9 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `PI_FREE_BRIDGE_WARP_MODE` | Pisa el modo de egress WARP (también `off`, `auto`, `on`; máxima precedencia). Mientras exista, el relay **no** lee el `warpEnabled` del config — el modo queda fijado (estático por diseño) |
 | `RELAY_WARP_RECYCLE_COOLDOWN_MS` | Relay-only: cool-down entre recycles (default `300000`). La rotación en sí **no** es configurable: ocurre en el primer `429` observado en el egress warp, porque cualquier umbral mayor entregaría ese tanto de `429` antes de rotar. El relay degrada con gracia si el proxy no tiene endpoint `/recycle`. |
 | `RELAY_WARP_RETRY_AFTER_RECYCLE` | Relay-only: kill switch del reenvío único tras una rotación confirmada. `0` lo desactiva (se entrega el `429` original tal cual); ausente o cualquier otro valor lo mantiene activo. |
+| `RELAY_WARP_SWAP` | Relay-only: kill switch del swap apuntado. `0` lo desactiva y deja la rotación dura como único paso; ausente o cualquier otro valor lo mantiene activo. |
+| `RELAY_WARP_SWAP_COOLDOWN_MS` | Relay-only: cool-down propio del swap (default `60000`), más corto que el del recycle porque reemplazar un exit es mucho más barato que tirar el pool entero. |
+| `RELAY_WARP_SWAP_MIN_RETRY_AFTER_MS` | Relay-only: si el `retry-after` del `429` es menor que esto (default `120000`), el relay espera en vez de gastar un enrolamiento. Un swap consume cuota de Cloudflare, que es justo lo escaso cuando el gate ya está devolviendo `1015`. |
 | `RELAY_LOG_FILE` | Relay-only: ruta del log de eventos de WARP en JSONL (un objeto por línea: `429` observado, rotación pedida/confirmada/fallida con motivo, reenvío, parking local, entrega final). Sin valor **no escribe nada**. Rota a los 5 MB conservando un `.1`. Nunca registra bodies, cabeceras ni prompts: solo el evento y los contadores que explican la decisión |
 | `PI_FREE_BRIDGE_WARP_PROXY` | URL del proxy WARP (por defecto `http://127.0.0.1:8789`) |
 | `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` (precedencia sobre `warpBin` en config) |

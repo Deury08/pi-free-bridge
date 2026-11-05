@@ -6,6 +6,22 @@
 
 ## Unreleased
 
+- **A targeted swap before the hard rotation**: a WARP `429` is now attributed to
+  the exit that served it through the proxy's monotonic `served` counter, and the
+  ladder replaces only that exit (`POST /swap`) plus one resend, falling back to
+  the pool-wide `/recycle` only when the fresh exit refuses too. One enrollment
+  instead of N, no stream cut, and the pool is never left without a healthy exit.
+  Attribution is deliberately conservative: a doubtful map means no rotation at
+  all rather than a swap aimed at an innocent exit, and the manual command stays
+  as the forced escape. A `202` carrying `ok:false` is a refusal and spends
+  nothing, a `409`/`404` is a real answer that is not insisted on, and a proxy
+  without `/swap` (older binary, or the WireGuard stack answering `501`) is
+  detected once, warned once, and the relay keeps rotating. `RELAY_WARP_SWAP=0`
+  is the kill switch, `RELAY_WARP_SWAP_COOLDOWN_MS` is the swap's own cool-down
+  (shorter than the recycle's, because replacing one exit is much cheaper than
+  tearing the pool down), and `RELAY_WARP_SWAP_MIN_RETRY_AFTER_MS` decides how
+  short a `retry-after` makes waiting cheaper than enrolling.
+
 - **Manual WARP rotation, by the same path as the automatic one**: new
   `/free-bridge-warp-recycle` command, backed by a loopback `POST /warp/recycle`
   route on the relay. It exists because the only manual recovery a burnt exit had

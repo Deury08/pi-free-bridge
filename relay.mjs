@@ -609,10 +609,12 @@ export function decideWarpSwap({
 	exitId,
 	retryAfterMs,
 	enabled = true,
+	unavailable = false,
 	onCooldown = false,
 	inFlight = false,
 	shortWindowMs = SWAP_MIN_RETRY_AFTER_MS,
 } = {}) {
+	if (unavailable) return { swap: false, reason: "unavailable" };
 	if (!enabled) return { swap: false, reason: "disabled" };
 	if (!exitId) return { swap: false, reason: "no_attribution" };
 	if (inFlight) return { swap: false, reason: "in_flight" };
@@ -670,6 +672,14 @@ let warpRecycleUnavailableWarned = false;
 let warpSwapNotBefore = 0;
 let warpSwapInFlight = false;
 let warpSwaps = 0;
+// The proxy answered that it has no /swap at all — an older binary, or one
+// running the WireGuard stack, where the route is a 501. Nothing about the exit
+// is wrong in that case, so retrying would burn a cooldown every minute for the
+// life of the process: the ladder steps aside once and stays aside.
+let warpSwapUnsupported = false;
+let warpSwapUnsupportedWarned = false;
+// Test-only mirror of `RELAY_WARP_SWAP`, which is read once at load.
+let warpSwapEnabledOverride = true;
 // The exit the relay believes its own tunnel rides on, learned from the
 // proxy's `served` counter. `undefined` means "unknown", and unknown is a
 // decision on its own: the ladder does not rotate without a target.
@@ -844,6 +854,9 @@ export function resetWarpStateForTests() {
 	warpSwapNotBefore = 0;
 	warpSwapInFlight = false;
 	warpSwaps = 0;
+	warpSwapUnsupported = false;
+	warpSwapUnsupportedWarned = false;
+	warpSwapEnabledOverride = true;
 	tunnelExit = undefined;
 	warpPreferred = false;
 	lastEgress = undefined;
@@ -860,6 +873,7 @@ export function warpStateForTests() {
 		warpSwaps,
 		warpSwapNotBefore,
 		warpSwapInFlight,
+		warpSwapUnsupported,
 		tunnelExit,
 		warpRecycleNotBefore,
 		warpRecycleInFlight,
@@ -868,6 +882,12 @@ export function warpStateForTests() {
 		localParkedUntil,
 		deliveringWarpStreams,
 	};
+}
+
+/** Test-only: turn the targeted swap off the way `RELAY_WARP_SWAP=0` does. The
+ *  production flag is read once at load, which a test cannot re-read. */
+export function setWarpSwapEnabledForTests(enabled) {
+	warpSwapEnabledOverride = enabled !== false;
 }
 
 /** Test-only: shrink the rotation window; a real rotation poll would cost the
@@ -1178,7 +1198,8 @@ async function noteWarpAttribution(config, before) {
 export async function swapWarpExit(config, exitId, client) {
 	const decision = decideWarpSwap({
 		exitId,
-		enabled: WARP_SWAP_ENABLED,
+		enabled: WARP_SWAP_ENABLED && warpSwapEnabledOverride,
+		unavailable: warpSwapUnsupported,
 		onCooldown: Date.now() < warpSwapNotBefore,
 		inFlight: warpSwapInFlight,
 	});
@@ -1215,6 +1236,25 @@ export async function swapWarpExit(config, exitId, client) {
 			body = undefined;
 		}
 		const target = body && typeof body.target === "string" ? body.target : undefined;
+		// Not every non-2xx is JSON: a 405 and a 501 answer in plain text, and a 404
+		// without our own `unknown_exit` reason is a route that does not exist. Those
+		// are not exit problems, so retrying would burn a cooldown every minute for
+		// the life of the process: the ladder steps aside once and stays aside.
+		const unsupported =
+			res.status === 405 ||
+			res.status === 501 ||
+			(res.status === 404 && !(body && body.reason === "unknown_exit"));
+		if (unsupported) {
+			warpSwapUnsupported = true;
+			if (!warpSwapUnsupportedWarned) {
+				warpSwapUnsupportedWarned = true;
+				process.stderr.write(
+					`pi-free-bridge relay: this proxy has no /swap (HTTP ${res.status}) — the targeted swap is off, rotating hard instead\n`,
+				);
+			}
+			logWarpEvent("swap_unavailable", { status: res.status, exit: exitId });
+			return { swapped: false, reason: "unavailable", status: res.status };
+		}
 		// `ok:false` is the proxy saying nothing happened: a swap or a recycle is
 		// already in flight and this one was refused. A 202 alone is not enough to
 		// call it accepted, and neither is an exit in `cooldown` — a target in
@@ -1343,7 +1383,7 @@ export async function recoverWarp429(config, pathname, body, original, client) {
 	const decision = decideWarpSwap({
 		exitId: tunnelExit,
 		retryAfterMs: original.retryAfterMs,
-		enabled: WARP_SWAP_ENABLED,
+		enabled: WARP_SWAP_ENABLED && warpSwapEnabledOverride,
 		onCooldown: Date.now() < warpSwapNotBefore,
 		inFlight: warpSwapInFlight,
 	});

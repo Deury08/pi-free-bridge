@@ -544,6 +544,7 @@ import {
 	rotateWarpExit,
 	setDeliveringStreamsForTests,
 	setWarpRotationTimingForTests,
+	setWarpSwapEnabledForTests,
 	warpExitSnapshot,
 	warpHealthState,
 	warpHealthUrl,
@@ -2428,4 +2429,89 @@ test("ladder: when the fresh exit refuses too, the recycle is still there (S8)",
 			assert.equal(upstreamCalls(fake.calls).length, 3, "original, after the swap, after the rotation");
 		},
 	);
+});
+
+// ---------------------------------------------------------------------------
+// Slice 2 — degradation and the kill switch (S10)
+// ---------------------------------------------------------------------------
+// An older proxy, or one running the WireGuard stack, has no /swap at all. That
+// is not an exit problem, and retrying would burn a cooldown every minute for
+// the life of the process: the ladder steps aside once and stays aside. Not
+// every non-2xx is JSON either — 405 and 501 answer in plain text.
+
+test("swapWarpExit: a plain-text 501 turns the swap off instead of retrying (S10)", () => {
+	const calls = [];
+	return withWarpFetch(
+		async (url) => {
+			calls.push(String(url));
+			if (String(url).endsWith("/swap")) {
+				return new Response("not supported: this stack has no per-exit swap", { status: 501 });
+			}
+			return new Response("{}", { status: 200 });
+		},
+		async () => {
+			const first = await swapWarpExit(WARP_CONFIG, EXIT_A);
+			assert.equal(first.swapped, false);
+			assert.equal(first.reason, "unavailable", "a route that does not exist is not an exit problem");
+			assert.equal(warpStateForTests().warpSwapUnsupported, true);
+
+			const second = await swapWarpExit(WARP_CONFIG, EXIT_A);
+			assert.equal(second.reason, "unavailable");
+			assert.equal(calls.length, 1, "once is a discovery, twice would be a routine");
+		},
+	);
+});
+
+test("swapWarpExit: a 404 that names unknown_exit is not a missing route (S10)", () => {
+	// The proxy sends this shape when the id is gone. Treating it as "no /swap"
+	// would switch the ladder off for the rest of the process over one stale id.
+	return withWarpFetch(
+		async (url) => {
+			if (String(url).endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: false, reason: "unknown_exit" }), { status: 404 });
+			}
+			return new Response("{}", { status: 200 });
+		},
+		async () => {
+			const result = await swapWarpExit(WARP_CONFIG, EXIT_A);
+			assert.equal(result.reason, "unknown_exit");
+			assert.equal(warpStateForTests().warpSwapUnsupported, false, "the route is there; the id was not");
+		},
+	);
+});
+
+test("decideWarpSwap: an unavailable route outranks every other reason", () => {
+	assert.deepEqual(decideWarpSwap({ exitId: "a", unavailable: true }), { swap: false, reason: "unavailable" });
+	assert.deepEqual(decideWarpSwap({ exitId: "a", enabled: false, unavailable: true }), {
+		swap: false,
+		reason: "unavailable",
+	});
+});
+
+test("ladder: RELAY_WARP_SWAP=0 leaves the hard rotation as the only step (S10)", async () => {
+	const nextHealth = sequencedHealth([
+		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+	]);
+	const nextUpstream = upstreamThen([429, 200]);
+	setWarpSwapEnabledForTests(false);
+	try {
+		await driveWarp(
+			(call) => {
+				if (call.url.endsWith("/health")) return nextHealth();
+				if (call.url.endsWith("/swap")) return new Response(JSON.stringify({ ok: true }), { status: 202 });
+				if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+				return nextUpstream();
+			},
+			async (fake) => {
+				// driveWarp resets the module state, so the switch is flipped after it.
+				setWarpSwapEnabledForTests(false);
+				const res = fakeRelayRes();
+				await forward(fakeReq({ marker: "kill-switch" }), res, RESEND_PATH, FORWARD_CONFIG);
+				assert.equal(swapPosts(fake.calls).length, 0, "the kill switch is not a suggestion");
+			},
+		);
+	} finally {
+		setWarpSwapEnabledForTests(true);
+	}
 });
