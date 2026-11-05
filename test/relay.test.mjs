@@ -527,23 +527,28 @@ test("readFileWarpMode: a missing config file never throws", () => {
 // `recycling: false` false-positive cannot come back.
 
 import {
+	decideWarpSwap,
 	isRotationConfirmed,
 	LOG_LIMIT_BYTES,
 	logLine,
 	makeEventLogger,
 	manualWarpRecycle,
 	resetWarpStateForTests,
+	servedDelta,
 	setLogFileForTests,
 	shouldRotateLog,
+	updateTunnelExit,
 	warpControlRoute,
 	resendAfterRotation,
 	rotateWarpExit,
 	setDeliveringStreamsForTests,
 	setWarpRotationTimingForTests,
+	warpExitSnapshot,
 	warpHealthState,
 	warpHealthUrl,
 	warpResendEnabled,
 	warpStateForTests,
+	warpSwapEnabled,
 } from "../relay.mjs";
 
 // Verbatim shape of warp-minimal's /health (L26). The published entry is
@@ -1778,4 +1783,170 @@ test("manualWarpRecycle: it waits for in-flight warp streams before cutting the 
 	assert.equal(postedAt.length, 1, "exactly one POST");
 	const waited = postedAt[0] - startedAt;
 	assert.ok(waited >= 100, `the POST came ${waited}ms in — it must wait for the stream`);
+});
+
+// ---------------------------------------------------------------------------
+// Slice 2 — per-exit attribution from the proxy's `served` counter (S6)
+// ---------------------------------------------------------------------------
+// The contract (odd/tasks/warp-per-exit-swap.md) publishes each exit as
+// `<full id> (<state>, served=N, streams=N)`: always the three fields, in that
+// order, no optional fields. The relay cannot see the CONNECT at all — Bun owns
+// it and exposes neither its request nor its response headers — so this counter
+// is the only way to learn which exit served a 429.
+
+const EXIT_A = "warp-18e5257c545b2e64";
+const EXIT_B = "warp-18e9a1c04f7d3b12";
+
+function snapshotOf(entries) {
+	return warpExitSnapshot({ ok: true, recycling: false, exits: entries });
+}
+
+test("warpExitSnapshot: reads id, state, served and streams from the contract format", () => {
+	const snapshot = snapshotOf([`${EXIT_A} (healthy, served=42, streams=0)`, `${EXIT_B} (in_use, served=17, streams=1)`]);
+	assert.deepEqual(snapshot.exits, [
+		{ id: EXIT_A, state: "healthy", served: 42, streams: 0 },
+		{ id: EXIT_B, state: "in_use", served: 17, streams: 1 },
+	]);
+});
+
+test("warpExitSnapshot: keeps the whole id and tolerates an older entry without served", () => {
+	const snapshot = snapshotOf(["warp-18e (in_use, streams=1)"]);
+	assert.equal(snapshot.exits[0].id, "warp-18e", "the id is everything before the annotation");
+	assert.equal(snapshot.exits[0].served, undefined, "an older proxy has no counter to read");
+	assert.equal(snapshot.exits[0].streams, 1);
+});
+
+test("warpExitSnapshot: a body that is not a health report yields nothing", () => {
+	assert.equal(warpExitSnapshot("<html>nope</html>"), undefined);
+	assert.equal(warpExitSnapshot([1, 2]), undefined);
+	assert.equal(warpExitSnapshot(null), undefined);
+});
+
+test("servedDelta: the single exit whose counter grew by one is the culprit", () => {
+	const before = snapshotOf([`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=17, streams=0)`]);
+	const after = snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=17, streams=0)`]);
+	const delta = servedDelta(before, after);
+	assert.equal(delta.learned, EXIT_A);
+	assert.deepEqual(delta.changed.map((entry) => entry.id), [EXIT_A]);
+	assert.equal(delta.ambiguous, false);
+});
+
+test("servedDelta: two exits moving at once is ambiguous, never an attribution", () => {
+	const before = snapshotOf([`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (in_use, served=17, streams=1)`]);
+	const after = snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (in_use, served=18, streams=1)`]);
+	const delta = servedDelta(before, after);
+	assert.equal(delta.learned, undefined);
+	assert.equal(delta.ambiguous, true);
+});
+
+test("servedDelta: one exit moving by more than one is not learnable either", () => {
+	const before = snapshotOf([`${EXIT_A} (healthy, served=40, streams=0)`, `${EXIT_B} (healthy, served=5, streams=0)`]);
+	const after = snapshotOf([`${EXIT_A} (healthy, served=42, streams=0)`, `${EXIT_B} (healthy, served=5, streams=0)`]);
+	const delta = servedDelta(before, after);
+	assert.equal(delta.learned, undefined, "two tunnels opened in the window: which one is ours is unknown");
+	assert.equal(delta.ambiguous, true);
+});
+
+test("servedDelta: nothing moving means the request reused an existing tunnel", () => {
+	const before = snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`]);
+	const after = snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`]);
+	const delta = servedDelta(before, after);
+	assert.equal(delta.unchanged, true);
+	assert.equal(delta.learned, undefined);
+	assert.equal(delta.ambiguous, false);
+});
+
+test("servedDelta: an unreadable or counter-less report teaches nothing", () => {
+	const before = snapshotOf([`${EXIT_A} (healthy, served=1, streams=0)`]);
+	assert.equal(servedDelta(before, undefined).learned, undefined);
+	const legacy = servedDelta(snapshotOf(["warp-18e (in_use, streams=1)"]), snapshotOf(["warp-18e (healthy, streams=0)"]));
+	assert.equal(legacy.learned, undefined, "without served there is no evidence at all");
+});
+
+test("updateTunnelExit: an empty map adopts the exit the delta named", () => {
+	const delta = servedDelta(
+		snapshotOf([`${EXIT_A} (healthy, served=1, streams=0)`]),
+		snapshotOf([`${EXIT_A} (healthy, served=2, streams=0)`]),
+	);
+	const next = updateTunnelExit(undefined, delta, { mapValid: false });
+	assert.deepEqual(next, { exitId: EXIT_A, decision: "learned" });
+});
+
+test("updateTunnelExit: a delta on another exit while our map holds is foreign traffic", () => {
+	const delta = servedDelta(
+		snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=8, streams=0)`]),
+	);
+	const next = updateTunnelExit(EXIT_A, delta, { mapValid: true });
+	assert.deepEqual(next, { exitId: EXIT_A, decision: "ignored_foreign" }, "a browser opening a tunnel must not move our map");
+});
+
+test("updateTunnelExit: our own exit moving while the map holds is a contradiction", () => {
+	const delta = servedDelta(
+		snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`]),
+		snapshotOf([`${EXIT_A} (in_use, served=43, streams=1)`]),
+	);
+	const next = updateTunnelExit(EXIT_A, delta, { mapValid: true });
+	assert.deepEqual(next, { exitId: undefined, decision: "knockout" });
+});
+
+test("updateTunnelExit: after our exit was replaced, a single delta is learned again", () => {
+	const delta = servedDelta(
+		snapshotOf([`${EXIT_B} (healthy, served=8, streams=0)`]),
+		snapshotOf([`${EXIT_B} (healthy, served=9, streams=1)`]),
+	);
+	const next = updateTunnelExit(EXIT_A, delta, { mapValid: false });
+	assert.deepEqual(next, { exitId: EXIT_B, decision: "learned" }, "a swap killed our tunnel: the next one is the new truth");
+});
+
+test("updateTunnelExit: ambiguity knocks the map out instead of guessing", () => {
+	const delta = servedDelta(
+		snapshotOf([`${EXIT_A} (healthy, served=1, streams=0)`, `${EXIT_B} (healthy, served=1, streams=0)`]),
+		snapshotOf([`${EXIT_A} (healthy, served=2, streams=0)`, `${EXIT_B} (healthy, served=2, streams=0)`]),
+	);
+	const next = updateTunnelExit(EXIT_A, delta, { mapValid: true });
+	assert.deepEqual(next, { exitId: undefined, decision: "knockout" });
+});
+
+test("updateTunnelExit: an unchanged delta keeps whatever we know", () => {
+	const delta = servedDelta(
+		snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`]),
+		snapshotOf([`${EXIT_A} (in_use, served=42, streams=1)`]),
+	);
+	assert.deepEqual(updateTunnelExit(EXIT_A, delta, { mapValid: true }), { exitId: EXIT_A, decision: "kept" });
+	assert.deepEqual(updateTunnelExit(undefined, delta, { mapValid: false }), {
+		exitId: undefined,
+		decision: "kept",
+	});
+});
+
+test("decideWarpSwap: rotating without an attributed exit is forbidden", () => {
+	assert.deepEqual(decideWarpSwap({ exitId: undefined, retryAfterMs: 3_600_000 }), {
+		swap: false,
+		reason: "no_attribution",
+	});
+});
+
+test("decideWarpSwap: a short retry-after means wait, because a swap burns an enrollment", () => {
+	const short = decideWarpSwap({ exitId: EXIT_A, retryAfterMs: 30_000, shortWindowMs: 120_000 });
+	assert.deepEqual(short, { swap: false, reason: "short_retry_after" });
+	const unknown = decideWarpSwap({ exitId: EXIT_A, retryAfterMs: undefined, shortWindowMs: 120_000 });
+	assert.equal(unknown.swap, true, "no recovery window is the case a swap exists for");
+	const long = decideWarpSwap({ exitId: EXIT_A, retryAfterMs: 3_600_000, shortWindowMs: 120_000 });
+	assert.equal(long.swap, true);
+});
+
+test("decideWarpSwap: disabled, cooling down or already in flight all refuse", () => {
+	assert.equal(decideWarpSwap({ exitId: EXIT_A, enabled: false }).reason, "disabled");
+	assert.equal(decideWarpSwap({ exitId: EXIT_A, onCooldown: true }).reason, "cooldown");
+	assert.equal(decideWarpSwap({ exitId: EXIT_A, inFlight: true }).reason, "in_flight");
+	assert.equal(decideWarpSwap({ exitId: EXIT_A }).swap, true);
+});
+
+test("warpSwapEnabled: only an explicit zero turns the swap off", () => {
+	assert.equal(warpSwapEnabled("0"), false);
+	assert.equal(warpSwapEnabled(0), false);
+	assert.equal(warpSwapEnabled(undefined), true);
+	assert.equal(warpSwapEnabled(""), true);
+	assert.equal(warpSwapEnabled("no"), true, "a typo must not silently disable the ladder");
 });

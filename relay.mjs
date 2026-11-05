@@ -483,6 +483,144 @@ export function isRotationConfirmed(before, health, seenRecycling) {
 	return current.some((exit) => !known.has(exit));
 }
 
+// ---------------------------------------------------------------------------
+// Slice 2 — attribution, and the tunnel -> exit map it feeds (S6)
+// ---------------------------------------------------------------------------
+//
+// The relay cannot see the CONNECT at all: Bun owns it, and `fetch({proxy})`
+// exposes neither the CONNECT request nor its response headers (measured, not
+// assumed). So `X-Warp-Exit` is invisible from here, and the only channel left
+// is the proxy's own `/health` report.
+//
+// Since slice 2 that report publishes each exit as
+// `<full id> (<state>, served=N, streams=N)` — always the three fields, in that
+// order, no optional ones. `served` counts the CONNECT tunnels that exit
+// established and never resets while the exit lives, so a delta between two
+// snapshots is the one honest way to learn which exit served a request.
+//
+// Two consequences shape everything below. First, a counter, not a request: one
+// tunnel carries many requests, so the relay learns ONCE and then reuses the
+// answer (Bun reuses the tunnel — three requests, one CONNECT, measured).
+// Second, the counter belongs to the EXIT, not to us: any other process on this
+// machine opening a tunnel through the same proxy moves it too. That is why the
+// map refuses to re-learn while it holds an answer it can still trust.
+
+/** Pure: reduce a /health body to its exits with their counters. An older
+ *  proxy publishes no `served`, which stays `undefined` rather than defaulting
+ *  to zero: "no evidence" and "zero tunnels" are different answers, and only
+ *  the first one forbids learning the map. */
+export function warpExitSnapshot(body) {
+	if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+	const exits = [];
+	for (const entry of Array.isArray(body.exits) ? body.exits : []) {
+		if (typeof entry !== "string") continue;
+		const open = entry.indexOf("(");
+		const id = (open === -1 ? entry : entry.slice(0, open)).trim();
+		if (!id) continue;
+		const inner = open === -1 ? "" : entry.slice(open + 1, entry.lastIndexOf(")"));
+		const fields = inner
+			.split(",")
+			.map((field) => field.trim())
+			.filter((field) => field.length > 0);
+		const counter = (name) => {
+			const field = fields.find((candidate) => candidate.startsWith(`${name}=`));
+			if (!field) return undefined;
+			const value = Number.parseInt(field.slice(name.length + 1), 10);
+			return Number.isInteger(value) ? value : undefined;
+		};
+		exits.push({
+			id,
+			state: fields.length > 0 ? fields[0] : undefined,
+			served: counter("served"),
+			streams: counter("streams"),
+		});
+	}
+	return { recycling: body.recycling === true, exits };
+}
+
+/** Pure: what moved between two snapshots. Only exits present in BOTH are
+ *  compared: the contract guarantees a NEW id per enrollment, so a fresh id
+ *  starts from zero and comparing it against nothing would invent a delta. A
+ *  single exit that advanced by exactly one tunnel is the only learnable
+ *  answer; two exits, or one that jumped by more, mean the window saw tunnels
+ *  that may not be ours, and that must never be guessed around. */
+export function servedDelta(before, after) {
+	const result = { learned: undefined, changed: [], gone: [], unchanged: true, ambiguous: false };
+	if (!after || !Array.isArray(after.exits)) return result;
+	const prior = new Map();
+	if (before && Array.isArray(before.exits)) {
+		for (const exit of before.exits) prior.set(exit.id, exit.served);
+	}
+	for (const exit of after.exits) {
+		if (!prior.has(exit.id)) continue;
+		const was = prior.get(exit.id);
+		if (typeof was !== "number" || typeof exit.served !== "number") continue;
+		if (exit.served > was) result.changed.push({ id: exit.id, delta: exit.served - was });
+	}
+	const alive = new Set(after.exits.map((exit) => exit.id));
+	for (const id of prior.keys()) if (!alive.has(id)) result.gone.push(id);
+	result.unchanged = result.changed.length === 0;
+	result.ambiguous =
+		result.changed.length > 1 || (result.changed.length === 1 && result.changed[0].delta !== 1);
+	if (!result.ambiguous && result.changed.length === 1) result.learned = result.changed[0].id;
+	return result;
+}
+
+/** Pure: the tunnel -> exit map, and the policy that keeps it honest (D8).
+ *  `mapValid` is the caller's statement that the exit it holds still exists and
+ *  was not just swapped — when it is false the previous answer is dead and a
+ *  single delta is the new truth. While the map is valid the answer is sticky:
+ *  our tunnel is reused, so its counter must not move, and any movement is
+ *  either foreign traffic (another exit, keep ours) or a contradiction (our own
+ *  exit, drop it). Ambiguity drops it too. Dropping is cheap and self-healing:
+ *  an empty map is learned again on the next window, and until then the caller
+ *  does not rotate at all. */
+export function updateTunnelExit(previous, delta, { mapValid = false } = {}) {
+	if (!delta || delta.unchanged) return { exitId: previous, decision: "kept" };
+	if (delta.ambiguous) return { exitId: undefined, decision: "knockout" };
+	if (!delta.learned) return { exitId: previous, decision: "kept" };
+	if (!previous || mapValid === false) return { exitId: delta.learned, decision: "learned" };
+	if (delta.learned === previous) return { exitId: undefined, decision: "knockout" };
+	return { exitId: previous, decision: "ignored_foreign" };
+}
+
+/** How short a `retry-after` makes waiting cheaper than re-enrolling. A swap
+ *  spends one Cloudflare enrollment, and under a 429 storm enrollments are the
+ *  scarce thing, so a window measured in seconds is not worth one. */
+const SWAP_MIN_RETRY_AFTER_MS = (() => {
+	const n = Number.parseInt(process.env.RELAY_WARP_SWAP_MIN_RETRY_AFTER_MS ?? "", 10);
+	return Number.isInteger(n) && n >= 0 ? n : 120_000;
+})();
+
+/** Pure: whether the ladder may spend a targeted swap on this 429 (S7, S9).
+ *  No attributed exit means no target, and rotating without a target is the
+ *  blind swap the proxy's own contract warns against (the body-less default
+ *  picks by live streams, and by the time we decide the culprit is idle). */
+export function decideWarpSwap({
+	exitId,
+	retryAfterMs,
+	enabled = true,
+	onCooldown = false,
+	inFlight = false,
+	shortWindowMs = SWAP_MIN_RETRY_AFTER_MS,
+} = {}) {
+	if (!enabled) return { swap: false, reason: "disabled" };
+	if (!exitId) return { swap: false, reason: "no_attribution" };
+	if (inFlight) return { swap: false, reason: "in_flight" };
+	if (onCooldown) return { swap: false, reason: "cooldown" };
+	if (typeof retryAfterMs === "number" && retryAfterMs >= 0 && retryAfterMs < shortWindowMs) {
+		return { swap: false, reason: "short_retry_after" };
+	}
+	return { swap: true, reason: "ok" };
+}
+
+/** Pure: S10's kill switch. Only an explicit `0` turns the swap off; unset,
+ *  empty or garbage all mean "on", so a typo cannot silently disable the
+ *  ladder and leave the user back where this slice started. */
+export function warpSwapEnabled(value) {
+	return String(value ?? "").trim() !== "0";
+}
+
 /** Pure: S18's kill switch. Only an explicit `0` turns the resend off; unset,
  *  empty or garbage all mean "on", so a typo cannot silently disable it. */
 export function warpResendEnabled(value) {
