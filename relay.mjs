@@ -435,6 +435,15 @@ const RECYCLE_COOLDOWN_MS = (() => {
 	return Number.isInteger(n) && n >= 0 ? n : 5 * 60_000;
 })();
 
+/** A targeted swap costs one Cloudflare enrollment, so it gets its own, shorter
+ *  cooldown: the recycle cooldown protects a whole tunnel from being torn down
+ *  twice, while this one only has to stop a burst of 429s from re-enrolling the
+ *  same exit over and over while the gate is already rate-limiting. */
+const SWAP_COOLDOWN_MS = (() => {
+	const n = Number.parseInt(process.env.RELAY_WARP_SWAP_COOLDOWN_MS ?? "", 10);
+	return Number.isInteger(n) && n >= 0 ? n : 60_000;
+})();
+
 /** Pure: the proxy's health URL. The path is warp-minimal's own (`health_path`
  *  in its config, handed over as `RELAY_WARP_HEALTH_PATH`); a missing or
  *  shapeless value falls back to the documented default, because probing an
@@ -628,6 +637,7 @@ export function warpResendEnabled(value) {
 }
 
 const WARP_RESEND_ENABLED = warpResendEnabled(process.env.RELAY_WARP_RETRY_AFTER_RECYCLE);
+const WARP_SWAP_ENABLED = warpSwapEnabled(process.env.RELAY_WARP_SWAP);
 /** A rotation takes ~4s end to end (L26). 10s covers a slow enroll without
  *  holding the client past its own patience. */
 const ROTATION_TIMEOUT_MS = 10_000;
@@ -657,6 +667,13 @@ let warpResends = 0;
 let warpRecycleNotBefore = 0;
 let warpRecycleInFlight = false;
 let warpRecycleUnavailableWarned = false;
+let warpSwapNotBefore = 0;
+let warpSwapInFlight = false;
+let warpSwaps = 0;
+// The exit the relay believes its own tunnel rides on, learned from the
+// proxy's `served` counter. `undefined` means "unknown", and unknown is a
+// decision on its own: the ladder does not rotate without a target.
+let tunnelExit = undefined;
 // S16/S17: when the LOCAL egress gets a 429, that IP spent its day. The header
 // says when it resets, so local stops being offered first until then. In memory
 // only — a restart re-learns it with one request that costs no quota (S4).
@@ -824,6 +841,10 @@ export function resetWarpStateForTests() {
 	warpRecycleNotBefore = 0;
 	warpRecycleInFlight = false;
 	warpResends = 0;
+	warpSwapNotBefore = 0;
+	warpSwapInFlight = false;
+	warpSwaps = 0;
+	tunnelExit = undefined;
 	warpPreferred = false;
 	lastEgress = undefined;
 	localParkedUntil = 0;
@@ -836,6 +857,10 @@ export function warpStateForTests() {
 		warp429Streak,
 		warpRecycles,
 		warpResends,
+		warpSwaps,
+		warpSwapNotBefore,
+		warpSwapInFlight,
+		tunnelExit,
 		warpRecycleNotBefore,
 		warpRecycleInFlight,
 		warpPreferred,
@@ -1055,6 +1080,119 @@ export async function rotateWarpExit(config, client) {
 	} finally {
 		warpRecycleInFlight = false;
 	}
+}
+
+/** The richer `/health` read: the rotation poll only needs names, but
+ *  attribution needs the counters. Kept separate so the tested rotation path
+ *  keeps its exact semantics. */
+async function readWarpSnapshot(config) {
+	try {
+		const res = await fetch(warpHealthUrl(config.warpProxy, config.warpHealthPath), {
+			signal: AbortSignal.timeout(2_000),
+		});
+		if (!res.ok) return undefined;
+		return warpExitSnapshot(await res.json());
+	} catch {
+		return undefined;
+	}
+}
+
+/** S7: rotate ONE exit instead of the whole pool. The proxy stops handing work
+ *  to the target, re-enrolls only that exit, and keeps serving through the
+ *  other one — one enrollment instead of N, and the pool is never left empty.
+ *
+ *  The drain wait is reused on purpose: our own deliveries are multiplexed over
+ *  the target too, so replacing it still kills the streams riding it. It is
+ *  cheap in the case this exists for, because by the time a 429 is being
+ *  diagnosed nothing of ours is still streaming.
+ *
+ *  A `202` is acceptance, not completion: the caller must not resend on the
+ *  strength of it alone. `409` (no standby) and `404` (unknown exit) are real
+ *  answers, and both mean "do not insist now" — with two exits a 409 says the
+ *  other one is already down, so hammering would only burn enrollments while
+ *  the gate is rate-limiting. */
+export async function swapWarpExit(config, exitId, client) {
+	const decision = decideWarpSwap({
+		exitId,
+		enabled: WARP_SWAP_ENABLED,
+		onCooldown: Date.now() < warpSwapNotBefore,
+		inFlight: warpSwapInFlight,
+	});
+	if (!decision.swap) {
+		logWarpEvent("swap_skipped", { reason: decision.reason, exit: exitId });
+		return { swapped: false, reason: decision.reason };
+	}
+	if (!config.warpProxy) {
+		logWarpEvent("swap_skipped", { reason: "no_proxy", exit: exitId });
+		return { swapped: false, reason: "no_proxy" };
+	}
+	if (!(await drainBeforeRotation(client))) {
+		logWarpEvent("swap_skipped", { reason: "drain_refused", exit: exitId, delivering: deliveringWarpStreams });
+		return { swapped: false, reason: "drain_refused" };
+	}
+	// The drain is an await: another handler may have started a swap meanwhile.
+	if (warpSwapInFlight) {
+		logWarpEvent("swap_skipped", { reason: "in_flight", exit: exitId });
+		return { swapped: false, reason: "in_flight" };
+	}
+	warpSwapInFlight = true;
+	logWarpEvent("swap_start", { exit: exitId, delivering: deliveringWarpStreams });
+	try {
+		const res = await fetch(`${config.warpProxy}/swap`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ exit: exitId }),
+			signal: AbortSignal.timeout(10_000),
+		});
+		let body;
+		try {
+			body = await res.json();
+		} catch {
+			body = undefined;
+		}
+		const target = body && typeof body.target === "string" ? body.target : undefined;
+		if (res.status === 202) {
+			warpSwapNotBefore = Date.now() + SWAP_COOLDOWN_MS;
+			warpSwaps += 1;
+			logWarpEvent("swap_ok", { exit: exitId, target });
+			return { swapped: true, target };
+		}
+		warpSwapNotBefore = Date.now() + SWAP_COOLDOWN_MS;
+		const reason =
+			res.status === 409 ? "no_standby" : res.status === 404 ? "unknown_exit" : `HTTP ${res.status}`;
+		if (res.status !== 409 && res.status !== 404) {
+			process.stderr.write(`pi-free-bridge relay: warp swap failed — HTTP ${res.status}\n`);
+		}
+		logWarpEvent("swap_refused", { exit: exitId, status: res.status, reason });
+		return { swapped: false, reason, status: res.status, target };
+	} catch (err) {
+		const reason = err && err.message ? err.message : String(err);
+		process.stderr.write(`pi-free-bridge relay: warp swap failed — ${reason}\n`);
+		logWarpEvent("swap_failed", { exit: exitId, reason });
+		// Not armed: a transport error says nothing about the proxy's state.
+		return { swapped: false, reason };
+	} finally {
+		warpSwapInFlight = false;
+	}
+}
+
+/** S7: turn "accepted" into "the other exit answers now". A `202` only means the
+ *  proxy took the work, so waiting for the target to stop accepting (it goes
+ *  `draining`, or the id disappears and comes back new) is the evidence the
+ *  resend needs. A timeout is not a failure — one resend is still worth it. */
+async function waitForSwapAcceptance(config, target) {
+	if (!target) return false;
+	const deadline = Date.now() + Math.min(rotationTimeoutMs, 5_000);
+	while (Date.now() < deadline) {
+		const snapshot = await readWarpSnapshot(config);
+		if (snapshot) {
+			const exit = snapshot.exits.find((candidate) => candidate.id === target);
+			if (!exit || exit.state === "draining" || exit.state === "cooldown") return true;
+		}
+		await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
+	}
+	logWarpEvent("swap_unconfirmed", { target });
+	return false;
 }
 
 /** S5/S7/S10: one resend, only after a confirmed rotation, and always on the

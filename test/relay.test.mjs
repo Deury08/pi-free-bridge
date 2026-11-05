@@ -537,6 +537,7 @@ import {
 	servedDelta,
 	setLogFileForTests,
 	shouldRotateLog,
+	swapWarpExit,
 	updateTunnelExit,
 	warpControlRoute,
 	resendAfterRotation,
@@ -1949,4 +1950,117 @@ test("warpSwapEnabled: only an explicit zero turns the swap off", () => {
 	assert.equal(warpSwapEnabled(undefined), true);
 	assert.equal(warpSwapEnabled(""), true);
 	assert.equal(warpSwapEnabled("no"), true, "a typo must not silently disable the ladder");
+});
+
+// ---------------------------------------------------------------------------
+// Slice 2 — the targeted swap (S7, S9)
+// ---------------------------------------------------------------------------
+// `POST /swap` replaces ONE exit: the proxy stops handing work to the target,
+// re-enrolls it, and keeps serving through the other one. One enrollment
+// instead of N, and the pool is never left empty. A 202 is acceptance, not
+// completion, and 409/404 are answers we must not insist on.
+
+async function withWarpFetch(stub, run) {
+	const original = globalThis.fetch;
+	globalThis.fetch = stub;
+	try {
+		resetWarpStateForTests();
+		return await run();
+	} finally {
+		globalThis.fetch = original;
+	}
+}
+
+test("swapWarpExit: a 202 posts the exact exit id and reports the target", () => {
+	const calls = [];
+	return withWarpFetch(
+		async (url, opts = {}) => {
+			calls.push({ url: String(url), method: opts.method, body: opts.body });
+			if (String(url).endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: EXIT_A }), { status: 202 });
+			}
+			return new Response("{}", { status: 200 });
+		},
+		async () => {
+			const result = await swapWarpExit(WARP_CONFIG, EXIT_A);
+			assert.deepEqual(result, { swapped: true, target: EXIT_A });
+			assert.equal(calls.length, 1, "exactly one POST");
+			assert.equal(calls[0].method, "POST");
+			assert.deepEqual(JSON.parse(calls[0].body), { exit: EXIT_A }, "the id is explicit: the body-less default picks by live streams");
+			const state = warpStateForTests();
+			assert.equal(state.warpSwaps, 1);
+			assert.ok(state.warpSwapNotBefore > Date.now(), "an accepted swap arms its own cooldown");
+		},
+	);
+});
+
+test("swapWarpExit: 409 no standby is an answer, never something to retry", () => {
+	const calls = [];
+	return withWarpFetch(
+		async (url) => {
+			calls.push(String(url));
+			if (String(url).endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: false, reason: "no_standby" }), { status: 409 });
+			}
+			return new Response("{}", { status: 200 });
+		},
+		async () => {
+			const first = await swapWarpExit(WARP_CONFIG, EXIT_A);
+			assert.deepEqual(first, { swapped: false, reason: "no_standby", status: 409, target: undefined });
+			const second = await swapWarpExit(WARP_CONFIG, EXIT_A);
+			assert.equal(second.reason, "cooldown", "a 409 arms the cooldown: insisting burns enrollments while the gate is rate-limiting");
+			assert.equal(calls.length, 1, "the second call never reached the proxy");
+		},
+	);
+});
+
+test("swapWarpExit: an unknown exit is reported instead of hidden", () => {
+	return withWarpFetch(
+		async (url) => {
+			if (String(url).endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: false, reason: "unknown_exit" }), { status: 404 });
+			}
+			return new Response("{}", { status: 200 });
+		},
+		async () => {
+			const result = await swapWarpExit(WARP_CONFIG, EXIT_A);
+			assert.equal(result.reason, "unknown_exit");
+			assert.equal(result.status, 404);
+		},
+	);
+});
+
+test("swapWarpExit: two handlers at once stack nothing", () => {
+	const calls = [];
+	return withWarpFetch(
+		async (url) => {
+			if (String(url).endsWith("/swap")) {
+				calls.push("swap");
+				await new Promise((resolve) => setTimeout(resolve, 30));
+				return new Response(JSON.stringify({ ok: true, target: EXIT_A }), { status: 202 });
+			}
+			return new Response("{}", { status: 200 });
+		},
+		async () => {
+			const [first, second] = await Promise.all([
+				swapWarpExit(WARP_CONFIG, EXIT_A),
+				swapWarpExit(WARP_CONFIG, EXIT_A),
+			]);
+			assert.equal(calls.length, 1, "one swap at a time: the proxy serializes its own, we do not stack ours");
+			assert.equal([first, second].filter((result) => result.swapped).length, 1);
+			assert.equal([first, second].filter((result) => result.reason === "in_flight").length, 1);
+		},
+	);
+});
+
+test("swapWarpExit: without a proxy there is nothing to ask", () => {
+	return withWarpFetch(
+		async () => {
+			throw new Error("must not fetch");
+		},
+		async () => {
+			const result = await swapWarpExit({ ...WARP_CONFIG, warpProxy: "" }, EXIT_A);
+			assert.equal(result.reason, "no_proxy");
+		},
+	);
 });
