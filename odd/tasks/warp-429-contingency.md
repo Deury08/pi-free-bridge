@@ -1,8 +1,10 @@
 # warp-429-contingency
 
 Contingencia para un `429 FreeUsageLimitError` que hoy deja el turno muerto sin
-rastro en disco y sin forma de recuperarlo a mano. Slice 1: observabilidad y
-escape hatch seguro. Sin cambio de conducta del relay.
+rastro en disco y sin forma de recuperarlo a mano. **Slice 1**: observabilidad y
+escape hatch seguro, sin cambio de conducta del relay. **Slice 2**: escalera de
+recuperación (swap de un solo exit → recycle → entregar), sobre el contrato
+cerrado con warp-minimal.
 
 ## Specs
 
@@ -26,6 +28,37 @@ escape hatch seguro. Sin cambio de conducta del relay.
   invocar el comando, el relay atiende `/v1/*` exactamente igual. La suite que ya
   existe sigue verde.
 
+### Slice 2 — escalera de recuperación
+
+- **S6** — Atribución por exit. `/health` del proxy expone cada exit como
+  `"<id completo> (<estado>, served=<n>, streams=<n>)"`, **siempre los tres
+  campos, en ese orden, sin campos opcionales**. El relay aprende el mapeo
+  túnel→exit **solo** en una ventana donde su propio intento abrió túnel, exige
+  delta total `served == 1`, **ignora** cualquier delta mientras el mapa es
+  válido y el túnel sigue vivo (puede ser tráfico de otro proceso contra el
+  mismo puerto), y ante delta ambiguo (2+ exits) o mapa dudoso marca el mapeo
+  como desconocido. Nunca compara ids truncados, nunca compara contadores entre
+  ids distintos.
+- **S7** — Con el exit culpable conocido y ventana de recuperación larga o
+  ausente, el relay pide `POST /swap` con `{"exit":"<id>"}` — un solo exit, el
+  otro sigue sirviendo — en vez del `POST /recycle` completo. Un `202` es
+  **aceptación, no fin**: el relay espera a que el exit objetivo deje de aceptar
+  trabajo antes de reintentar. `409 no_standby`, `404 unknown_exit` y cualquier
+  otro fallo **no se reintentan**: se espera la recuperación de `/health`.
+- **S8** — Escalera acotada y sin loop: intento → (429) → swap apuntado →
+  intento → (429) → recycle completo → intento → entregar el 429 original
+  byte-exacto. Cada peldaño exige una confirmación real (swap aceptado con
+  `target`; rotación confirmada por id nuevo); un peldaño no confirmado entrega
+  el original. El reenvío existente se reusa, no se duplica.
+- **S9** — Política de espera: un `retry-after` corto (por debajo de
+  `RELAY_WARP_SWAP_MIN_RETRY_AFTER_MS`, default 120000 ms) significa esperar y
+  **no** rotar, porque rotar gastaría un enrolamiento al vicio. El swap tiene
+  cooldown propio (`RELAY_WARP_SWAP_COOLDOWN_MS`) y single-flight, separados de
+  los del recycle.
+- **S10** — `RELAY_WARP_SWAP=0` devuelve exactamente la conducta de hoy (slice 1
+  + el reenvío único ya mergeado). Sin la ruta en el proxy (`404`) se degrada con
+  un solo aviso y se sigue como antes.
+
 ## Tasks
 
 | ID | Spec | Qué | Route | Commit |
@@ -35,6 +68,11 @@ escape hatch seguro. Sin cambio de conducta del relay.
 | T3 | S4 | Comando `/free-bridge-warp-recycle` en `index.ts` | inline | `feat(extension): add /free-bridge-warp-recycle` |
 | T4 | S1, S4 | README + CHANGELOG: comando nuevo y `RELAY_LOG_FILE` | inline | `docs(readme): document warp recycle command and relay log` |
 | T5 | S5 | Suite completa + prueba en vivo del comando contra el relay instalado | verify | — |
+| T6 | S6 | Parser de `/health` con `served`/`streams`, política de atribución y mapa túnel→exit como helpers puros + eventos de log | inline | `feat(relay): attribute warp 429s to an exit via a cached tunnel map` |
+| T7 | S7, S9 | `POST /swap` apuntado por id, con cooldown propio, single-flight y lectura de `target` | inline | `feat(relay): swap a single warp exit on a persistent 429` |
+| T8 | S8 | Escalera acotada integrada al reenvío existente | inline | `feat(relay): ladder a targeted swap before recycling the pool` |
+| T9 | S10 | Kill switch, degradación por 404 ausente y README/CHANGELOG | inline | `docs(readme): document the warp swap knobs` |
+| T10 | S6-S10 | Verificación en vivo de los criterios 1-4 con el binario nuevo en 8789 | verify | — |
 
 ## Log
 
@@ -135,3 +173,10 @@ escape hatch seguro. Sin cambio de conducta del relay.
   auto-cura** porque el mapa vacío vuelve a la regla 1 en el intento siguiente. Se
   registra como evento `attribution_knockout` en el JSONL para que la causa quede
   visible y no parezca un fallo.
+- **L4** — "como go-ahead" (respuesta a la propuesta de arrancar el slice 2 con
+  fixtures, sin proxy vivo).
+- **E8** — Contrato con warp-minimal cerrado y congelado: rama
+  `feat/per-exit-swap` (7 commits) con el pool sostenido en `pool_size`,
+  `POST /swap`, `X-Warp-Exit` y `served` en `/health`. Criterios de aceptación
+  1-4 del lado del relay, sin push y con el binario de 8789 viejo: la
+  verificación en vivo queda bloqueada hasta el deploy.
