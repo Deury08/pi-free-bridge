@@ -1097,6 +1097,43 @@ async function readWarpSnapshot(config) {
 	}
 }
 
+/** S6: learn which exit owns the tunnel this request just opened. The `served`
+ *  counter is monotonic and belongs to the exit, so only its movement between a
+ *  snapshot taken before our attempt and one taken after says a tunnel opened —
+ *  and even then a single delta does not say WHOSE tunnel it was. The policy
+ *  that keeps it honest lives in `updateTunnelExit`; this only feeds it the two
+ *  facts it cannot get itself: the live delta and whether the exit we hold still
+ *  exists.
+ *
+ *  A failure to read is not a contradiction, so the map is kept as it was: an
+ *  unreadable `/health` must not cost a good attribution that will be needed on
+ *  the next 429. */
+async function noteWarpAttribution(config, before) {
+	if (!before) return;
+	const after = await readWarpSnapshot(config);
+	if (!after) {
+		logWarpEvent("attribution_unreadable", {});
+		return;
+	}
+	const delta = servedDelta(before, after);
+	// A vanished exit is not evidence about the tunnel, it is proof that the map
+	// itself is stale: whatever replaced it gets learned from scratch, and the old
+	// id is never pinned. That is the difference between a cache and a mistake.
+	const replaced = tunnelExit !== undefined && delta.gone.includes(tunnelExit);
+	const mapValid =
+		tunnelExit !== undefined && !replaced && after.exits.some((candidate) => candidate.id === tunnelExit);
+	const next = replaced
+		? { exitId: delta.learned, decision: delta.learned ? "relearned" : "exit_gone" }
+		: updateTunnelExit(tunnelExit, delta, { mapValid });
+	const previous = tunnelExit;
+	tunnelExit = next.exitId;
+	if (next.decision === "kept" && previous === tunnelExit) return;
+	logWarpEvent(`attribution_${next.decision}`, {
+		exit: tunnelExit,
+		...(previous ? { previous } : {}),
+	});
+}
+
 /** S7: rotate ONE exit instead of the whole pool. The proxy stops handing work
  *  to the target, re-enrolls only that exit, and keeps serving through the
  *  other one — one enrollment instead of N, and the pool is never left empty.
@@ -1106,8 +1143,10 @@ async function readWarpSnapshot(config) {
  *  cheap in the case this exists for, because by the time a 429 is being
  *  diagnosed nothing of ours is still streaming.
  *
- *  A `202` is acceptance, not completion: the caller must not resend on the
- *  strength of it alone. `409` (no standby) and `404` (unknown exit) are real
+ *  A `202` is acceptance, and it is also the state: the proxy publishes the new
+ *  state under the same lock that accepts the swap, so the body already carries
+ *  the target `draining` and the other exit serving. The caller may resend on
+ *  it without polling anything. `409` (no standby) and `404` (unknown exit) are real
  *  answers, and both mean "do not insist now" — with two exits a 409 says the
  *  other one is already down, so hammering would only burn enrollments while
  *  the gate is rate-limiting. */
@@ -1176,10 +1215,6 @@ export async function swapWarpExit(config, exitId, client) {
 	}
 }
 
-/** S7: turn "accepted" into "the other exit answers now". A `202` only means the
- *  proxy took the work, so waiting for the target to stop accepting (it goes
- *  `draining`, or the id disappears and comes back new) is the evidence the
- *  resend needs. A timeout is not a failure — one resend is still worth it. */
 /** S5/S7/S10: one resend, only after a confirmed rotation, and always on the
  *  warp egress — the fresh IP lives there whatever order the chain used. Never
  *  a loop: the attempt happens once and only a non-error answer is adopted.
@@ -1297,6 +1332,9 @@ export async function forward(req, res, pathname, config) {
 			egressUsed = egress;
 			let candidate;
 			try {
+				// S6: attribution needs the counters from BEFORE this attempt, because
+				// `served` is monotonic and only its movement says a tunnel opened.
+				const warpBefore = egress === "warp" ? await readWarpSnapshot(config) : undefined;
 				candidate = await egressFetch(config, pathname, { body: JSON.stringify(body) }, egress);
 				// relay-warp-auto-recycle: count OBSERVED warp responses, not only
 				// the delivered one — a warp 429 that falls back to a local
@@ -1305,6 +1343,7 @@ export async function forward(req, res, pathname, config) {
 					warp429Streak = bumpWarp429Streak(warp429Streak, candidate.status, "warp");
 					if (candidate.status === 429) {
 						logWarpEvent("warp_429", { streak: warp429Streak, delivering: deliveringWarpStreams });
+						await noteWarpAttribution(config, warpBefore);
 					}
 					// S10: the trigger is the whole request, not the last egress — in
 					// either `auto` order, a 429 observed through warp is exit evidence

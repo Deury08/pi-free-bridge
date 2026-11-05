@@ -2064,3 +2064,108 @@ test("swapWarpExit: without a proxy there is nothing to ask", () => {
 		},
 	);
 });
+
+// ---------------------------------------------------------------------------
+// Slice 2 — attribution is wired into the request path (S6)
+// ---------------------------------------------------------------------------
+// The pure helpers above are necessary and not sufficient: without the wiring
+// the ladder would have no target exactly when it matters. What these prove is
+// the wiring itself — a snapshot taken BEFORE our attempt, a delta read AFTER
+// the 429, and a map that tolerates the traffic of others.
+
+/** Health bodies in order; the tail repeats, because the rotation poll reads
+ *  `/health` an unpredictable number of times and must not disturb the case. */
+function sequencedHealth(entries) {
+	let index = 0;
+	return () =>
+		healthJson({
+			ok: true,
+			recycling: false,
+			exits: entries[Math.min(index++, entries.length - 1)],
+		});
+}
+
+test("forward: one tunnel opening during our own attempt attributes that exit (S6)", async () => {
+	const nextHealth = sequencedHealth([
+		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+	]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			return new Response(GATE_429_BODY, { status: 429 });
+		},
+		async () => {
+			await forward(fakeReq({ marker: "attribute" }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(
+				warpStateForTests().tunnelExit,
+				EXIT_A,
+				"the only exit whose counter moved is the one carrying our tunnel",
+			);
+		},
+	);
+});
+
+test("forward: two exits moving at once are attributed to neither (S6)", async () => {
+	// Both counters moving during one attempt is the case where a single delta
+	// would be a coin flip. Guessing here costs a swap on the wrong exit, so a
+	// known map is DROPPED rather than replaced, and the ladder stays out of the
+	// way until the next clean window teaches it again. Learning first matters:
+	// without it this case would pass with no wiring at all.
+	const nextHealth = sequencedHealth([
+		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
+		[`${EXIT_A} (in_use, served=43, streams=1)`, `${EXIT_B} (in_use, served=8, streams=1)`],
+	]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			return new Response(GATE_429_BODY, { status: 429 });
+		},
+		async () => {
+			setWarpRotationTimingForTests(0, 1);
+			await forward(fakeReq({ marker: "clean" }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(warpStateForTests().tunnelExit, EXIT_A, "a clean window teaches the map");
+
+			await forward(fakeReq({ marker: "ambiguous" }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(warpStateForTests().tunnelExit, undefined, "ambiguity must not be resolved by picking one");
+		},
+	);
+});
+
+test("forward: another exit's traffic does not steal a valid map (S6)", async () => {
+	// Our tunnel is reused, so its counter cannot move again on its own. Any
+	// single delta while the map is valid therefore belongs to somebody else, and
+	// overwriting our answer would aim the next swap at an innocent exit.
+	const states = [
+		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=8, streams=0)`],
+	];
+	const nextHealth = sequencedHealth(states);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			return new Response(GATE_429_BODY, { status: 429 });
+		},
+		async () => {
+			setWarpRotationTimingForTests(0, 1); // no poll: the sequence stays readable
+			await forward(fakeReq({ marker: "one" }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(warpStateForTests().tunnelExit, EXIT_A);
+
+			await forward(fakeReq({ marker: "two" }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(
+				warpStateForTests().tunnelExit,
+				EXIT_A,
+				"a delta on another exit is foreign traffic, never a correction",
+			);
+		},
+	);
+});
