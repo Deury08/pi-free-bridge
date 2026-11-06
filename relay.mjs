@@ -544,7 +544,11 @@ export function warpExitSnapshot(body) {
 			streams: counter("streams"),
 		});
 	}
-	return { recycling: body.recycling === true, exits };
+	// The pool's own count of exits that can serve new work. A body without it
+	// stays `undefined`: "no count" and "no healthy exit" are different answers,
+	// and only the caller knows which policy the first one deserves.
+	const healthy = Number.isInteger(body.healthy) && body.healthy >= 0 ? body.healthy : undefined;
+	return { recycling: body.recycling === true, exits, healthy };
 }
 
 /** Pure: what moved between two snapshots. Only exits present in BOTH are
@@ -612,11 +616,18 @@ export function decideWarpSwap({
 	unavailable = false,
 	onCooldown = false,
 	inFlight = false,
+	healthy,
 	shortWindowMs = SWAP_MIN_RETRY_AFTER_MS,
 } = {}) {
 	if (unavailable) return { swap: false, reason: "unavailable" };
 	if (!enabled) return { swap: false, reason: "disabled" };
 	if (!exitId) return { swap: false, reason: "no_attribution" };
+	// The swap drains the exit that served the 429, so it may only run while the
+	// pool still has a standby to serve the retry: draining the last serving exit
+	// would trade a 429 for a dead pool. Only a count is judged here, so a caller
+	// that could not read the pool passes `0` and an unknown pool is not a standby
+	// either — when in doubt, do not rotate.
+	if (healthy !== undefined && !(healthy >= 2)) return { swap: false, reason: "no_standby" };
 	if (inFlight) return { swap: false, reason: "in_flight" };
 	if (onCooldown) return { swap: false, reason: "cooldown" };
 	if (typeof retryAfterMs === "number" && retryAfterMs >= 0 && retryAfterMs < shortWindowMs) {
@@ -1382,8 +1393,13 @@ export async function resendAfterRotation(config, pathname, body, original, clie
  *  which, by the time a 429 is being diagnosed, points at the wrong exit. So the
  *  ladder skips straight to the rotation instead of guessing. */
 export async function recoverWarp429(config, pathname, body, original, client) {
+	// Read the pool once, before the decision: a targeted swap costs the exit that
+	// served us, so it is only worth spending while another healthy exit remains
+	// to serve the retry. A snapshot that cannot be read counts as no standby.
+	const snapshot = await readWarpSnapshot(config);
 	const decision = decideWarpSwap({
 		exitId: tunnelExit,
+		healthy: snapshot ? snapshot.healthy : 0,
 		retryAfterMs: original.retryAfterMs,
 		enabled: WARP_SWAP_ENABLED && warpSwapEnabledOverride,
 		onCooldown: Date.now() < warpSwapNotBefore,

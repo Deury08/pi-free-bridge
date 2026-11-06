@@ -2222,6 +2222,8 @@ test("forward: two exits moving at once are attributed to neither (S6)", async (
 	const nextHealth = sequencedHealth([
 		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
+		// the standby guard's own read, then the rotation's before-snapshot
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`],
 		[`${EXIT_A} (in_use, served=43, streams=1)`, `${EXIT_B} (in_use, served=8, streams=1)`],
@@ -2335,10 +2337,12 @@ test("ladder: without an attributed exit it never guesses a target (S7)", async 
 	// diagnosed the burnt exit is the idle one. Guessing costs an enrollment on
 	// the wrong exit, so the ladder skips to the rotation instead.
 	// The chain reads twice (before the attempt, after the 429) without a served
-	// counter, so the map stays empty. The rotation then needs its own window: the
-	// entry name never changes, so only "recycling seen, then quiet again" proves
-	// it.
+	// counter, so the map stays empty — and the standby guard reads once more
+	// before its decision, still finding no target. The rotation then needs its
+	// own window: the entry name never changes, so only "recycling seen, then
+	// quiet again" proves it.
 	const bodies = [
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
 		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
 		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
 		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
@@ -2428,6 +2432,52 @@ test("ladder: when the fresh exit refuses too, the recycle is still there (S8)",
 			assert.equal(swapPosts(fake.calls).length, 1, "one swap, no loop");
 			assert.equal(recyclePosts(fake.calls).length, 1, "one recycle, no loop");
 			assert.equal(upstreamCalls(fake.calls).length, 3, "original, after the swap, after the rotation");
+		},
+	);
+});
+
+test("ladder: a thin pool skips the swap and lets the rotation recover (S8)", async () => {
+	// Draining the exit that served the 429 is only survivable while another
+	// healthy exit can serve the retry. With `healthy:1` a swap would leave the
+	// pool empty, so the ladder must not spend it: it goes straight to the
+	// rotation, exactly as it does when there is no target at all.
+	const pool = (healthy, recycling, exits) => ({ ok: true, pool_size: 2, healthy, recycling, exits });
+	const thinPool = pool(1, false, [
+		`${EXIT_A} (in_use, served=42, streams=1)`,
+		`${EXIT_B} (cooldown, served=7, streams=0)`,
+	]);
+	const bodies = [
+		// our own attempt's window: EXIT_A is the only counter that moved
+		pool(2, false, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		pool(2, false, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		// the pool the guard reads: EXIT_B went to cooldown, so draining EXIT_A
+		// would leave nothing to serve the retry.
+		thinPool,
+		// the rotation's own window: quiet, then recycling, then a new exit
+		thinPool,
+		pool(1, true, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (cooldown, served=7, streams=0)`]),
+		pool(1, false, [`warp-fresh (healthy, served=0, streams=0)`, `${EXIT_B} (cooldown, served=7, streams=0)`]),
+	];
+	let index = 0;
+	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: "warp-fresh" }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async (fake) => {
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "thin-pool" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(warpStateForTests().tunnelExit, EXIT_A, "the ladder had a real target to swap");
+			assert.equal(swapPosts(fake.calls).length, 0, "a thin pool must not drain the exit that served the 429");
+			assert.equal(recyclePosts(fake.calls).length, 1, "the recovery continued to the rotation");
+			assert.equal(res.status, 200, "the rotation's resend delivered the turn");
 		},
 	);
 });
