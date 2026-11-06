@@ -17,18 +17,37 @@
   nothing, a `409`/`404` is a real answer that is not insisted on, and a proxy
   without `/swap` (older binary, or the WireGuard stack answering `501`) is
   detected once, warned once, and the relay keeps rotating. `RELAY_WARP_SWAP=0`
-  is the kill switch, `RELAY_WARP_SWAP_COOLDOWN_MS` is the swap's own cool-down
-  (shorter than the recycle's, because replacing one exit is much cheaper than
-  tearing the pool down), and `RELAY_WARP_SWAP_MIN_RETRY_AFTER_MS` decides how
+  is the kill switch and `RELAY_WARP_SWAP_MIN_RETRY_AFTER_MS` decides how
   short a `retry-after` makes waiting cheaper than enrolling.
+
+- **No cool-downs, and a swap judged by the pool it left behind**: both the
+  swap's 60 s and the recycle's 5 min cool-downs are gone, from the automatic
+  ladder and from the manual command. Measured on one machine: eighteen device
+  enrollments in fifty-five minutes produced no rate-limit refusals, while the
+  cool-downs only ever blocked useful recovery — a command that wanted the cheap
+  step was refused for the sake of the expensive step it was not going to run.
+  The only wait left is the one for in-flight deliveries, plus mutual exclusion,
+  neither of which is a timer. A swap is also no longer judged inline: the
+  proxy's drain holds its exit for up to 120 s, so a short settle budget labelled
+  healthy swaps as stranded. The verdict is deferred to the next ladder run and
+  measured by how many exits the pool can still serve, never by exit id, because
+  a re-enrolment publishes a new one.
+
+- **Manual recovery sweeps by cheapest step**: the command now reads the pool and
+  decides instead of always tearing it down. One usable exit, or any exit parked
+  in the proxy's thirty-minute cooldown, means recycle — re-enrolling fresh exits
+  is the only thing that clears those parks. Otherwise it swaps the exit in use,
+  re-reads the pool after each accepted swap, and stops at one usable exit: a
+  drain holds its exit for up to two minutes, so draining every exit at once is
+  exactly how a pool ends up with nothing to serve. Each step is reported.
 
 - **Manual WARP rotation, by the same path as the automatic one**: new
   `/free-bridge-warp-recycle` command, backed by a loopback `POST /warp/recycle`
   route on the relay. It exists because the only manual recovery a burnt exit had
   was a raw `POST /recycle` straight to the proxy, which skips the drain and tears
   down every stream multiplexed over the tunnel. The command now waits for
-  in-flight deliveries, respects the cool-down, confirms the new exit through
-  `/health`, and reports streak, recycles, result and remaining cool-down. The
+  in-flight deliveries, reads the pool and sweeps by cheapest step, and reports
+  each step instead of streak, recycles and remaining cool-down. The
   relay binds `127.0.0.1` only, so the route needs no token.
 - **The relay can keep an event log on disk**: `RELAY_LOG_FILE` writes one JSON
   object per line for every WARP decision that costs something — a `429`
