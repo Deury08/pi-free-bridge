@@ -178,9 +178,11 @@ quedará visibible en `/health` (`sessionSource`) y `/free-bridge-session`:
 
 ## Egress WARP (`off` / `auto` / `on`)
 
-`warp-minimal` (puerto `127.0.0.1:8789`, `warp_enabled` opcional) es la salida
-alternativa cuando el egress directo está bloqueado o saturado de rate limit.
-Tres modos (bun-upgrades S5):
+[`warp-minimal`](https://github.com/Deury08/warp-minimal) es el proxy que aporta la
+salida (puerto `127.0.0.1:8789`, `warp_enabled` opcional). Es un proyecto aparte
+del relay: registra las salidas WARP, publica su pool en `/health` y expone
+`/swap` y `/recycle`. De él vienen la salida alternativa cuando el egress directo
+está bloqueado o saturado de rate limit. Tres modos (bun-upgrades S5):
 
 - **`off`** (default): todo directo; el relay nunca toca WARP.
 - **`auto`**: directo primero; si llega un `429` **antes del primer byte**, el
@@ -271,13 +273,27 @@ menor a mayor costo:
    vacío **no se rota**: se entrega el `429`, y el escape forzado es el comando
    manual.
 2. **`POST /swap` apuntado por id.** Reemplaza sólo ese exit: un enrolamiento en
-   vez de N, y el pool sigue sirviendo por el otro. Un `202` es aceptación y ya
-   trae el estado publicado (el `target` en `draining`), así que no hay nada que
-   esperar. `409` (no hay standby) y `404` (id desconocido) son respuestas: no se
-   insisten.
-3. **Un reintento** en el exit nuevo. Si entrega, terminó.
+   vez de N, y el pool sigue sirviendo por el otro. Un `202` es **aceptación**, no
+   cambio: el `target` queda en `draining` y la salida nueva aparece cuando el
+   drain termina. `409` (no hay standby) y `404` (id desconocido) son respuestas:
+   no se insisten.
+3. **La espera del cambio, y después un reintento por la salida nueva.** El relay
+   relee `/health` hasta que la salida drenada desaparezca **y** aparezca un id que
+   antes no estaba, y sólo entonces reenvía. Reenviar antes sale por la standby —la
+   única que sirve mientras la otra drena—, que puede estar tan limitada como la
+   que dio el `429`: se gastaría un enrolamiento para reintentar contra una IP
+   quemada. No hay plazo propio: la espera termina cuando el pool cambia o cuando
+   **el cliente se va**, lo que pase primero. Si el cliente se fue primero, se
+   entrega el `429` original byte-exacto y el swap sigue solo en segundo plano, así
+   el request siguiente ya encuentra la salida nueva. La espera medida contra el
+   drain real no es corta: 120 s una vez, 183 s otra, y la válvula del proxy sólo
+   se abre al vencer, no antes.
 4. **`/recycle`** sólo si ese reintento también da `429`. Es el único paso que
-   corta los streams en vuelo —incluido el tuyo—, así que va último.
+   corta los streams en vuelo —incluido el tuyo—, así que va último, y también
+   espera a que el pool muestre las salidas nuevas antes de reenviar. En esa ruta
+   el presupuesto de confirmación de 10 s ya no manda cuando hay cliente: era el
+   mismo error, porque contra el drain medido toda rotación exitosa se reportaba
+   como `not_confirmed`.
 5. **Un reintento más**, y si tampoco: el `429` original byte-exacto.
 
 Acotada por construcción: dos intentos extra como máximo, nunca un loop.

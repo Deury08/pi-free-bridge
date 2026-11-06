@@ -1475,7 +1475,11 @@ test("forward: a warp delivery is counted once and released on every exit path (
 			const u = String(url);
 			if (u.endsWith("/recycle")) {
 				duringRotation = warpStateForTests().deliveringWarpStreams;
-				return new Response("", { status: 200 });
+				// Refused on purpose: an ACCEPTED rotation is waited out until the pool
+				// shows a new exit (relay `waitForPoolReplacement`), and this case is
+				// about the counting, not about the pool. A refusal keeps the read
+				// sequence — and this test's point — untouched.
+				return new Response(JSON.stringify({ ok: false, error: "blocked_by_recycle" }), { status: 202 });
 			}
 			if (u.endsWith("/health")) return new Response(JSON.stringify({ recycling: false, exits: ["warp-a"] }));
 			if (upstreamStatus >= 400) return new Response(GATE_429_BODY, { status: upstreamStatus });
@@ -2193,6 +2197,13 @@ function sequencedHealth(entries) {
 		});
 }
 
+/** The recycle REFUSED. An accepted rotation is now waited out until the pool
+ *  shows exits that were not there before (relay `waitForPoolReplacement`), and
+ *  the attribution cases below are not about that wait: a refusal keeps their
+ *  read sequence exactly what it was, so they still assert attribution alone. */
+const refusedRecycle = () =>
+	new Response(JSON.stringify({ ok: false, error: "blocked_by_recycle" }), { status: 202 });
+
 test("forward: one tunnel opening during our own attempt attributes that exit (S6)", async () => {
 	const nextHealth = sequencedHealth([
 		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
@@ -2201,7 +2212,7 @@ test("forward: one tunnel opening during our own attempt attributes that exit (S
 	await driveWarp(
 		(call) => {
 			if (call.url.endsWith("/health")) return nextHealth();
-			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			if (call.url.endsWith("/recycle")) return refusedRecycle();
 			return new Response(GATE_429_BODY, { status: 429 });
 		},
 		async () => {
@@ -2233,7 +2244,7 @@ test("forward: two exits moving at once are attributed to neither (S6)", async (
 	await driveWarp(
 		(call) => {
 			if (call.url.endsWith("/health")) return nextHealth();
-			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			if (call.url.endsWith("/recycle")) return refusedRecycle();
 			return new Response(GATE_429_BODY, { status: 429 });
 		},
 		async () => {
@@ -2262,7 +2273,7 @@ test("forward: another exit's traffic does not steal a valid map (S6)", async ()
 	await driveWarp(
 		(call) => {
 			if (call.url.endsWith("/health")) return nextHealth();
-			if (call.url.endsWith("/recycle")) return new Response("", { status: 200 });
+			if (call.url.endsWith("/recycle")) return refusedRecycle();
 			return new Response(GATE_429_BODY, { status: 429 });
 		},
 		async () => {
@@ -2305,7 +2316,11 @@ test("ladder: a targeted swap and one resend need no recycle (S8)", async () => 
 	const nextHealth = sequencedHealth([
 		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
-		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (in_use, served=0, streams=0)`],
+		// the standby guard, read before the swap goes out
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		// accepted and drained: the resend waits for THIS — the drained id gone and a
+		// NEW id in its place, which is the exit that then serves the retry
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (in_use, served=1, streams=1)`],
 	]);
 	const nextUpstream = upstreamThen([429, 200]);
 	await driveWarp(
@@ -2340,9 +2355,9 @@ test("ladder: without an attributed exit it never guesses a target (S7)", async 
 	// the wrong exit, so the ladder skips to the rotation instead.
 	// The chain reads twice (before the attempt, after the 429) without a served
 	// counter, so the map stays empty — and the standby guard reads once more
-	// before its decision, still finding no target. The rotation then needs its
-	// own window: the entry name never changes, so only "recycling seen, then
-	// quiet again" proves it.
+	// before its decision, still finding no target. The rotation's own before-read
+	// follows, and then the wait: the pool only counts as replaced once an id that
+	// was not there before shows up.
 	const bodies = [
 		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
 		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
@@ -2350,6 +2365,7 @@ test("ladder: without an attributed exit it never guesses a target (S7)", async 
 		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
 		{ recycling: true, exits: ["warp-18e (in_use, streams=0)"] },
 		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+		{ recycling: false, exits: ["warp-fresh (healthy, served=0, streams=0)"] },
 	];
 	let index = 0;
 	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
@@ -2376,10 +2392,11 @@ test("ladder: a refused swap falls through to the rotation (S8)", async () => {
 	const nextHealth = sequencedHealth([
 		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
-		// the rotation's own before-snapshot, then the confirmed replacement
+		// the rotation's own before-snapshot, then the pool it left behind: every old
+		// id gone and a new one serving, which is what the resend waits for
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
-		[`warp-fresh (healthy, served=0, streams=0)`, `${EXIT_B} (in_use, served=7, streams=1)`],
+		[`warp-fresh (healthy, served=0, streams=0)`],
 	]);
 	const nextUpstream = upstreamThen([429, 200]);
 	await driveWarp(
@@ -2408,15 +2425,18 @@ test("ladder: when the fresh exit refuses too, the recycle is still there (S8)",
 	const nextHealth = sequencedHealth([
 		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
-		// after the swap: our tunnel moved to the new exit
+		// the standby guard, read before the swap goes out
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		// accepted: the drained exit is out and the new id is in, so the first resend
+		// leaves on it — and gets a 429, which sends the ladder to the rotation
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (draining, served=0, streams=0)`],
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (in_use, served=1, streams=1)`],
-		// the rotation: quiet, quiet, then a new id (the settled swap already read
-		// one quiet body, because it waits before it retries)
+		// the attribute read after that refused resend, then the rotation's own
+		// before-snapshot
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (healthy, served=1, streams=0)`],
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (healthy, served=1, streams=0)`],
-		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (healthy, served=1, streams=0)`],
-		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-newer (healthy, served=0, streams=0)`],
+		// the recycle replaced the whole pool: every old id gone, a new one serving
+		[`warp-newer (healthy, served=0, streams=0)`],
 	]);
 	const nextUpstream = upstreamThen([429, 429, 200]);
 	await driveWarp(
@@ -2457,10 +2477,12 @@ test("ladder: a thin pool skips the swap and lets the rotation recover (S8)", as
 		// the pool the guard reads: EXIT_B went to cooldown, so draining EXIT_A
 		// would leave nothing to serve the retry.
 		thinPool,
-		// the rotation's own window: quiet, then recycling, then a new exit
+		// the rotation's own window: quiet, then recycling, and finally the pool it
+		// replaced — every old id gone and a new one serving, which is what the
+		// resend waits for
 		thinPool,
 		pool(1, true, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (cooldown, served=7, streams=0)`]),
-		pool(1, false, [`warp-fresh (healthy, served=0, streams=0)`, `${EXIT_B} (cooldown, served=7, streams=0)`]),
+		pool(1, false, [`warp-fresh (healthy, served=0, streams=0)`]),
 	];
 	let index = 0;
 	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
@@ -2493,22 +2515,29 @@ test("ladder: a swap the pool replaced is judged settled, not stranded (S14)", a
 	// settled swap — and the next run is free to spend another swap because the
 	// consecutive counter was reset instead of being pushed towards the suspension.
 	const pool = (healthy, exits) => ({ ok: true, pool_size: 2, active: healthy, cooling_down: 0, healthy, recycling: false, exits });
-	const replaced = [`${EXIT_B} (in_use, served=8, streams=0)`, "warp-fresh (healthy, served=0, streams=0)"];
+	const FRESH = "warp-fresh";
+	const replaced = (served) =>
+		pool(2, [`${EXIT_B} (in_use, served=${served}, streams=1)`, `${FRESH} (healthy, served=0, streams=0)`]);
 	const bodies = [
 		// run 1 — our own attempt's window: EXIT_A is the exit that served the 429
 		pool(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
 		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
 		// the standby guard: two usable exits, recorded before the swap
 		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
-		// accepted and drained; the retry goes out on the accepted swap and is
-		// delivered, so nothing waits for the pool
+		// accepted, drained and still out: the retry waits instead of leaving on the
+		// standby the drained exit left behind
 		pool(1, [`${EXIT_B} (in_use, served=7, streams=0)`]),
-		// run 2 — the drained id is gone and a brand-new id took its place: two
-		// usable exits again, so the swap SETTLED and the streak resets
-		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, "warp-fresh (healthy, served=0, streams=0)"]),
-		pool(2, replaced),
-		pool(2, replaced),
-		pool(1, ["warp-fresh (healthy, served=0, streams=0)"]),
+		// and here the pool is whole again with a BRAND-NEW id, which is what buys
+		// the resend
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
+		// run 2 — a clean attribution window again, under the NEW ids
+		replaced(7),
+		// the guard: two usable exits again, so the swap SETTLED and the streak resets
+		replaced(8),
+		replaced(8),
+		// the next swap's own replacement
+		pool(2, [`${FRESH} (in_use, served=0, streams=1)`, "warp-newer (healthy, served=0, streams=0)"]),
 	];
 	let index = 0;
 	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
@@ -2524,7 +2553,7 @@ test("ladder: a swap the pool replaced is judged settled, not stranded (S14)", a
 		async (fake) => {
 			const first = fakeRelayRes();
 			await forward(fakeReq({ marker: "settles" }), first, RESEND_PATH, FORWARD_CONFIG);
-			assert.equal(first.status, 200, "the retry after an accepted swap is delivered without waiting for the drain");
+			assert.equal(first.status, 200, "the resend waits for the new exit and is delivered by it");
 
 			const second = fakeRelayRes();
 			await forward(fakeReq({ marker: "settled" }), second, RESEND_PATH, FORWARD_CONFIG);
@@ -2549,26 +2578,29 @@ test("ladder: a stranded drain is judged on the next run, never inline (S14)", a
 	// the recovery it buys is the recycle.
 	const EXIT_C = "warp-18e3d7f901ab45c6";
 	const pool = (healthy, exits) => ({ ok: true, pool_size: 3, active: healthy, cooling_down: 0, healthy, recycling: false, exits });
-	const recycling = (exits) => ({ ...pool(2, exits), recycling: true });
 	const two = [`${EXIT_B} (in_use, served=8, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`];
+	const FRESH = "warp-fresh";
 	const bodies = [
 		// run 1 — our own attempt's window: EXIT_A is the exit that served the 429
 		pool(3, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
 		pool(3, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
 		// the standby guard: three usable exits, recorded before the swap
 		pool(3, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
-		// accepted and drained; the retry is delivered on the accepted swap
+		// accepted and drained, with the drained id still out: the retry waits
 		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
-		// run 2 — a new 429 with the pool one usable exit short of what the swap
-		// started from: one stranding, and the swap is stood down for this run
-		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
+		// the replacees landed, so the retry is delivered on the fresh exit
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
+		// run 2 — attribution window, then a new 429 with the pool one usable exit
+		// short of what the swap started from: one stranding, and the swap is stood
+		// down for this run
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
 		pool(2, two),
+		// the recycle's own before-snapshot
 		pool(2, two),
-		pool(2, two),
-		// the recycle's own window: the pre-POST snapshot, recycling seen, then
-		// back to quiet
-		recycling(two),
-		pool(2, two),
+		// the pool it replaced: every old id gone and new ones serving
+		pool(2, ["warp-r1 (in_use, served=0, streams=1)", "warp-r2 (healthy, served=0, streams=0)"]),
 	];
 	let index = 0;
 	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
@@ -2589,7 +2621,7 @@ test("ladder: a stranded drain is judged on the next run, never inline (S14)", a
 		async (fake) => {
 			const first = fakeRelayRes();
 			await forward(fakeReq({ marker: "drains" }), first, RESEND_PATH, FORWARD_CONFIG);
-			assert.equal(first.status, 200, "the retry after an accepted swap is delivered without waiting for the drain");
+			assert.equal(first.status, 200, "the resend waits for the new exit and is delivered by it");
 
 			const second = fakeRelayRes();
 			await forward(fakeReq({ marker: "stranded" }), second, RESEND_PATH, FORWARD_CONFIG);
@@ -2622,13 +2654,15 @@ test("ladder: two stranded drains in a row turn the targeted swap off (S14)", as
 
 	// Read in order, one entry per `/health` read:
 	//   run 1: our own window, the attribution's after-shot, the standby guard
-	//          (three usable exits, the count that gets recorded), then the
-	//          post-swap pool that learns EXIT_B, then the recycle's guard;
+	//          (three usable exits, the count that gets recorded), the drained pool
+	//          the retry now WAITS OUT, the pool that replaced it (new id), the
+	//          resend's own attribution window, then the recycle's before-read;
 	//   run 2: the pool that is one usable exit short, so the guard counts the
 	//          first stranding and stands the swap down — with two healthy exits
 	//          left, so nothing but the verdict can refuse it;
 	//   run 3: the pool filled back to three under a new id, nothing pending, so
-	//          the swap is allowed again and drains EXIT_B;
+	//          the swap is allowed again and drains EXIT_A, and the retry waits for
+	//          that replacement too;
 	//   run 4: one exit short again, the guard counts the second stranding and
 	//          suspends the swap.
 	// The tail repeats, because a refused recycle reads `/health` once more.
@@ -2649,29 +2683,48 @@ test("ladder: two stranded drains in a row turn the targeted swap off (S14)", as
 		`${EXIT_B} (healthy, served=7, streams=0)`,
 		`${EXIT_C} (healthy, served=3, streams=0)`,
 	];
-	const two = [`${EXIT_B} (in_use, served=8, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`];
-	const filled = [...two, `${FRESH} (healthy, served=0, streams=0)`];
-	const drained = [`${EXIT_C} (healthy, served=3, streams=0)`];
-	const remaining = [...drained, `${FRESH} (healthy, served=1, streams=0)`];
+	const short = [`${EXIT_B} (in_use, served=8, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`];
+	const filled = [
+		`${EXIT_B} (in_use, served=7, streams=0)`,
+		`${EXIT_C} (healthy, served=3, streams=0)`,
+		`${FRESH} (healthy, served=0, streams=0)`,
+	];
+	const drained = [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`];
+	const swapped = [
+		`${EXIT_C} (healthy, served=3, streams=0)`,
+		`${FRESH} (in_use, served=0, streams=1)`,
+		"warp-newer (healthy, served=0, streams=0)",
+	];
+	const remaining = [`${EXIT_C} (healthy, served=3, streams=0)`, `${FRESH} (healthy, served=1, streams=0)`];
 	const bodies = [
+		// run 1
 		pool(3, [`${EXIT_A} (in_use, served=41, streams=1)`, ...three.slice(1)]),
 		pool(3, three),
 		pool(3, three),
-		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, ...drained]),
-		pool(2, two),
-		pool(2, two),
-		pool(2, two),
-		pool(2, two),
-		pool(2, two),
-		pool(2, two),
+		// accepted, and the drained id is still out: the retry waits
+		pool(2, drained),
+		// the replacees landed: new id, so the retry leaves on it
 		pool(3, filled),
 		pool(3, filled),
 		pool(3, filled),
-		pool(2, remaining),
-		pool(2, remaining),
-		pool(2, remaining),
-		pool(2, remaining),
-		pool(2, remaining),
+		pool(3, filled),
+		// run 2
+		pool(3, filled),
+		pool(3, filled),
+		pool(2, short),
+		pool(2, short),
+		// run 3
+		pool(3, filled),
+		pool(3, filled),
+		pool(3, filled),
+		pool(2, drained),
+		pool(2, swapped),
+		pool(2, swapped),
+		pool(2, swapped),
+		pool(2, swapped),
+		// run 4
+		pool(2, swapped),
+		pool(2, swapped),
 		pool(2, remaining),
 		pool(2, remaining),
 	];
@@ -2766,6 +2819,200 @@ test("ladder: two stranded drains in a row turn the targeted swap off (S14)", as
 });
 
 // ---------------------------------------------------------------------------
+// The resend waits for the pool it paid for (feat/warp-429-contingency)
+// ---------------------------------------------------------------------------
+// A `202` from `/swap` is acceptance, not completion, and a recycled pool is
+// accepted before it exists. The drained exit stays in `exits[]` while the
+// standby serves, so a resend sent on the acceptance alone rides the STANDBY and
+// the step buys nothing. Observed live on 2026-11-05 21:46-21:49: one swap
+// drained one exit, the pool was whole again with a NEW id only ~3 minutes later,
+// and the first request that id served was the NEXT one.
+
+/** A two-exit pool in the exact `/health` shape the proxy publishes. */
+const poolOf = (healthy, exits, recycling = false) => ({
+	ok: true,
+	pool_size: 2,
+	active: healthy,
+	cooling_down: 0,
+	healthy,
+	recycling,
+	exits,
+});
+
+/** `/health` bodies in order, plus one recorded fact: whether the pool had
+ *  ALREADY changed when the question is asked — an id from `fresh` is published
+ *  and none of the `gone` ids is still listed. That flag is the only honest way
+ *  to pin "the resend waited": asserting on elapsed time would also pass for an
+ *  implementation that resends first and waits afterwards, and on a bare "a fresh
+ *  id exists" a rotation that merely enrolled one exit would pass too. */
+function watchedPool(bodies, { fresh, gone = [] }) {
+	let reads = 0;
+	let changed = false;
+	return {
+		next: () => {
+			const body = bodies[Math.min(reads++, bodies.length - 1)];
+			const ids = body.exits.map((exit) => exit.slice(0, exit.indexOf("(")).trim());
+			if (ids.some((id) => id.startsWith(fresh)) && !gone.some((id) => ids.includes(id))) changed = true;
+			return healthJson(body);
+		},
+		changed: () => changed,
+	};
+}
+
+test("ladder: the resend waits for the pool to show the new exit after a swap", async () => {
+	// The drained exit is still out on the first poll: the resend must not leave
+	// yet. On the second poll the pool is whole again with an id that was not
+	// there before, and THAT is what buys the resend.
+	const FRESH = "warp-7d1c9f0ab3e24518";
+	const pool = watchedPool(
+		[
+			// our own attempt's window, then the standby guard
+			poolOf(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+			poolOf(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+			poolOf(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+			// accepted, drained and still out: only the standby can serve
+			poolOf(1, [`${EXIT_B} (in_use, served=7, streams=1)`]),
+			// whole again, with the exit the swap enrolled
+			poolOf(2, [`${EXIT_B} (in_use, served=7, streams=1)`, `${FRESH} (in_use, served=1, streams=1)`]),
+		],
+		{ fresh: FRESH, gone: [EXIT_A] },
+	);
+	const changedAtUpstream = [];
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return pool.next();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: FRESH }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			changedAtUpstream.push(pool.changed());
+			return nextUpstream();
+		},
+		async (fake) => {
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "waits" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(res.status, 200, "the request the fresh exit served is the response");
+			assert.equal(res.body(), '{"ok":true}');
+			assert.equal(swapPosts(fake.calls).length, 1, "one swap, no loop");
+			assert.equal(recyclePosts(fake.calls).length, 0, "the swap was enough");
+			assert.equal(upstreamCalls(fake.calls).length, 2, "original, then exactly one resend");
+			assert.deepEqual(
+				changedAtUpstream,
+				[false, true],
+				"the resend left only after the pool published the new exit",
+			);
+			assert.equal(warpStateForTests().warpResends, 1);
+		},
+	);
+});
+
+test("ladder: a client gone before the swap changed the pool gets the original 429", async () => {
+	// Shown live too: the client gives up before the pool comes back. Nobody is
+	// left to answer, so nothing is resent — the swap keeps running in the proxy
+	// and the next request finds the fresh exit. A wait that ends here says nothing
+	// about stranding: that verdict stays deferred to the next run.
+	const FRESH = "warp-4e8b2ad17c95f360";
+	let reads = 0;
+	let res;
+	const bodies = [
+		poolOf(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		poolOf(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		poolOf(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		// the drained exit never comes back within this request's life
+		poolOf(1, [`${EXIT_B} (in_use, served=7, streams=1)`]),
+	];
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) {
+				const body = bodies[Math.min(reads++, bodies.length - 1)];
+				// The client walks away while the wait is polling the drained pool.
+				if (reads >= 4) res.emit("close");
+				return healthJson(body);
+			}
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: FRESH }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async (fake) => {
+			res = fakeRelayRes();
+			await forward(fakeReq({ marker: "gone" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(res.status, 429, "no resend means the client gets the real answer");
+			assert.equal(res.body(), GATE_429_BODY, "and it is the original 429, byte-exact");
+			assert.equal(swapPosts(fake.calls).length, 1, "the accepted swap is left running in the background");
+			assert.equal(upstreamCalls(fake.calls).length, 1, "no resend request leaves upstream");
+			assert.equal(warpStateForTests().warpResends, 0);
+		},
+	);
+});
+
+test("ladder: the resend waits for the pool to show the new exits after a recycle", async () => {
+	// The same rule on the harder step, and the 10s confirmation budget is NOT its
+	// bound: against the drain measured on 2026-11-05 that budget reported
+	// `not_confirmed` on rotations that did succeed. Here the swap is refused (no
+	// standby), the recycle is accepted, and the resend only leaves once the pool
+	// publishes ids that were not there before.
+	const R1 = "warp-2f6a8c4d90b1e537";
+	const R2 = "warp-8a1d3e6f24c0b795";
+	// Accepted: the recycle window opens, then closes, and the SAME two ids are
+	// still the pool while the old exit drains. `recycling` flipping back off is the
+	// resting state of a healthy pool, so it proves nothing; the drain measured on
+	// 2026-11-05 ran for two minutes under it. The reused body keeps that pool up
+	// long enough for either policy to reveal itself: a resend sent on the flip
+	// leaves here, a resend sent on the replacement leaves after it.
+	const draining = poolOf(1, [`${EXIT_A} (draining, served=42, streams=0)`, `${EXIT_B} (in_use, served=7, streams=1)`], true);
+	const stillDraining = poolOf(2, [`${EXIT_A} (draining, served=42, streams=0)`, `${EXIT_B} (in_use, served=8, streams=1)`]);
+	const pool = watchedPool(
+		[
+			// our own attempt's window, then the standby guard
+			poolOf(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+			poolOf(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+			poolOf(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+			// the rotation's own before-snapshot
+			poolOf(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+			draining,
+			...Array(8).fill(stillDraining),
+			// the old ids are gone and the fresh enrollments are serving: now
+			poolOf(2, [`${R1} (in_use, served=1, streams=1)`, `${R2} (healthy, served=0, streams=0)`]),
+		],
+		{ fresh: R1, gone: [EXIT_A, EXIT_B] },
+	);
+	const changedAtUpstream = [];
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return pool.next();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: false, error: "no_standby" }), { status: 409 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			changedAtUpstream.push(pool.changed());
+			return nextUpstream();
+		},
+		async (fake) => {
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "recycled" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(res.status, 200, "the request the fresh exits served is the response");
+			assert.equal(swapPosts(fake.calls).length, 1, "the cheap step was tried first");
+			assert.equal(recyclePosts(fake.calls).length, 1, "the harder step ran once");
+			assert.equal(upstreamCalls(fake.calls).length, 2, "original, then exactly one resend");
+			assert.deepEqual(
+				changedAtUpstream,
+				[false, true],
+				"the resend left only after the pool published exits that were not there before",
+			);
+			assert.equal(warpStateForTests().warpResends, 1);
+		},
+	);
+});
+
+// ---------------------------------------------------------------------------
 // Slice 2 — degradation and the kill switch (S10)
 // ---------------------------------------------------------------------------
 // An older proxy, or one running the WireGuard stack, has no /swap at all. That
@@ -2826,6 +3073,11 @@ test("ladder: RELAY_WARP_SWAP=0 leaves the hard rotation as the only step (S10)"
 	const nextHealth = sequencedHealth([
 		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		// the standby guard, the rotation's own before-read, and then the pool it
+		// replaced
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
+		[`warp-fresh (healthy, served=0, streams=0)`],
 	]);
 	const nextUpstream = upstreamThen([429, 200]);
 	setWarpSwapEnabledForTests(false);
@@ -3054,9 +3306,11 @@ test("ladder: a parked exit skips the swap and takes the rotation (S13)", async 
 		`${EXIT_A} (draining, served=42, streams=0)`,
 		"warp-fresh (in_use, served=0, streams=1)",
 	], true);
+	// The recycle replaced the whole pool: the old ids are gone and the two ids
+	// below were not there before, which is what the resend waits for.
 	const settled = poolBody(2, [
 		"warp-fresh (in_use, served=0, streams=1)",
-		`${EXIT_B} (healthy, served=7, streams=0)`,
+		"warp-second (healthy, served=0, streams=0)",
 	]);
 	const nextHealth = poolSequence([live, served, parked, parked, recycling, settled]);
 	const nextUpstream = upstreamThen([429, 200]);

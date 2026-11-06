@@ -1194,28 +1194,47 @@ async function runWarpRotation(config, client, snapshot) {
 	try {
 		// Snapshot BEFORE the POST: the exit list is the only observable proof
 		// that an exit was actually replaced.
-		const before = healthFromSnapshot(snapshot ?? (await readWarpSnapshot(config)));
+		const before = snapshot ?? (await readWarpSnapshot(config));
 		const recycle = await postRecycle(config);
 		if (!recycle.accepted) return { rotated: false };
 		warpRecycles += 1;
 
-		const deadline = Date.now() + rotationTimeoutMs;
-		let seenRecycling = false;
-		while (Date.now() < deadline) {
-			if (client && client.gone) return { rotated: false, usable }; // S13: nobody to answer
-			const current = await readWarpSnapshot(config);
-			const observed = usableExitCount(current);
-			if (observed !== undefined) usable = observed;
-			const state = healthFromSnapshot(current);
-			if (state && state.recycling) seenRecycling = true;
-			if (isRotationConfirmed(before, state, seenRecycling)) {
-				logWarpEvent("rotate_ok", { recycles: warpRecycles });
-				return { rotated: true, usable };
+		// A rotation is ACCEPTED before the pool changes: the proxy publishes the new
+		// exits minutes later. With a client waiting, the resend waits for exactly
+		// that change and nothing else bounds it (`waitForPoolReplacement`); a caller
+		// that passed no client has nothing to keep waiting for, so it keeps the
+		// confirmation window this rotation always had. The deadline survives only
+		// here, where nobody is waiting for an answer.
+		if (!client) {
+			const previous = healthFromSnapshot(before);
+			const deadline = Date.now() + rotationTimeoutMs;
+			let seenRecycling = false;
+			while (Date.now() < deadline) {
+				const current = await readWarpSnapshot(config);
+				const observed = usableExitCount(current);
+				if (observed !== undefined) usable = observed;
+				const state = healthFromSnapshot(current);
+				if (state && state.recycling) seenRecycling = true;
+				if (isRotationConfirmed(previous, state, seenRecycling)) {
+					logWarpEvent("rotate_ok", { recycles: warpRecycles });
+					return { rotated: true, accepted: true, usable };
+				}
+				await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
 			}
-			await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
+			logWarpEvent("rotate_failed", { reason: "not_confirmed" });
+			return { rotated: false, accepted: true, usable };
 		}
-		logWarpEvent("rotate_failed", { reason: "not_confirmed" });
-		return { rotated: false, usable };
+
+		const replaced = await waitForPoolReplacement(config, before, exitIds(before), client);
+		if (replaced.changed) {
+			logWarpEvent("rotate_ok", { recycles: warpRecycles });
+			return { rotated: true, accepted: true, usable: replaced.usable, newExit: replaced.newExit };
+		}
+		// The client left before the pool changed: nobody is left to answer, so
+		// nothing is resent. The rotation finishes in the proxy and the next request
+		// finds the fresh exits.
+		logWarpEvent("rotate_abandoned", { reason: replaced.reason, recycles: warpRecycles });
+		return { rotated: false, accepted: true, abandoned: true, usable: replaced.usable };
 	} catch (err) {
 		const reason = err && err.message ? err.message : String(err);
 		process.stderr.write(`pi-free-bridge relay: warp rotation failed — ${reason}\n`);
@@ -1296,11 +1315,12 @@ async function noteWarpAttribution(config, before) {
  *
  *  A `202` is acceptance, and it is also the state: the proxy publishes the new
  *  state under the same lock that accepts the swap, so the body already carries
- *  the target `draining` and the other exit serving. The caller may resend on
- *  it without polling anything. `409` (no standby) and `404` (unknown exit) are real
- *  answers, and both mean "do not insist now" — with two exits a 409 says the
- *  other one is already down, so hammering would only burn enrollments while
- *  the gate is rate-limiting. */
+ *  the target `draining` and the other exit serving. The caller may NOT resend on
+ *  it: the drained exit stays listed for minutes while the standby answers, so the
+ *  ladder waits for the pool to change first (`waitForPoolReplacement`). `409` (no
+ *  standby) and `404` (unknown exit) are real answers, and both mean "do not insist
+ *  now" — with two exits a 409 says the other one is already down, so hammering
+ *  would only burn enrollments while the gate is rate-limiting. */
 export async function swapWarpExit(config, exitId, client) {
 	const decision = decideWarpSwap({
 		exitId,
@@ -1414,6 +1434,63 @@ function rebuildOriginal(original) {
 			headers: original.contentType ? { "content-type": original.contentType } : {},
 		}),
 	};
+}
+
+/** The exit ids of a snapshot, in pool order. The waits below compare sets of
+ *  ids, and a failed read has no ids to compare. */
+function exitIds(snapshot) {
+	return snapshot && Array.isArray(snapshot.exits) ? snapshot.exits.map((exit) => exit.id) : [];
+}
+
+/** Pure: the pool has ACTUALLY replaced what a step drained when every drained id
+ *  is gone from `exits[]` AND an id that was not in the pool before the step is
+ *  present. Returns that fresh id, or `undefined` while the pool still shows the
+ *  old one. One condition is not enough: an accepted swap keeps the drained exit
+ *  listed as `draining` for minutes while the STANDBY serves, so a resend sent on
+ *  a new id alone can still ride an exit the step did not replace, and an exit
+ *  list that merely lost the drained id is a pool that came back short. */
+function replacedExit(before, current, drained) {
+	if (!current || !Array.isArray(current.exits)) return undefined;
+	const known = new Set(exitIds(before));
+	const gone = new Set(drained ?? []);
+	const ids = current.exits.map((exit) => exit.id);
+	if (ids.some((id) => gone.has(id))) return undefined;
+	return ids.find((id) => !known.has(id));
+}
+
+/** Wait until the pool has changed for real, because the resend that follows must
+ *  be SERVED by the exit the step enrolled and not by the standby the drained one
+ *  left behind. Live evidence (2026-11-05, 21:46-21:49): a swap was accepted, the
+ *  resend left while the drained exit was still out and the standby answered it,
+ *  and the pool was whole again with a NEW id only ~3 minutes later — the first
+ *  request served by that id was the next one.
+ *
+ *  There is no clock of its own, and that is the point: the drain measured on
+ *  2026-11-05 took 120s (`20:37:18` asked -> `20:39:18` drained) and the pool took
+ *  minutes longer, so any budget short enough to keep a client waiting is short
+ *  enough to call a healthy step failed. The single bound is the client's own
+ *  patience, observed through `client.gone` — the same signal the drain wait uses
+ *  — and a caller with no client at all keeps the rotation deadline as its only
+ *  bound, because it has nothing else to observe.
+ *
+ *  A wait that ends because the client left is NOT evidence about the exit: the
+ *  deferred judgement (`judgeStrandedWarpSwap`) stays the only thing that
+ *  measures stranding, on the next ladder run, by usable-exit count. */
+async function waitForPoolReplacement(config, before, drained, client) {
+	const deadline = client ? Infinity : Date.now() + rotationTimeoutMs;
+	let usable;
+	for (;;) {
+		if (client && client.gone) return { changed: false, reason: "client_gone", usable };
+		const current = await readWarpSnapshot(config);
+		const observed = usableExitCount(current);
+		if (observed !== undefined) usable = observed;
+		const fresh = replacedExit(before, current, drained);
+		// A client that left during the read must not spend the resend, even when the
+		// pool happened to change in the same window.
+		if (fresh && !(client && client.gone)) return { changed: true, newExit: fresh, usable };
+		if (Date.now() >= deadline) return { changed: false, reason: "timeout", usable };
+		await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
+	}
 }
 
 /** S5: the one attempt a fresh exit buys. Returns the adopted response, or
@@ -1542,8 +1619,11 @@ function judgeStrandedWarpSwap(snapshot) {
  *  riding it. Bounded by construction: at most two attempts per request, and the
  *  original 429 is delivered byte-exact when neither works.
  *
- *  Nothing here waits for a swap to settle: the drain alone can take 120s, so
- *  the verdict belongs to the next run (`judgeStrandedWarpSwap`).
+ *  An accepted swap is waited out (`waitForPoolReplacement`) so the resend is
+ *  served by the exit it enrolled instead of the standby the drained one left
+ *  behind. That wait is NOT a settle verdict: it only asks whether the pool
+ *  changed, so whether a swap stranded the pool is still judged on the next run
+ *  (`judgeStrandedWarpSwap`), by usable-exit count.
  *
  *  No attribution means no target, and a body-less swap picks by live streams —
  *  which, by the time a 429 is being diagnosed, points at the wrong exit. So the
@@ -1576,12 +1656,23 @@ export async function recoverWarp429(config, pathname, body, original, client) {
 	const drainedExit = tunnelExit;
 	const swap = await swapWarpExit(config, drainedExit, client);
 	if (swap.swapped) {
-		// S14: the swap was accepted, not finished, and this process cannot tell
-		// the difference inside the request — the drain alone can take 120s. The
-		// retry goes out now and the usable exit count is remembered so the NEXT
-		// run judges whether the pool replaced what this swap drained (by count,
-		// because a re-enrolment publishes a new id and identity proves nothing).
+		// S14: the swap was accepted, not finished, so the usable exit count is
+		// remembered for the NEXT run's verdict (by count, because a re-enrolment
+		// publishes a new id and identity proves nothing).
 		warpSwapPoolBefore = usableExitCount(snapshot);
+		// The resend waits for the pool to actually change: sent on the acceptance
+		// alone it leaves while the drained exit is still out and the standby serves
+		// it, which is the swap buying nothing (observed live on 2026-11-05). The
+		// only bound is the client's own patience.
+		const replaced = await waitForPoolReplacement(config, snapshot, [drainedExit], client);
+		if (!replaced.changed) {
+			// The client left before the pool changed: nobody to answer, so nothing is
+			// resent. The swap finishes in the proxy and the next request finds the
+			// fresh exit. This wait says nothing about stranding — see above.
+			logWarpEvent("swap_wait_abandoned", { exit: drainedExit, reason: replaced.reason });
+			return rebuildOriginal(original);
+		}
+		logWarpEvent("swap_wait_ok", { exit: drainedExit, newExit: replaced.newExit, usable: replaced.usable });
 		const attempt = await resendWarpOnce(config, pathname, body, original, "swap");
 		if (attempt) return attempt;
 		return resendAfterRotation(config, pathname, body, original, client);
