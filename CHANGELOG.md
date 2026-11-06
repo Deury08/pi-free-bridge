@@ -4,7 +4,7 @@
 > `pi install` pulls this repository directly from `master`, so binary releases
 > were no longer needed). Content is verbatim from the GitHub release bodies.
 
-## Unreleased
+## 0.4.0 (unreleased)
 
 - **A targeted swap before the hard rotation**: a WARP `429` is now attributed to
   the exit that served it through the proxy's monotonic `served` counter, and the
