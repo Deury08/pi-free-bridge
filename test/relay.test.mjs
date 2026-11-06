@@ -1436,11 +1436,14 @@ test("rotateWarpExit: a second 429 during the drain gets no second POST (C7)", a
 	}
 });
 
-function fakeRelayRes() {
+function fakeRelayRes({ socket } = {}) {
 	const res = new EventEmitter();
 	res.headersSent = false;
 	res.writableEnded = false;
 	res.status = 0;
+	// A real response always carries the connection it was written to, and the
+	// departed-client tests need to model what that connection reports.
+	if (socket) res.socket = socket;
 	const chunks = [];
 	res.writeHead = (status) => {
 		res.status = status;
@@ -2947,6 +2950,67 @@ test("ladder: a client gone before the swap changed the pool gets the original 4
 			assert.equal(swapPosts(fake.calls).length, 1, "the accepted swap is left running in the background");
 			assert.equal(upstreamCalls(fake.calls).length, 1, "no resend request leaves upstream");
 			assert.equal(warpStateForTests().warpResends, 0);
+		},
+	);
+});
+
+test("ladder: the wait ends on the departed connection when no close is fired", async () => {
+	// The probe's failing case. Bun never fires `close` on the response of a client
+	// that left, so a tracker bound to it keeps the post-swap wait alive for nobody
+	// (probe case 3: `swap_ok`, then `swap_wait_ok` 30 s later, and a resend the
+	// provider never needed). What Bun does report, measured on Bun 1.3.12 in
+	// `.tmp-probe/signals.mjs`, is the connection losing its remote endpoint. That
+	// is the only signal this fake exposes: it never emits `close` before the
+	// response is written, so a tracker that listens to the response alone cannot
+	// pass, and the wait would run on to the pool's own replacement and spend the
+	// resend on a client that is gone.
+	const FRESH = "warp-5c0a3e8f7b1d2469";
+	const peer = { remoteAddress: "127.0.0.1", remotePort: 51234 };
+	const before = poolOf(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]);
+	const standby = poolOf(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]);
+	const drained = poolOf(1, [`${EXIT_B} (in_use, served=7, streams=1)`]);
+	const whole = poolOf(2, [`${EXIT_B} (in_use, served=7, streams=1)`, `${FRESH} (in_use, served=1, streams=1)`]);
+	// reads 1-3: our own attempt's window and the standby guard; 4-7: the drained
+	// pool the wait polls; 8: the replacement the swap enrolled.
+	const bodies = [before, standby, standby, drained, drained, drained, drained, whole];
+	let reads = 0;
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) {
+				const body = bodies[Math.min(reads++, bodies.length - 1)];
+				// The client hangs up while the wait polls the drained pool. Bun reports
+				// that by dropping the connection's remote endpoint, and by nothing else.
+				if (reads >= 5) {
+					peer.remoteAddress = undefined;
+					peer.remotePort = undefined;
+				}
+				return healthJson(body);
+			}
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: FRESH }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async (fake) => {
+			const res = fakeRelayRes({ socket: peer });
+			let announcedByClose = false;
+			res.on("close", () => {
+				if (!res.writableEnded) announcedByClose = true;
+			});
+			await forward(fakeReq({ marker: "departed" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(announcedByClose, false, "the departure was never announced as a close on the response");
+			assert.equal(res.status, 429, "nobody was left to answer, so the original status stands");
+			assert.equal(res.body(), GATE_429_BODY, "and it is the original 429, byte-exact");
+			assert.equal(upstreamCalls(fake.calls).length, 1, "exactly ONE request reached the provider (no resend)");
+			assert.equal(swapPosts(fake.calls).length, 1, "the accepted swap is left running in the background");
+			assert.equal(warpStateForTests().warpResends, 0);
+			assert.ok(
+				reads < bodies.length,
+				`the wait ended before the pool published the replacement (health reads: ${reads})`,
+			);
 		},
 	);
 });

@@ -1696,14 +1696,40 @@ export function forwardedHeaders(source) {
 	return headers;
 }
 
-/** S13: marks a client that went away before the response finished. `close`
- *  also fires after a normal finish, so the `writableEnded` guard matters. */
+/** S13: has this connection lost its client while the response is still unwritten?
+ *  Node answers that with the response's `close` (handled in `trackClient`). Bun
+ *  never fires it for a client that left: measured on Bun 1.3.12 (2026-11-06,
+ *  `.tmp-probe/signals.mjs`), an abandoned request emits nothing at all — no
+ *  `res:close`, no `res:finish`, no socket `close`/`end`, and `res.destroyed`,
+ *  `res.writableEnded` and `res.socket.destroyed` all stay `false` — while the
+ *  connection's remote endpoint, documented `net.Socket` properties, go away:
+ *  `remoteAddress`/`remotePort`/`remoteFamily` turn `undefined` about 50 ms after
+ *  the client hangs up. In the normal case those properties keep their values for
+ *  the whole life of the request, including past `res:finish` and `res:close`, so
+ *  they only ever disappear for a client that is no longer there. */
+function clientLeft(res) {
+	if (res.writableEnded) return false;
+	const socket = res.socket;
+	if (!socket) return false;
+	return socket.remoteAddress === undefined;
+}
+
+/** S13: marks a client that went away before the response finished. Two signals
+ *  because the runtimes disagree: the response's `close` (also fires after a
+ *  normal finish, so the `writableEnded` guard matters) and the connection's
+ *  lost remote endpoint, observed when `gone` is read. Both flip forward only;
+ *  neither ever resets, so a wait that has been abandoned stays abandoned. */
 function trackClient(res) {
-	const tracker = { gone: false };
+	let gone = false;
 	res.on("close", () => {
-		if (!res.writableEnded) tracker.gone = true;
+		if (!res.writableEnded) gone = true;
 	});
-	return tracker;
+	return {
+		get gone() {
+			if (!gone && clientLeft(res)) gone = true;
+			return gone;
+		},
+	};
 }
 
 // Exported for the request-path tests: the counter and the drain order are only
