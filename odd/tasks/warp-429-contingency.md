@@ -58,6 +58,24 @@ cerrado con warp-minimal.
 - **S10** — `RELAY_WARP_SWAP=0` devuelve exactamente la conducta de hoy (slice 1
   + el reenvío único ya mergeado). Sin la ruta en el proxy (`404`) se degrada con
   un solo aviso y se sigue como antes.
+- **S11** — El comando manual recupera por el paso más barato primero, no por el
+  más caro: lee el pool y, con una sola salida sana, hace recycle inmediato; con
+  n salidas sanas hace swap de cada una, **una por una**, hasta la última, y sólo
+  si el barrido no devolvió ninguna salida sana recurre al recycle. El comando
+  reporta cada paso, no un veredicto agregado.
+- **S12** — Sin bloqueantes por tiempo, ni manual ni automático: se eliminan el
+  cooldown del swap (`RELAY_WARP_SWAP_COOLDOWN_MS`, 60 s) y el del recycle
+  (5 min). La única espera legítima es la de entregas en vuelo; el single-flight
+  se conserva porque no es un temporizador, es exclusión mutua.
+- **S13** — Una salida en estado `cooldown` dentro del pool hace preferir el
+  recycle sobre el swap: re-enrolar salidas nuevas limpia los parques de 30
+  minutos del proxy, y el swap no los toca. Evidencia: `20:40:13 acquire failed:
+  no WARP exit available (all cooling down or starting)`.
+- **S14** — La detección de `stranded` es diferida, nunca inline: el drain real
+  del proxy puede durar hasta 120 s (`20:37:18` pedido → `20:39:18` drenado), así
+  que ninguna espera en el camino de la request puede concluir que una salida no
+  volvió. Se evalúa en la vuelta siguiente de la escalera, comprobando si la
+  salida drenada reapareció.
 
 ## Tasks
 
@@ -73,6 +91,10 @@ cerrado con warp-minimal.
 | T8 | S8 | Escalera acotada integrada al reenvío existente | inline | `3c5fa33` (atribución cableada, 3 tests con RED probado) · `918cf88` (un recycle rechazado no es una rotación) · `91e2a67` (la escalera, 4 tests) |
 | T9 | S10 | Kill switch, degradación por 405/501/404 ausente y README/CHANGELOG | inline | `988071d` · `095991c` (el campo es `error`, no `reason`) |
 | T10 | S6-S10 | Verificación en vivo de los criterios 1-4 con el binario nuevo en 8789 | verify | **pendiente**: espera el deploy del operador (`754dcec`); contra 8789 sólo `GET /health` por política del dueño |
+| T11 | S11, S12 | Barrido manual por el paso más barato, sin cooldowns, con reporte por paso | writer | pendiente |
+| T12 | S12 | Quitar los dos cooldowns también del camino automático | writer | pendiente |
+| T13 | S13 | Salida parkeada en el pool → preferir recycle sobre swap | writer | pendiente |
+| T14 | S14 | Reemplazar la espera inline de asentamiento por detección diferida de stranded | writer | pendiente |
 
 ## Log
 
@@ -193,3 +215,13 @@ cerrado con warp-minimal.
   de que sobreviviera a la suite: los fixtures estaban escritos desde la misma
   mala lectura, así que código y test coincidían entre sí y discrepaban del proxy.
   Verificado reponiendo el nombre equivocado y viendo caer el test del id viejo.
+- **L7** — "no, 1 ver cuantos pool tenemos si es uno acer recicle imediatamente si
+  es n cantidad acemos swap asta el ultimo, sin bloqueantes, la idea es tener
+  acceso" · "no quiero bloqueante automatico ni manual solo espera si ay una
+  peticion en linea esperando, respuesta, cuando devuenva comiensa el barrido" ·
+  "aplica lo que te pedí". Evidencia que funda S13 y S14, sacada del log del
+  proxy del 2026-11-05: 18 enrolamientos en 55 minutos sin un solo 1015 (la cuota
+  no era el problema), `20:37:18` swap pedido → `20:39:18` drenado (el drain real
+  dura 120 s, no 10), `20:23:26` recycle y falla de túnel en el mismo segundo
+  (rotar fabrica los parques de 30 min), `20:40:13 acquire failed: no WARP exit
+  available (all cooling down or starting)` (el pool vacío que hay que evitar).
