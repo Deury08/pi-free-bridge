@@ -1641,7 +1641,7 @@ export async function forward(req, res, pathname, config) {
 	}
 }
 
-async function handle(req, res, config) {
+export async function handle(req, res, config) {
 	// Hot reload (relay-warp-hot-reload): one cheap config re-read per request
 	// drives both /health and /v1.
 	refreshWarpMode(config);
@@ -1670,6 +1670,15 @@ async function handle(req, res, config) {
 			warp429Streak: warp429Streak,
 			warpRecycles: warpRecycles,
 			warpResends: warpResends,
+			// The ladder is invisible from outside for a different reason than the
+			// counters above: a finished swap leaves the proxy snapshot healthy
+			// again, so whether it ran, was disabled, or degraded is only knowable
+			// from the process that ran it.
+			warpSwaps: warpSwaps,
+			warpSwapEnabled: warpSwapEnabledOverride ? WARP_SWAP_ENABLED : false,
+			warpSwapUnsupported: warpSwapUnsupported,
+			warpSwapInFlight: warpSwapInFlight,
+			tunnelExit: tunnelExit ?? null,
 			warpResendEnabled: WARP_RESEND_ENABLED,
 			// S16: 0 means the local egress is free to use again. Reported as a
 			// remaining window rather than a timestamp, because that is the number

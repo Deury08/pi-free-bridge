@@ -528,6 +528,7 @@ test("readFileWarpMode: a missing config file never throws", () => {
 
 import {
 	decideWarpSwap,
+	handle,
 	isRotationConfirmed,
 	LOG_LIMIT_BYTES,
 	logLine,
@@ -2514,4 +2515,61 @@ test("ladder: RELAY_WARP_SWAP=0 leaves the hard rotation as the only step (S10)"
 	} finally {
 		setWarpSwapEnabledForTests(true);
 	}
+});
+
+// ---------------------------------------------------------------------------
+// /health publishes the ladder (S10)
+// ---------------------------------------------------------------------------
+// A swap that finished leaves the exit pool looking healthy again, so the proxy
+// snapshot says nothing about it. The relay's own /health is the one place an
+// outside reader — a human, or the peer session on the far side of the tunnel —
+// can see whether the ladder ran, was disabled, or degraded.
+
+test("relay /health publishes the swap ladder and its kill switch (S10)", async () => {
+	await driveWarp(
+		() => {
+			throw new Error("GET /health never touches the network");
+		},
+		async (fake) => {
+			const readHealth = async () => {
+				const res = fakeRelayRes();
+				await handle({ method: "GET", url: "/health" }, res, { ...FORWARD_CONFIG });
+				assert.equal(res.status, 200, "the diagnostic endpoint keeps answering 200");
+				return JSON.parse(res.body());
+			};
+
+			const on = await readHealth();
+			for (const field of [
+				"warpSwaps",
+				"warpSwapEnabled",
+				"warpSwapUnsupported",
+				"warpSwapInFlight",
+				"tunnelExit",
+			]) {
+				assert.ok(Object.hasOwn(on, field), `/health must publish ${field}`);
+			}
+			assert.equal(on.warpSwaps, 0, "no swap yet, and the counter says so");
+			assert.equal(on.warpSwapInFlight, false);
+			assert.equal(on.warpSwapUnsupported, false);
+			assert.equal(on.tunnelExit, null, "an unknown exit reads as null, never as a missing key");
+			assert.equal(
+				on.warpSwapEnabled,
+				warpSwapEnabled(process.env.RELAY_WARP_SWAP),
+				"with no override the ladder follows RELAY_WARP_SWAP",
+			);
+			assert.equal(fake.calls.length, 0, "reading /health reaches no proxy");
+
+			setWarpSwapEnabledForTests(false);
+			try {
+				assert.equal((await readHealth()).warpSwapEnabled, false, "an explicit 0 is absolute");
+			} finally {
+				setWarpSwapEnabledForTests(true);
+			}
+			assert.equal(
+				(await readHealth()).warpSwapEnabled,
+				warpSwapEnabled(process.env.RELAY_WARP_SWAP),
+				"restoring the switch restores the ladder",
+			);
+		},
+	);
 });
