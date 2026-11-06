@@ -1379,6 +1379,33 @@ export async function resendAfterRotation(config, pathname, body, original, clie
 	return (await resendWarpOnce(config, pathname, body, original, "rotation")) ?? rebuildOriginal(original);
 }
 
+/** S8: a swap is ACCEPTED before it is settled. The proxy publishes the target
+ *  as `draining` under the same lock that accepts the swap and enrolls the
+ *  replacement afterwards, under a NEW id, so a `202` says only that the drain
+ *  started. Resending on an accepted-but-unsettled swap spends the one retry on
+ *  a pool that is halfway through a swap. The settled condition is the drift
+ *  away from the old state: the drained id is gone AND nothing is `draining`.
+ *
+ *  Bounded by the rotation budget, because an exit that never comes back is the
+ *  case this has to survive. An unreadable `/health` is not a settlement — the
+ *  wait keeps going and running out of budget counts as stranded, which is the
+ *  honest reading of a pool that can no longer be observed. */
+async function awaitWarpSwapSettled(config, drainedExit) {
+	const deadline = Date.now() + rotationTimeoutMs;
+	while (Date.now() < deadline) {
+		const state = await readWarpSnapshot(config);
+		if (
+			state &&
+			!state.exits.some((exit) => exit.id === drainedExit) &&
+			!state.exits.some((exit) => exit.state === "draining")
+		) {
+			return true;
+		}
+		await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
+	}
+	return false;
+}
+
 /** S8: the bounded ladder, in ascending cost. A targeted swap replaces ONLY the
  *  exit that served the 429 and keeps the pool serving through the other one:
  *  one enrollment instead of N, no stream cut, nothing left empty. One resend on
@@ -1409,10 +1436,27 @@ export async function recoverWarp429(config, pathname, body, original, client) {
 		logWarpEvent("ladder_swap_skipped", { reason: decision.reason, exit: tunnelExit });
 		return resendAfterRotation(config, pathname, body, original, client);
 	}
-	const swap = await swapWarpExit(config, tunnelExit, client);
+	const drainedExit = tunnelExit;
+	const swap = await swapWarpExit(config, drainedExit, client);
 	if (swap.swapped) {
-		const attempt = await resendWarpOnce(config, pathname, body, original, "swap");
-		if (attempt) return attempt;
+		// S8: the swap was accepted, not finished. Waiting for it to settle before
+		// the retry is what keeps the retry from landing on a pool that is still
+		// draining, and the budget expiring is the stranded pool: the drained exit
+		// never came back. A recycle there would burn the remaining enrollments and
+		// leave the pool worse, so the ladder stops climbing here — one last attempt
+		// on the surviving exit, and then the original 429 byte-exact.
+		if (await awaitWarpSwapSettled(config, drainedExit)) {
+			const attempt = await resendWarpOnce(config, pathname, body, original, "swap");
+			if (attempt) return attempt;
+			return resendAfterRotation(config, pathname, body, original, client);
+		}
+		logWarpEvent("swap_stranded", { exit: drainedExit, target: swap.target });
+		// Both steps stay out for the recycle cooldown: another swap would drain an
+		// exit for nothing, and the recycle is the one that costs the most
+		// enrollments exactly when they are being refused.
+		warpSwapNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
+		warpRecycleNotBefore = Date.now() + RECYCLE_COOLDOWN_MS;
+		return (await resendWarpOnce(config, pathname, body, original, "swap")) ?? rebuildOriginal(original);
 	}
 	return resendAfterRotation(config, pathname, body, original, client);
 }

@@ -2303,7 +2303,7 @@ test("ladder: a targeted swap and one resend need no recycle (S8)", async () => 
 	const nextHealth = sequencedHealth([
 		[`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
 		[`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`],
-		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (draining, served=0, streams=0)`],
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (in_use, served=0, streams=0)`],
 	]);
 	const nextUpstream = upstreamThen([429, 200]);
 	await driveWarp(
@@ -2409,7 +2409,9 @@ test("ladder: when the fresh exit refuses too, the recycle is still there (S8)",
 		// after the swap: our tunnel moved to the new exit
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (draining, served=0, streams=0)`],
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (in_use, served=1, streams=1)`],
-		// the rotation: quiet, then recycling, then a new id
+		// the rotation: quiet, quiet, then a new id (the settled swap already read
+		// one quiet body, because it waits before it retries)
+		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (healthy, served=1, streams=0)`],
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (healthy, served=1, streams=0)`],
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-new (healthy, served=1, streams=0)`],
 		[`${EXIT_B} (in_use, served=7, streams=1)`, `warp-newer (healthy, served=0, streams=0)`],
@@ -2478,6 +2480,53 @@ test("ladder: a thin pool skips the swap and lets the rotation recover (S8)", as
 			assert.equal(swapPosts(fake.calls).length, 0, "a thin pool must not drain the exit that served the 429");
 			assert.equal(recyclePosts(fake.calls).length, 1, "the recovery continued to the rotation");
 			assert.equal(res.status, 200, "the rotation's resend delivered the turn");
+		},
+	);
+});
+
+test("ladder: a stranded swap delivers the original 429 and never recycles (S8)", async () => {
+	// The 202 is acceptance, not a settled pool: the proxy publishes the target
+	// as `draining` and enrolls the replacement afterwards, under a NEW id. When
+	// enrollments are being refused that replacement never appears, so the drained
+	// id stays and keeps `draining` forever. Resending there spends the one retry
+	// on a pool halfway through a swap, and climbing to the recycle burns the
+	// enrollments that are already scarce — the ladder stops and hands back the
+	// original 429 byte-exact.
+	const pool = (healthy, exits) => ({ ok: true, pool_size: 2, active: 1, cooling_down: 0, healthy, recycling: false, exits });
+	const bodies = [
+		// our own attempt's window: EXIT_A is the only counter that moved
+		pool(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		// the standby guard's own read, still before the swap
+		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		// accepted and never settled: the drained id stays, still draining
+		pool(1, [`${EXIT_A} (draining, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`]),
+	];
+	let index = 0;
+	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
+	const nextUpstream = upstreamThen([429, 429]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: "warp-new" }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async (fake) => {
+			setWarpRotationTimingForTests(120, 1); // deadline, not patience
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "stranded" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(res.status, 429, "a stranded swap recovers nothing");
+			assert.equal(res.body(), GATE_429_BODY, "the original 429 is delivered byte-exact");
+			assert.equal(
+				recyclePosts(fake.calls).length,
+				0,
+				"a recycle here would burn the enrollments that are already scarce",
+			);
+			assert.equal(upstreamCalls(fake.calls).length, 2, "the original plus exactly one post-swap retry, no loop");
 		},
 	);
 });
