@@ -2906,3 +2906,177 @@ test("relay /health publishes the swap ladder and its kill switch (S10)", async 
 		},
 	);
 });
+
+// ---------------------------------------------------------------------------
+// Slice 2 — the manual sweep, and a parked pool (S11, S13)
+// ---------------------------------------------------------------------------
+// The manual command recovers by the CHEAPEST step first: it reads the pool and
+// swaps one exit at a time while another usable exit remains, because draining
+// the whole pool at once is what produced `acquire failed: no WARP exit
+// available (all cooling down or starting)` on this machine. The sweep is
+// bounded by the pool it started from — a two-exit pool spends exactly one swap
+// per invocation, a three-exit pool at most two — and nothing waits for a drain
+// to settle: the identifier of the exit that was drained is usable state, the
+// verdict belongs to a later run (S14).
+//
+// S13 adds the exception: an exit in `cooldown` is parked by the proxy for 30
+// minutes and only fresh enrolments clear the parks, so a parked pool goes to
+// the recycle in BOTH paths — the swap would spend an enrollment and touch none
+// of the parks.
+
+/** The proxy's `/health` as warp-minimal publishes it: `exits[]` always carries
+ *  the three fields `<id> (<state>, served=N, streams=N)`. */
+function poolBody(healthy, exits, recycling = false) {
+	return { ok: true, pool_size: 2, active: exits.length, cooling_down: 0, healthy, recycling, exits };
+}
+
+/** `/health` bodies in order; the tail repeats, so a poll that reads more times
+ *  than the case anticipated cannot disturb it. */
+function poolSequence(bodies) {
+	let index = 0;
+	return () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
+}
+
+test("manual sweep: a two-exit pool swaps once and stops (S11)", async () => {
+	// The whole point of the sweep: one swap leaves one usable exit serving, so
+	// the command stops there. Never a second swap, never a recycle in the same
+	// run — draining every exit at once is what emptied the pool.
+	const twoUsable = poolBody(2, [
+		`${EXIT_A} (in_use, served=41, streams=1)`,
+		`${EXIT_B} (healthy, served=7, streams=0)`,
+	]);
+	const oneUsable = poolBody(1, [
+		`${EXIT_B} (in_use, served=8, streams=1)`,
+		"warp-fresh (draining, served=0, streams=0)",
+	]);
+	const nextHealth = poolSequence([twoUsable, oneUsable]);
+	const out = await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: EXIT_A }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return new Response("", { status: 200 });
+		},
+		fake => manualWarpRecycle(WARP_CONFIG).then(body => ({ body, fake })),
+	);
+
+	assert.equal(swapPosts(out.fake.calls).length, 1, "a two-exit pool spends exactly one swap per invocation");
+	assert.equal(recyclePosts(out.fake.calls).length, 0, "the sweep never reaches the harder step while it progresses");
+	assert.equal(out.body.steps.length, 1, "the response reports one step, not an aggregate verdict");
+	assert.deepEqual(out.body.steps[0], { action: "swap", exit: EXIT_A, outcome: "accepted", usable: 1 });
+	assert.equal(out.body.ok, true);
+});
+
+test("manual sweep: a single usable exit recycles instead of swapping (S11)", async () => {
+	// With one usable exit there is no standby: a swap would leave the pool empty
+	// and the proxy would refuse it anyway, so the cheapest step that can work is
+	// the recycle.
+	const onlyUsable = poolBody(1, [`${EXIT_A} (in_use, served=42, streams=1)`]);
+	const recycling = poolBody(1, [`${EXIT_A} (in_use, served=42, streams=0)`], true);
+	const nextHealth = poolSequence([onlyUsable, recycling, onlyUsable]);
+	const out = await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: EXIT_A }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return new Response("", { status: 200 });
+		},
+		fake => manualWarpRecycle(WARP_CONFIG).then(body => ({ body, fake })),
+	);
+
+	assert.equal(recyclePosts(out.fake.calls).length, 1, "one recycle is the whole recovery");
+	assert.equal(swapPosts(out.fake.calls).length, 0, "a pool of one has no standby to swap");
+	assert.equal(out.body.steps.length, 1);
+	assert.equal(out.body.steps[0].action, "recycle");
+	assert.equal(out.body.steps[0].outcome, "accepted");
+	assert.equal(out.body.ok, true);
+});
+
+test("manual sweep: a parked exit prefers the recycle over the swap (S13)", async () => {
+	// `healthy:2` is deliberate: this pool reports a standby, so without the
+	// parking rule the sweep WOULD spend a swap. A `cooldown` exit is parked by
+	// the proxy for 30 minutes and a swap does not touch the parks — only fresh
+	// enrolments do, which is what the recycle buys.
+	const parked = poolBody(2, [
+		`${EXIT_A} (in_use, served=42, streams=1)`,
+		`${EXIT_B} (cooldown, served=7, streams=0)`,
+	]);
+	const recycling = poolBody(2, [
+		`${EXIT_A} (in_use, served=42, streams=0)`,
+		`${EXIT_B} (cooldown, served=7, streams=0)`,
+	], true);
+	const settled = poolBody(2, [
+		"warp-fresh (in_use, served=0, streams=1)",
+		`${EXIT_B} (healthy, served=7, streams=0)`,
+	]);
+	const nextHealth = poolSequence([parked, recycling, settled]);
+	const out = await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: EXIT_A }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return new Response("", { status: 200 });
+		},
+		fake => manualWarpRecycle(WARP_CONFIG).then(body => ({ body, fake })),
+	);
+
+	assert.equal(swapPosts(out.fake.calls).length, 0, "a parked pool is never swept with swaps");
+	assert.equal(recyclePosts(out.fake.calls).length, 1, "the recycle is the step that clears the parks");
+	assert.equal(out.body.steps.length, 1);
+	assert.deepEqual(out.body.steps[0], { action: "recycle", outcome: "accepted", usable: 2 });
+	assert.equal(out.body.ok, true);
+});
+
+test("ladder: a parked exit skips the swap and takes the rotation (S13)", async () => {
+	// The automatic path obeys the same rule: spending a swap on a parked pool
+	// buys an enrollment and clears nothing. `healthy:2` with a `cooldown` exit
+	// again isolates the rule from the standby guard, which would otherwise skip
+	// the swap for a different reason and hide a regression here.
+	const live = poolBody(2, [
+		`${EXIT_A} (in_use, served=41, streams=1)`,
+		`${EXIT_B} (healthy, served=7, streams=0)`,
+	]);
+	const served = poolBody(2, [
+		`${EXIT_A} (in_use, served=42, streams=1)`,
+		`${EXIT_B} (healthy, served=7, streams=0)`,
+	]);
+	const parked = poolBody(2, [
+		`${EXIT_A} (in_use, served=42, streams=1)`,
+		`${EXIT_B} (cooldown, served=7, streams=0)`,
+	]);
+	const recycling = poolBody(2, [
+		`${EXIT_A} (draining, served=42, streams=0)`,
+		"warp-fresh (in_use, served=0, streams=1)",
+	], true);
+	const settled = poolBody(2, [
+		"warp-fresh (in_use, served=0, streams=1)",
+		`${EXIT_B} (healthy, served=7, streams=0)`,
+	]);
+	const nextHealth = poolSequence([live, served, parked, parked, recycling, settled]);
+	const nextUpstream = upstreamThen([429, 200]);
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: EXIT_A }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+			return nextUpstream();
+		},
+		async fake => {
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "parked-pool" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(warpStateForTests().tunnelExit, EXIT_A, "the ladder had a target it could have spent");
+			assert.equal(swapPosts(fake.calls).length, 0, "a parked pool is a recycle, never a swap");
+			assert.equal(recyclePosts(fake.calls).length, 1, "the rotation is the step that clears the parks");
+			assert.equal(res.status, 200, "the rotation's resend delivered the turn");
+		},
+	);
+});

@@ -507,22 +507,24 @@ function relayRecycleUrl(port: number): string {
 	return `http://${RELAY_HOST}:${port}/warp/recycle`;
 }
 
-/** A cooldown reads as a number of seconds in `/health`; a human reads minutes. */
-function formatWait(ms: number): string {
-	const seconds = Math.max(0, Math.round(ms / 1000));
-	if (seconds === 0) return "none";
-	const minutes = Math.floor(seconds / 60);
-	const rest = seconds % 60;
-	return minutes > 0 ? `${minutes}m${String(rest).padStart(2, "0")}s` : `${seconds}s`;
-}
+/** One step of the relay's manual sweep (relay S11): the action, the exit it
+ *  targeted, the outcome the proxy gave and the usable exit count observed right
+ *  after it. `usable` is null when that read failed. */
+type WarpRecycleStep = {
+	action?: string;
+	exit?: string;
+	outcome?: string;
+	usable?: number | null;
+};
 
 type WarpRecycleReply = {
 	ok?: boolean;
 	rotated?: boolean;
 	reason?: string;
+	steps?: WarpRecycleStep[];
+	usable?: number | null;
 	warpRecycles?: number;
 	warp429Streak?: number;
-	cooldownMs?: number;
 	delivering?: number;
 };
 
@@ -2194,7 +2196,7 @@ export default function (pi: ExtensionAPI) {
 			if (outcome.status === 404) {
 				// The route is part of the relay build, not of the extension: a 404
 				// means an older relay is answering, and calling that a refusal would
-				// send the reader looking for a cooldown that does not exist.
+				// send the reader looking for a step that does not exist.
 				lines.push(
 					"",
 					`  the relay on port ${RELAY_PORT} has no /warp/recycle route: it is still`,
@@ -2204,27 +2206,45 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(lines.join("\n"), "error");
 				return;
 			}
+
+			// One line per step, never an aggregate verdict: the sweep is the answer
+			// (which exit it drained, what the proxy said, what the pool looks like
+			// afterwards), and a single "rotated" would hide exactly the two-exit
+			// case where one swap is the whole recovery.
+			const steps = body.steps ?? [];
+			lines.push("  steps:");
+			if (steps.length === 0) {
+				lines.push("    (the relay reported no step)");
+			}
+			for (const [index, step] of steps.entries()) {
+				const action = step.action === "swap" ? `swap ${step.exit ?? "an unnamed exit"}` : "recycle";
+				const usable =
+					typeof step.usable === "number" ? `${step.usable} usable exit(s)` : "usable count unknown";
+				lines.push(`    ${index + 1}. ${action} — ${step.outcome ?? "unknown"}, ${usable}`);
+			}
 			lines.push(
-				`  result:  ${body.ok ? "rotated — new exit confirmed" : `refused (${body.reason ?? "unknown"})`}`,
+				"",
+				`  result:  ${body.ok ? "recovered" : `stopped (${body.reason ?? "unknown"})`}`,
 				`  after:   ${body.warpRecycles ?? before.warpRecycles ?? 0} recycle(s), streak ${
 					body.warp429Streak ?? 0
 				}`,
-				`  cooldown: ${formatWait(body.cooldownMs ?? 0)}`,
 			);
 
 			if (!body.ok) {
 				lines.push(
 					"",
-					"  cooldown       a rotation already ran recently — wait it out.",
 					"  in_flight      another rotation is running right now — look again shortly.",
 					"  no_proxy       the relay has no WARP proxy configured.",
 					"  not_confirmed  the proxy took the POST but never showed a new exit.",
+					"  no_standby     the proxy has no standby exit — the pool is one exit thin.",
+					"  unavailable    the proxy has no /swap route (older build) — only a recycle is left.",
+					"  cooldown       an exit is parked for 30 minutes by the proxy; the recycle clears it.",
 				);
 			}
 
 			lines.push(
 				"",
-				"  The same rotation also runs by itself on the next request after a warp 429;",
+				"  The sweep is also what runs by itself on the next request after a warp 429;",
 				"  this command is for when it did not, or when you do not want to spend a turn.",
 			);
 			ctx.ui.notify(lines.join("\n"), body.ok ? "info" : "error");

@@ -537,6 +537,19 @@ export function warpExitSnapshot(body) {
 	return { recycling: body.recycling === true, exits, healthy };
 }
 
+/** Pure: is any exit in this snapshot parked (S13)? An exit in `cooldown` was
+ *  parked by the proxy for 30 minutes after it burnt its quota, and the parks
+ *  are only cleared by enrolling fresh exits — a targeted swap replaces one exit
+ *  and leaves every park in place. So a parked pool is the recycle's case, in the
+ *  manual sweep and in the automatic ladder alike. */
+export function hasParkedExit(snapshot) {
+	return Boolean(
+		snapshot &&
+			Array.isArray(snapshot.exits) &&
+			snapshot.exits.some((exit) => exit && exit.state === "cooldown"),
+	);
+}
+
 /** Pure: what moved between two snapshots. Only exits present in BOTH are
  *  compared: the contract guarantees a NEW id per enrollment, so a fresh id
  *  starts from zero and comparing it against nothing would invent a delta. A
@@ -602,10 +615,15 @@ export function decideWarpSwap({
 	unavailable = false,
 	inFlight = false,
 	healthy,
+	parked = false,
 	shortWindowMs = SWAP_MIN_RETRY_AFTER_MS,
 } = {}) {
 	if (unavailable) return { swap: false, reason: "unavailable" };
 	if (!enabled) return { swap: false, reason: "disabled" };
+	// S13: a parked exit is a pool-level fact, so it is judged before the target
+	// is: no exit the swap could name is the reason the pool is empty, and only
+	// fresh enrollments clear the 30 minute parks a swap never touches.
+	if (parked) return { swap: false, reason: "cooldown" };
 	if (!exitId) return { swap: false, reason: "no_attribution" };
 	// The swap drains the exit that served the 429, so it may only run while the
 	// pool still has a standby to serve the retry: draining the last serving exit
@@ -820,25 +838,115 @@ function refusalReason(config, inFlightBefore, rotated) {
 	return "not_confirmed";
 }
 
-/** S3: the manual trigger runs the automatic path — same single-flight guard,
- *  same drain, same confirmation. Nothing here is a second implementation of
- *  the rotation, and that is the whole point: a hand-rolled `POST /recycle`
- *  straight to the proxy is exactly the bug this replaces. */
+/** Pure: the order the manual sweep drains exits in (S11). The exit the proxy
+ *  publishes as `in_use` goes first — it is the one serving the burst that
+ *  prompted the command — and the rest follow in snapshot order. An exit the
+ *  proxy already parked (`cooldown`) or is draining is never a target: asking to
+ *  swap one spends a POST to be told no. */
+function sweepTargets(snapshot) {
+	if (!snapshot || !Array.isArray(snapshot.exits)) return [];
+	const candidates = snapshot.exits.filter(
+		(exit) => exit.id && exit.state !== "cooldown" && exit.state !== "draining",
+	);
+	const inUse = candidates.filter((exit) => exit.state === "in_use");
+	return [...inUse, ...candidates.filter((exit) => exit.state !== "in_use")];
+}
+
+/** S11: the manual recovery, by the CHEAPEST step first, reported per step.
+ *
+ *  One usable exit means there is no standby, so the only step that can work is
+ *  the recycle. Otherwise the sweep drains exits one at a time, `in_use` first,
+ *  and stops as soon as one usable exit remains: draining every exit at once is
+ *  what emptied the pool (`acquire failed: no WARP exit available (all cooling
+ *  down or starting)`). Two consequences of that rule:
+ *
+ *  - A two-exit pool spends exactly ONE swap per invocation and a three-exit
+ *    pool at most two. The bound is the pool the sweep STARTED from, never the
+ *    live count: the drain is asynchronous and the proxy may keep reporting the
+ *    drained exit for up to 120s (S14), so following the live number would sweep
+ *    the whole pool in one run.
+ *  - Nothing waits for a drain to settle. The id of the exit that was drained is
+ *    usable state for the report; the settle verdict belongs to a later
+ *    automatic run (`judgeStrandedWarpSwap`), never to this command.
+ *
+ *  S13: a pool holding a parked exit goes to the recycle in either branch — the
+ *  swap replaces one exit and leaves the 30 minute parks in place, while fresh
+ *  enrollments are the only thing that clears them.
+ *
+ *  A refused swap (409 no standby, or a proxy without the route) STOPS the
+ *  sweep: insisting spends enrollments on a pool that just said no, and falling
+ *  back to the recycle in the same run is only allowed when the pool itself was
+ *  the reason (the single-exit branch above). */
 export async function manualWarpRecycle(config) {
 	const inFlightBefore = warpRecycleInFlight;
-	const rotated = await rotateWarpExit(config, undefined);
-	const reason = refusalReason(config, inFlightBefore, rotated);
+	// One pool read decides the cheapest step, and the same read is the
+	// pre-POST snapshot the rotation confirms against. With no proxy there is no
+	// pool to read, and the rotation below reports `no_proxy` on its own.
+	const snapshot = config.warpProxy ? await readWarpSnapshot(config) : undefined;
+	const parked = hasParkedExit(snapshot);
+	const startUsable = usableExitCount(snapshot);
+	const steps = [];
+	let current = snapshot;
+	let reason;
+
+	if (parked || !(startUsable >= 2)) {
+		if (parked) logWarpEvent("manual_sweep_skip_swap", { reason: "cooldown" });
+		const rotation = await runWarpRotation(config, undefined, snapshot);
+		reason = refusalReason(config, inFlightBefore, rotation.rotated);
+		steps.push({
+			action: "recycle",
+			outcome: rotation.rotated ? "accepted" : reason === "not_confirmed" ? "refused" : "degraded",
+			// No rotation, no new observation: the last count read is the honest one.
+			usable: rotation.usable ?? usableExitCount(current) ?? null,
+		});
+	} else {
+		const targets = sweepTargets(snapshot);
+		const budget = Math.max(0, startUsable - 1);
+		for (let index = 0; index < budget; index += 1) {
+			const target = targets[index];
+			if (!target) break;
+			// Never start a swap that would leave zero usable exits.
+			if (!(usableExitCount(current) >= 2)) break;
+			const swap = await swapWarpExit(config, target.id);
+			if (swap.swapped) {
+				// The step is judged by the pool it left behind, so the pool is re-read
+				// after every ACCEPTED swap and the sweep stops at one usable exit.
+				const next = await readWarpSnapshot(config);
+				if (next) current = next;
+			}
+			steps.push({
+				action: "swap",
+				exit: target.id,
+				outcome: swap.swapped ? "accepted" : swap.reason === "unavailable" ? "degraded" : "refused",
+				usable: usableExitCount(current) ?? null,
+			});
+			if (!swap.swapped) {
+				reason = swap.reason;
+				break;
+			}
+		}
+	}
+
+	const rotated = steps.some((step) => step.action === "recycle" && step.outcome === "accepted");
 	const result = {
-		ok: rotated,
+		ok: steps.length > 0 && steps.every((step) => step.outcome === "accepted"),
 		rotated,
+		steps,
+		usable: usableExitCount(current) ?? null,
 		warpMode: config.warpMode,
 		warpRecycles,
 		warp429Streak,
 		delivering: deliveringWarpStreams,
 	};
 	if (reason) result.reason = reason;
-	logWarpEvent(rotated ? "manual_recycle" : "manual_recycle_refused", {
-		warpRecycles,
+	logWarpEvent("manual_sweep", {
+		steps: steps.map((step) => ({
+			action: step.action,
+			...(step.exit ? { exit: step.exit } : {}),
+			outcome: step.outcome,
+			usable: step.usable,
+		})),
+		usable: result.usable,
 		...(reason ? { reason } : {}),
 	});
 	return result;
@@ -992,19 +1100,18 @@ async function maybeRecycleWarp(config) {
 	}
 }
 
-/** GET the proxy's health and reduce it to what the rotation poll reads. Every
- *  failure (refused, timeout, non-2xx, unparseable body) is just "no report":
- *  the poll keeps waiting and eventually falls back to the original 429. */
-async function readWarpHealth(config) {
-	try {
-		const res = await fetch(warpHealthUrl(config.warpProxy, config.warpHealthPath), {
-			signal: AbortSignal.timeout(2_000),
-		});
-		if (!res.ok) return undefined;
-		return warpHealthState(await res.json());
-	} catch {
-		return undefined;
-	}
+/** Reduce a `/health` snapshot to what the rotation poll reads. One read serves
+ *  both answers the poll needs: the exit NAMES the confirmation helper compares
+ *  and the usable count the manual sweep reports, so no rotation reads the proxy
+ *  twice per poll. A snapshot already treats every failure (refused, timeout,
+ *  non-2xx, unparseable body) as "no report", so the poll keeps waiting and
+ *  eventually falls back to the original 429. */
+function healthFromSnapshot(snapshot) {
+	if (!snapshot) return undefined;
+	return {
+		recycling: snapshot.recycling === true,
+		exits: Array.isArray(snapshot.exits) ? snapshot.exits.map((exit) => exit.id) : [],
+	};
 }
 
 /** Wait until nothing is being delivered over the warp tunnel, because the
@@ -1040,12 +1147,19 @@ async function drainBeforeRotation(client) {
 }
 
 /** Rotate the warp exit and wait until the rotation is CONFIRMED (S6). Returns
- *  true only then: an unconfirmed rotation must not buy a resend, because the
- *  resend would leave through the same burnt IP and burn the one attempt.
+ *  `{ rotated, usable }` — true only when confirmed, because an unconfirmed
+ *  rotation must not buy a resend (the resend would leave through the same burnt
+ *  IP and burn the one attempt), plus the usable exit count observed on the last
+ *  read, which is the number the manual sweep reports for its step.
  *  Concurrency: a rotation already in flight belongs to another handler, and
  *  the correct degradation is today's behaviour (deliver the 429) rather than
- *  stacking POSTs on the proxy. */
-export async function rotateWarpExit(config, client) {
+ *  stacking POSTs on the proxy.
+ *
+ *  `snapshot` is an optional pool read the caller already made: the manual sweep
+ *  reads the pool to choose its cheapest step, and that same read is the
+ *  pre-POST snapshot the confirmation compares against, so the rotation never
+ *  reads the proxy twice for one answer. */
+async function runWarpRotation(config, client, snapshot) {
 	// A rotation already in flight belongs to another handler: a second POST
 	// would rotate the exit out from under that handler's in-flight resend and
 	// hand this request a stream nobody can serve. The original 429 is the honest
@@ -1053,11 +1167,11 @@ export async function rotateWarpExit(config, client) {
 	// used to keep a burst of 429s from rotating twice.
 	if (warpRecycleInFlight) {
 		logWarpEvent("rotate_skipped", { reason: "in_flight" });
-		return false;
+		return { rotated: false };
 	}
 	if (!config.warpProxy) {
 		logWarpEvent("rotate_skipped", { reason: "no_proxy" });
-		return false;
+		return { rotated: false };
 	}
 
 	if (!(await drainBeforeRotation(client))) {
@@ -1065,52 +1179,63 @@ export async function rotateWarpExit(config, client) {
 			reason: "drain_refused",
 			delivering: deliveringWarpStreams,
 		});
-		return false;
+		return { rotated: false };
 	}
 	// The drain is an await: another handler may have recycled meanwhile.
 	if (warpRecycleInFlight) {
 		logWarpEvent("rotate_skipped", { reason: "in_flight" });
-		return false;
+		return { rotated: false };
 	}
 	warpRecycleInFlight = true;
 	// This rotation pays for the 429s that asked for it.
 	logWarpEvent("rotate_start", { streak: warp429Streak, delivering: deliveringWarpStreams });
 	warp429Streak = 0;
+	let usable;
 	try {
 		// Snapshot BEFORE the POST: the exit list is the only observable proof
 		// that an exit was actually replaced.
-		const before = await readWarpHealth(config);
+		const before = healthFromSnapshot(snapshot ?? (await readWarpSnapshot(config)));
 		const recycle = await postRecycle(config);
-		if (!recycle.accepted) return false;
+		if (!recycle.accepted) return { rotated: false };
 		warpRecycles += 1;
 
 		const deadline = Date.now() + rotationTimeoutMs;
 		let seenRecycling = false;
 		while (Date.now() < deadline) {
-			if (client && client.gone) return false; // S13: nobody to answer
-			const state = await readWarpHealth(config);
+			if (client && client.gone) return { rotated: false, usable }; // S13: nobody to answer
+			const current = await readWarpSnapshot(config);
+			const observed = usableExitCount(current);
+			if (observed !== undefined) usable = observed;
+			const state = healthFromSnapshot(current);
 			if (state && state.recycling) seenRecycling = true;
 			if (isRotationConfirmed(before, state, seenRecycling)) {
 				logWarpEvent("rotate_ok", { recycles: warpRecycles });
-				return true;
+				return { rotated: true, usable };
 			}
 			await new Promise((resolve) => setTimeout(resolve, rotationPollMs));
 		}
 		logWarpEvent("rotate_failed", { reason: "not_confirmed" });
-		return false;
+		return { rotated: false, usable };
 	} catch (err) {
 		const reason = err && err.message ? err.message : String(err);
 		process.stderr.write(`pi-free-bridge relay: warp rotation failed — ${reason}\n`);
 		logWarpEvent("rotate_failed", { reason });
-		return false;
+		return { rotated: false, usable };
 	} finally {
 		warpRecycleInFlight = false;
 	}
 }
 
-/** The richer `/health` read: the rotation poll only needs names, but
- *  attribution needs the counters. Kept separate so the tested rotation path
- *  keeps its exact semantics. */
+/** S3: the rotation itself. Every caller that only asks "did it rotate?" keeps
+ *  that answer; the manual sweep asks the richer `runWarpRotation` directly. */
+export async function rotateWarpExit(config, client) {
+	return (await runWarpRotation(config, client, undefined)).rotated;
+}
+
+/** The `/health` read behind both the rotation poll and the manual sweep. It
+ *  keeps the counters because attribution and the sweep's per-step usable count
+ *  need more than exit names; `healthFromSnapshot` reduces it to what the
+ *  rotation's confirmation helper compares. */
 async function readWarpSnapshot(config) {
 	try {
 		const res = await fetch(warpHealthUrl(config.warpProxy, config.warpHealthPath), {
@@ -1436,6 +1561,10 @@ export async function recoverWarp429(config, pathname, body, original, client) {
 		: decideWarpSwap({
 				exitId: tunnelExit,
 				healthy: snapshot ? snapshot.healthy : 0,
+				// S13: a parked exit makes the recycle the right tool — the swap
+				// replaces one exit and leaves the 30 minute parks alone, while only
+				// fresh enrollments clear them.
+				parked: hasParkedExit(snapshot),
 				retryAfterMs: original.retryAfterMs,
 				enabled: WARP_SWAP_ENABLED && warpSwapEnabledOverride,
 				inFlight: warpSwapInFlight,
