@@ -501,6 +501,59 @@ function relayHealthUrl(port: number): string {
 	return `http://${RELAY_HOST}:${port}/health`;
 }
 
+/** The relay's manual rotation route. The relay binds 127.0.0.1 only, so this is
+ *  the same loopback surface `/health` already lives on. */
+function relayRecycleUrl(port: number): string {
+	return `http://${RELAY_HOST}:${port}/warp/recycle`;
+}
+
+/** One step of the relay's manual sweep (relay S11): the action, the exit it
+ *  targeted, the outcome the proxy gave and the usable exit count observed right
+ *  after it. `usable` is null when that read failed. */
+type WarpRecycleStep = {
+	action?: string;
+	exit?: string;
+	outcome?: string;
+	usable?: number | null;
+};
+
+type WarpRecycleReply = {
+	ok?: boolean;
+	rotated?: boolean;
+	reason?: string;
+	steps?: WarpRecycleStep[];
+	usable?: number | null;
+	warpRecycles?: number;
+	warp429Streak?: number;
+	delivering?: number;
+};
+
+type WarpRecycleOutcome =
+	| { kind: "reply"; status: number; body: WarpRecycleReply }
+	| { kind: "timeout" }
+	| { kind: "absent" };
+
+/** POST the manual rotation (relay S3). A rotation may legitimately spend up to
+ *  two minutes waiting for responses still being delivered over the tunnel, and
+ *  a command must not hang for two minutes, so the caller is told "still
+ *  working, read the result again" instead of watching a frozen prompt. */
+async function requestWarpRecycle(port: number, timeoutMs = 25_000): Promise<WarpRecycleOutcome> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const res = await fetch(relayRecycleUrl(port), {
+			method: "POST",
+			signal: controller.signal,
+		});
+		const body = (await res.json().catch(() => ({}))) as WarpRecycleReply;
+		return { kind: "reply", status: res.status, body };
+	} catch (err) {
+		return (err as Error)?.name === "AbortError" ? { kind: "timeout" } : { kind: "absent" };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /** S27: `PI_FREE_BRIDGE_BUN`, then `bun` on PATH, then `~/.bun/bin/bun.exe`.
  *  PATH is split by hand instead of shelled out, so this stays synchronous and
  *  side-effect free. */
@@ -940,6 +993,12 @@ type RelayHealth = {
 	warpModeSource?: "env" | "config";
 	lastEgress?: string;
 	pid?: number;
+	/** Counters `/health` already publishes: they are what makes a manual
+	 *  rotation's result readable instead of guessable. */
+	warp429Streak?: number;
+	warpRecycles?: number;
+	warpResends?: number;
+	localParkedForMs?: number;
 };
 
 /** The relay's `/health` payload, or undefined when it is not answering. */
@@ -957,6 +1016,10 @@ export async function fetchRelayHealth(port: number): Promise<RelayHealth | unde
 			warpMode?: unknown;
 			warpModeSource?: unknown;
 			lastEgress?: unknown;
+			warp429Streak?: unknown;
+			warpRecycles?: unknown;
+			warpResends?: unknown;
+			localParkedForMs?: unknown;
 		};
 		if (payload?.service !== RELAY_SERVICE || payload.ok !== true) return undefined;
 		return {
@@ -972,6 +1035,11 @@ export async function fetchRelayHealth(port: number): Promise<RelayHealth | unde
 			lastEgress: typeof payload.lastEgress === "string" && ["local", "warp"].includes(payload.lastEgress)
 				? payload.lastEgress
 				: undefined,
+			warp429Streak: typeof payload.warp429Streak === "number" ? payload.warp429Streak : undefined,
+			warpRecycles: typeof payload.warpRecycles === "number" ? payload.warpRecycles : undefined,
+			warpResends: typeof payload.warpResends === "number" ? payload.warpResends : undefined,
+			localParkedForMs:
+				typeof payload.localParkedForMs === "number" ? payload.localParkedForMs : undefined,
 		};
 	} catch {
 		return undefined;
@@ -2065,6 +2133,121 @@ export default function (pi: ExtensionAPI) {
 				`WARP mode set to ${next} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
 				"info",
 			);
+		},
+	});
+
+	pi.registerCommand("free-bridge-warp-recycle", {
+		description:
+			"Rotate the WARP exit right now — manual recovery when a 429 keeps killing turns",
+		handler: async (_args: string, ctx) => {
+			const before = await fetchRelayHealth(RELAY_PORT);
+			if (!before) {
+				ctx.ui.notify(
+					`pi-free-bridge: the relay does not answer on ${relayHealthUrl(RELAY_PORT)} — nothing to rotate.`,
+					"error",
+				);
+				return;
+			}
+
+			const lines = [
+				"pi-free-bridge warp recycle",
+				`  relay:   ${relayHealthUrl(RELAY_PORT)}`,
+				`  mode:    ${before.warpMode ?? "unknown"}${
+					before.warpModeSource ? ` (from ${before.warpModeSource})` : ""
+				}`,
+				`  before:  streak ${before.warp429Streak ?? 0}, ${before.warpRecycles ?? 0} recycle(s), last egress ${
+					before.lastEgress ?? "none"
+				}`,
+			];
+
+			if ((before.warpMode ?? "off") === "off") {
+				lines.push(
+					"",
+					"  warp is off, so the 429 came from the direct egress: rotating WARP",
+					"  cannot fix it. Run /free-bridge-warp auto (or on) first.",
+				);
+				ctx.ui.notify(lines.join("\n"), "error");
+				return;
+			}
+
+			const outcome = await requestWarpRecycle(RELAY_PORT);
+
+			if (outcome.kind === "absent") {
+				lines.push("", "  FAILED — the relay did not accept the request.");
+				ctx.ui.notify(lines.join("\n"), "error");
+				return;
+			}
+
+			if (outcome.kind === "timeout") {
+				lines.push(
+					"",
+					"  no answer in 25s. A rotation can wait up to two minutes for responses",
+					"  still being delivered over the tunnel, and it rotates on its own when that",
+					"  wait ends. Re-run this command to read the result.",
+					"",
+					"  Heads up: if this session talks through the bridge, the rotation replaces",
+					"  the exit under your own answer. Best run from a session that does not.",
+				);
+				ctx.ui.notify(lines.join("\n"), "info");
+				return;
+			}
+
+			const body = outcome.body;
+			if (outcome.status === 404) {
+				// The route is part of the relay build, not of the extension: a 404
+				// means an older relay is answering, and calling that a refusal would
+				// send the reader looking for a step that does not exist.
+				lines.push(
+					"",
+					`  the relay on port ${RELAY_PORT} has no /warp/recycle route: it is still`,
+					"  running an older build. Restart Pi so the extension spawns the new one,",
+					"  then run this command again.",
+				);
+				ctx.ui.notify(lines.join("\n"), "error");
+				return;
+			}
+
+			// One line per step, never an aggregate verdict: the sweep is the answer
+			// (which exit it drained, what the proxy said, what the pool looks like
+			// afterwards), and a single "rotated" would hide exactly the two-exit
+			// case where one swap is the whole recovery.
+			const steps = body.steps ?? [];
+			lines.push("  steps:");
+			if (steps.length === 0) {
+				lines.push("    (the relay reported no step)");
+			}
+			for (const [index, step] of steps.entries()) {
+				const action = step.action === "swap" ? `swap ${step.exit ?? "an unnamed exit"}` : "recycle";
+				const usable =
+					typeof step.usable === "number" ? `${step.usable} usable exit(s)` : "usable count unknown";
+				lines.push(`    ${index + 1}. ${action} — ${step.outcome ?? "unknown"}, ${usable}`);
+			}
+			lines.push(
+				"",
+				`  result:  ${body.ok ? "recovered" : `stopped (${body.reason ?? "unknown"})`}`,
+				`  after:   ${body.warpRecycles ?? before.warpRecycles ?? 0} recycle(s), streak ${
+					body.warp429Streak ?? 0
+				}`,
+			);
+
+			if (!body.ok) {
+				lines.push(
+					"",
+					"  in_flight      another rotation is running right now — look again shortly.",
+					"  no_proxy       the relay has no WARP proxy configured.",
+					"  not_confirmed  the proxy took the POST but never showed a new exit.",
+					"  no_standby     the proxy has no standby exit — the pool is one exit thin.",
+					"  unavailable    the proxy has no /swap route (older build) — only a recycle is left.",
+					"  cooldown       an exit is parked for 30 minutes by the proxy; the recycle clears it.",
+				);
+			}
+
+			lines.push(
+				"",
+				"  The sweep is also what runs by itself on the next request after a warp 429;",
+				"  this command is for when it did not, or when you do not want to spend a turn.",
+			);
+			ctx.ui.notify(lines.join("\n"), body.ok ? "info" : "error");
 		},
 	});
 

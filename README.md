@@ -178,9 +178,11 @@ quedará visibible en `/health` (`sessionSource`) y `/free-bridge-session`:
 
 ## Egress WARP (`off` / `auto` / `on`)
 
-`warp-minimal` (puerto `127.0.0.1:8789`, `warp_enabled` opcional) es la salida
-alternativa cuando el egress directo está bloqueado o saturado de rate limit.
-Tres modos (bun-upgrades S5):
+[`warp-minimal`](https://github.com/Deury08/warp-minimal) es el proxy que aporta la
+salida (puerto `127.0.0.1:8789`, `warp_enabled` opcional). Es un proyecto aparte
+del relay: registra las salidas WARP, publica su pool en `/health` y expone
+`/swap` y `/recycle`. De él vienen la salida alternativa cuando el egress directo
+está bloqueado o saturado de rate limit. Tres modos (bun-upgrades S5):
 
 - **`off`** (default): todo directo; el relay nunca toca WARP.
 - **`auto`**: directo primero; si llega un `429` **antes del primer byte**, el
@@ -258,6 +260,54 @@ Con la rotación confirmada hace **un** reenvío, y nada más:
 - `/health` publica `warpResends` (reenvíos que salieron bien) y
   `warpResendEnabled` (si el mecanismo está activo en este proceso).
 - `RELAY_WARP_RETRY_AFTER_RECYCLE=0` lo apaga del todo, sin tocar el resto.
+
+### Escalera de recuperación: swap apuntado antes que recycle
+
+Un `429` de WARP ya no tiene la rotación dura como único paso. La escalera va de
+menor a mayor costo:
+
+1. **Un intento por IP.** El `429` se atribuye a un exit concreto leyendo el
+   contador `served` de `/health` —túneles abiertos por ese exit, no requests—:
+   snapshot antes del intento, snapshot después del `429`, y sólo un delta de
+   exactamente 1 sobre un único exit cuenta como evidencia. Con el mapa dudoso o
+   vacío **no se rota**: se entrega el `429`, y el escape forzado es el comando
+   manual.
+2. **`POST /swap` apuntado por id.** Reemplaza sólo ese exit: un enrolamiento en
+   vez de N, y el pool sigue sirviendo por el otro. Un `202` es **aceptación**, no
+   cambio: el `target` queda en `draining` y la salida nueva aparece cuando el
+   drain termina. `409` (no hay standby) y `404` (id desconocido) son respuestas:
+   no se insisten.
+3. **La espera del cambio, y después un reintento por la salida nueva.** El relay
+   relee `/health` hasta que la salida drenada desaparezca **y** aparezca un id que
+   antes no estaba, y sólo entonces reenvía. Reenviar antes sale por la standby —la
+   única que sirve mientras la otra drena—, que puede estar tan limitada como la
+   que dio el `429`: se gastaría un enrolamiento para reintentar contra una IP
+   quemada. No hay plazo propio: la espera termina cuando el pool cambia o cuando
+   **el cliente se va**, lo que pase primero. Si el cliente se fue primero, se
+   entrega el `429` original byte-exacto y el swap sigue solo en segundo plano, así
+   el request siguiente ya encuentra la salida nueva. La espera medida contra el
+   drain real no es corta: 120 s una vez, 183 s otra, y la válvula del proxy sólo
+   se abre al vencer, no antes.
+4. **`/recycle`** sólo si ese reintento también da `429`. Es el único paso que
+   corta los streams en vuelo —incluido el tuyo—, así que va último, y también
+   espera a que el pool muestre las salidas nuevas antes de reenviar. En esa ruta
+   el presupuesto de confirmación de 10 s ya no manda cuando hay cliente: era el
+   mismo error, porque contra el drain medido toda rotación exitosa se reportaba
+   como `not_confirmed`.
+5. **Un reintento más**, y si tampoco: el `429` original byte-exacto.
+
+Acotada por construcción: dos intentos extra como máximo, nunca un loop.
+
+Dos detalles que costaron encontrar:
+
+- Un `202` con `{"ok":false}` (o un `/recycle` rechazado) significa que **otro**
+  swap o recycle tiene el estado del proxy: no pasó nada, así que no se cuenta
+  como acción. Sólo un `202` puede decir `ok:false` y significarlo; un `409`/`404`
+  llega con status de error y ahí el status es la respuesta.
+- Si el proxy no tiene `/swap` (binario viejo, o stack WireGuard que responde
+  `501` en texto plano, o un `404` sin el motivo `unknown_exit`), el relay lo
+  detecta, avisa **una vez** y sigue rotando duro. Reintentar contra una ruta que
+  no existe sólo gasta intentos.
 
 ### Parking de la IP local
 
@@ -366,6 +416,7 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `/free-bridge-warp` | Muestra el modo de salida WARP (`off` por defecto), el endpoint efectivo y el último egress usado | Diagnóstico de red o grandes rate limits |
 | `/free-bridge-warp off\|auto\|on` | Cambia y persiste el modo: `off` directo; `auto` directo primero, WARP ante rate limit; `on` siempre WARP. **Hot reload:** sin reiniciar el relay — aplica en el próximo request | Requiere `warp-minimal` en `127.0.0.1:8789` para modos no-`off`. Si no está y no hay ruta configurada, Pi **te pregunta** y ofrece descargar e instalar la release oficial (checksum verificado) |
 | `/free-bridge-warp bin <ruta>` | Configura la ruta del binario `warp-minimal` (queda en `warpBin` de la config) | Cuando ya lo tenés compilado o descargado y preferís apuntarlo a mano |
+| `/free-bridge-warp-recycle` | Recupera el egress WARP ahora, por el paso más barato primero: lee el pool y hace recycle si sólo una salida puede servir o si alguna está parkeada en el cool-down de 30 minutos del proxy; si no, hace un swap apuntado de la salida en uso y vuelve a leer el pool después de cada swap aceptado, parando cuando queda una sola sirviendo. Nunca arranca un swap que dejaría el pool sin salidas, porque el drain retiene esa salida hasta 120 s. Espera a que no haya respuestas entregándose por el túnel e informa cada paso, no un veredicto | Cuando un `429` te mató el turno y la rotación automática no llegó (o no querés gastar un turno para que llegue). **No lo corras desde una sesión que esté usando el bridge**: el swap cambia el exit debajo de tu propia respuesta |
 
 ### Terminal (fuera de Pi)
 
@@ -388,8 +439,10 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 | `~/.pi/agent/pi-free-bridge.json` → `sessionId` | Session id persistido |
 | `~/.pi/agent/pi-free-bridge.json` → `warpEnabled` | Modo de egress WARP: `off`, `auto` u `on` (por defecto `off`) |
 | `PI_FREE_BRIDGE_WARP_MODE` | Pisa el modo de egress WARP (también `off`, `auto`, `on`; máxima precedencia). Mientras exista, el relay **no** lee el `warpEnabled` del config — el modo queda fijado (estático por diseño) |
-| `RELAY_WARP_RECYCLE_COOLDOWN_MS` | Relay-only: cool-down entre recycles (default `300000`). La rotación en sí **no** es configurable: ocurre en el primer `429` observado en el egress warp, porque cualquier umbral mayor entregaría ese tanto de `429` antes de rotar. El relay degrada con gracia si el proxy no tiene endpoint `/recycle`. |
 | `RELAY_WARP_RETRY_AFTER_RECYCLE` | Relay-only: kill switch del reenvío único tras una rotación confirmada. `0` lo desactiva (se entrega el `429` original tal cual); ausente o cualquier otro valor lo mantiene activo. |
+| `RELAY_WARP_SWAP` | Relay-only: kill switch del swap apuntado. `0` lo desactiva y deja la rotación dura como único paso; ausente o cualquier otro valor lo mantiene activo. |
+| `RELAY_WARP_SWAP_MIN_RETRY_AFTER_MS` | Relay-only: si el `retry-after` del `429` es menor que esto (default `120000`), el relay espera en vez de gastar un enrolamiento. Un swap consume cuota de Cloudflare, que es justo lo escaso cuando el gate ya está devolviendo `1015`. |
+| `RELAY_LOG_FILE` | Relay-only: ruta del log de eventos de WARP en JSONL (un objeto por línea: `429` observado, rotación pedida/confirmada/fallida con motivo, reenvío, parking local, entrega final). Sin valor **no escribe nada**. Rota a los 5 MB conservando un `.1`. Nunca registra bodies, cabeceras ni prompts: solo el evento y los contadores que explican la decisión |
 | `PI_FREE_BRIDGE_WARP_PROXY` | URL del proxy WARP (por defecto `http://127.0.0.1:8789`) |
 | `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` (precedencia sobre `warpBin` en config) |
 | `~/.pi/agent/pi-free-bridge.json` → `warpBin` | Ruta al binario; si no hay ninguna y no responde, Pi ofrece descargar e instalar la release oficial (te lo pregunta antes) |

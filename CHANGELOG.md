@@ -4,7 +4,58 @@
 > `pi install` pulls this repository directly from `master`, so binary releases
 > were no longer needed). Content is verbatim from the GitHub release bodies.
 
-## Unreleased
+## 0.4.0 (unreleased)
+
+- **A targeted swap before the hard rotation**: a WARP `429` is now attributed to
+  the exit that served it through the proxy's monotonic `served` counter, and the
+  ladder replaces only that exit (`POST /swap`) plus one resend, falling back to
+  the pool-wide `/recycle` only when the fresh exit refuses too. One enrollment
+  instead of N, no stream cut, and the pool is never left without a healthy exit.
+  Attribution is deliberately conservative: a doubtful map means no rotation at
+  all rather than a swap aimed at an innocent exit, and the manual command stays
+  as the forced escape. A `202` carrying `ok:false` is a refusal and spends
+  nothing, a `409`/`404` is a real answer that is not insisted on, and a proxy
+  without `/swap` (older binary, or the WireGuard stack answering `501`) is
+  detected once, warned once, and the relay keeps rotating. `RELAY_WARP_SWAP=0`
+  is the kill switch and `RELAY_WARP_SWAP_MIN_RETRY_AFTER_MS` decides how
+  short a `retry-after` makes waiting cheaper than enrolling.
+
+- **No cool-downs, and a swap judged by the pool it left behind**: both the
+  swap's 60 s and the recycle's 5 min cool-downs are gone, from the automatic
+  ladder and from the manual command. Measured on one machine: eighteen device
+  enrollments in fifty-five minutes produced no rate-limit refusals, while the
+  cool-downs only ever blocked useful recovery — a command that wanted the cheap
+  step was refused for the sake of the expensive step it was not going to run.
+  The only wait left is the one for in-flight deliveries, plus mutual exclusion,
+  neither of which is a timer. A swap is also no longer judged inline: the
+  proxy's drain holds its exit for up to 120 s, so a short settle budget labelled
+  healthy swaps as stranded. The verdict is deferred to the next ladder run and
+  measured by how many exits the pool can still serve, never by exit id, because
+  a re-enrolment publishes a new one.
+
+- **Manual recovery sweeps by cheapest step**: the command now reads the pool and
+  decides instead of always tearing it down. One usable exit, or any exit parked
+  in the proxy's thirty-minute cooldown, means recycle — re-enrolling fresh exits
+  is the only thing that clears those parks. Otherwise it swaps the exit in use,
+  re-reads the pool after each accepted swap, and stops at one usable exit: a
+  drain holds its exit for up to two minutes, so draining every exit at once is
+  exactly how a pool ends up with nothing to serve. Each step is reported.
+
+- **Manual WARP rotation, by the same path as the automatic one**: new
+  `/free-bridge-warp-recycle` command, backed by a loopback `POST /warp/recycle`
+  route on the relay. It exists because the only manual recovery a burnt exit had
+  was a raw `POST /recycle` straight to the proxy, which skips the drain and tears
+  down every stream multiplexed over the tunnel. The command now waits for
+  in-flight deliveries, reads the pool and sweeps by cheapest step, and reports
+  each step instead of streak, recycles and remaining cool-down. The
+  relay binds `127.0.0.1` only, so the route needs no token.
+- **The relay can keep an event log on disk**: `RELAY_LOG_FILE` writes one JSON
+  object per line for every WARP decision that costs something — a `429`
+  observed, a rotation asked for or refused (with its reason), the resend, the
+  local-egress parking, the final delivery. Until now every one of those
+  diagnostics went to a pipe the parent drained, so an incident died with the
+  turn that hit it. Off by default, rolls at 5 MB keeping one `.1`, and never
+  records bodies, headers or prompts.
 
 - **Rotation waits for in-flight WARP deliveries**: `/recycle` replaces the exit,
   and that kills every stream multiplexed over it. A response that already
