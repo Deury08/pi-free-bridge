@@ -2531,6 +2531,133 @@ test("ladder: a stranded swap delivers the original 429 and never recycles (S8)"
 	);
 });
 
+test("ladder: two stranded swaps in a row turn the targeted swap off (S8)", async () => {
+	// One stranded swap can be one exit having a bad day. Two in a row mean the
+	// pool cannot replace what the ladder drains, so the ladder must stop spending
+	// enrollments instead of grinding one every recycle cooldown: the third 429 is
+	// recovered without a `POST /swap`, and it still answers the client.
+	//
+	// The first stranding arms both cooldowns for minutes and they are read once at
+	// load, so this case loads its own relay instance with them at zero. Two
+	// stranded swaps have to fit in one test without sleeping.
+	const FRESH = "warp-stranded-fresh";
+	const previousRecycleCooldown = process.env.RELAY_WARP_RECYCLE_COOLDOWN_MS;
+	const previousSwapCooldown = process.env.RELAY_WARP_SWAP_COOLDOWN_MS;
+	process.env.RELAY_WARP_RECYCLE_COOLDOWN_MS = "0";
+	process.env.RELAY_WARP_SWAP_COOLDOWN_MS = "0";
+	let relay;
+	try {
+		relay = await import("../relay.mjs?stranded-guard");
+	} finally {
+		for (const [key, was] of [
+			["RELAY_WARP_RECYCLE_COOLDOWN_MS", previousRecycleCooldown],
+			["RELAY_WARP_SWAP_COOLDOWN_MS", previousSwapCooldown],
+		]) {
+			if (was === undefined) delete process.env[key];
+			else process.env[key] = was;
+		}
+	}
+
+	const file = join(logDir(), "relay-stranded-guard.jsonl");
+	relay.setLogFileForTests(file);
+	relay.resetWarpStateForTests();
+	relay.setWarpRotationTimingForTests(0, 1); // the settle budget is spent at once
+
+	// Read in order: our own attempt's window, the attribution's after-shot, the
+	// standby guard, then the post-swap pool. The drained id is gone from that
+	// last one while the other exit's counter moved, so the tunnel is learned
+	// again on the very exit the second swap will drain. The tail repeats: the
+	// recovery reads `/health` an unpredictable number of times.
+	const pool = (healthy, exits) => ({
+		ok: true,
+		pool_size: exits.length,
+		active: 1,
+		cooling_down: 0,
+		healthy,
+		recycling: false,
+		exits,
+	});
+	const bodies = [
+		pool(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
+		pool(2, [`${EXIT_B} (in_use, served=8, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
+	];
+	let reads = 0;
+	const nextHealth = () => healthJson(bodies[Math.min(reads++, bodies.length - 1)]);
+	const nextUpstream = upstreamThen([429]);
+
+	const stderr = [];
+	const originalWrite = process.stderr.write;
+	process.stderr.write = (chunk) => (stderr.push(String(chunk)), true);
+	const fake = installFakeFetch((call) => {
+		if (call.url.endsWith("/health")) return nextHealth();
+		if (call.url.endsWith("/swap")) {
+			return new Response(JSON.stringify({ ok: true, target: FRESH }), { status: 202 });
+		}
+		if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+		return nextUpstream();
+	});
+	try {
+		const recover = async (marker) => {
+			const res = fakeRelayRes();
+			await relay.forward(fakeReq({ marker }), res, RESEND_PATH, FORWARD_CONFIG);
+			return res;
+		};
+
+		await recover("strand-one");
+		await recover("strand-two");
+		assert.equal(
+			swapPosts(fake.calls).length,
+			2,
+			"both swaps were attempted: the guard is about the second one, not the first",
+		);
+
+		const beforeThird = swapPosts(fake.calls).length;
+		const third = await recover("strand-three");
+		assert.equal(
+			beforeThird,
+			2,
+			"two stranded swaps were spent before the third recovery",
+		);
+		assert.equal(
+			swapPosts(fake.calls).length - beforeThird,
+			0,
+			"a suspended swap is never attempted again, however many 429s follow",
+		);
+		assert.equal(third.status, 429, "the client still gets an answer");
+		assert.equal(third.body(), GATE_429_BODY, "and it is the original 429, byte-exact");
+		assert.equal(
+			relay.warpStateForTests().warpSwapUnsupported,
+			true,
+			"two strandings suspend the swap through the state a missing /swap sets",
+		);
+
+		const events = readEvents(file).map((event) => event.ev);
+		assert.equal(events.filter((ev) => ev === "swap_stranded").length, 2, "both strandings are on disk");
+		assert.equal(
+			events.filter((ev) => ev === "swap_suspended_stranded").length,
+			1,
+			"the suspension has its own event name",
+		);
+		assert.equal(
+			events.includes("swap_unavailable"),
+			false,
+			"a stranded pool is never reported as a proxy without /swap",
+		);
+		assert.equal(
+			stderr.filter((line) => /two targeted swaps in a row/.test(line)).length,
+			1,
+			"one warning names the suspension, not one per 429",
+		);
+	} finally {
+		process.stderr.write = originalWrite;
+		fake.restore();
+		relay.setWarpRotationTimingForTests();
+	}
+});
+
 // ---------------------------------------------------------------------------
 // Slice 2 — degradation and the kill switch (S10)
 // ---------------------------------------------------------------------------

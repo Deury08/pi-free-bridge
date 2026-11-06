@@ -689,6 +689,12 @@ let warpSwaps = 0;
 // life of the process: the ladder steps aside once and stays aside.
 let warpSwapUnsupported = false;
 let warpSwapUnsupportedWarned = false;
+// Two stranded swaps in a row are not one exit having a bad day: the pool is not
+// coming back on its own, so the ladder stops attempting targeted swaps for the
+// rest of the process instead of grinding one every recycle cooldown. A swap
+// that does settle proves the pool can still replace what the ladder drains, so
+// the streak starts over.
+let warpSwapStrandedStreak = 0;
 // Test-only mirror of `RELAY_WARP_SWAP`, which is read once at load.
 let warpSwapEnabledOverride = true;
 // The exit the relay believes its own tunnel rides on, learned from the
@@ -867,6 +873,7 @@ export function resetWarpStateForTests() {
 	warpSwaps = 0;
 	warpSwapUnsupported = false;
 	warpSwapUnsupportedWarned = false;
+	warpSwapStrandedStreak = 0;
 	warpSwapEnabledOverride = true;
 	tunnelExit = undefined;
 	warpPreferred = false;
@@ -1446,11 +1453,29 @@ export async function recoverWarp429(config, pathname, body, original, client) {
 		// leave the pool worse, so the ladder stops climbing here — one last attempt
 		// on the surviving exit, and then the original 429 byte-exact.
 		if (await awaitWarpSwapSettled(config, drainedExit)) {
+			warpSwapStrandedStreak = 0;
 			const attempt = await resendWarpOnce(config, pathname, body, original, "swap");
 			if (attempt) return attempt;
 			return resendAfterRotation(config, pathname, body, original, client);
 		}
 		logWarpEvent("swap_stranded", { exit: drainedExit, target: swap.target });
+		// The pool could not replace the exit the swap drained. Once can be luck;
+		// twice in a row says the swap itself is what is costing us exits, so the
+		// ladder steps aside through the same state a proxy without `/swap` sets.
+		// The event name and the warning stay distinct on purpose: a stranded pool
+		// and a missing route are different failures, and whoever reads the log has
+		// to be able to tell them apart.
+		warpSwapStrandedStreak += 1;
+		if (warpSwapStrandedStreak >= 2) {
+			warpSwapUnsupported = true;
+			if (!warpSwapUnsupportedWarned) {
+				warpSwapUnsupportedWarned = true;
+				process.stderr.write(
+					"pi-free-bridge relay: two targeted swaps in a row stranded the pool — the targeted swap is off, rotating hard instead\n",
+				);
+			}
+			logWarpEvent("swap_suspended_stranded", { stranded: warpSwapStrandedStreak, exit: drainedExit });
+		}
 		// Both steps stay out for the recycle cooldown: another swap would drain an
 		// exit for nothing, and the recycle is the one that costs the most
 		// enrollments exactly when they are being refused.
