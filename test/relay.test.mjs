@@ -495,15 +495,16 @@ test("bumpWarp429Streak: only a warp-egress success resets it — a local fallba
 	assert.equal(bumpWarp429Streak(2, 502, "warp"), 2);
 });
 
-test("needsWarpRecycle: rotates on the FIRST warp 429, never during cooldown", () => {
+test("needsWarpRecycle: rotates on the FIRST warp 429, with no timer in between (S12)", () => {
 	// The meter has exactly one correct value: rotate on the first 429. Any
 	// larger threshold would deliver that many 429s before the exit rotates,
-	// which is strictly worse once the relay resends after a rotation.
-	assert.equal(needsWarpRecycle(0, false), false);
-	assert.equal(needsWarpRecycle(1, false), true);
-	assert.equal(needsWarpRecycle(4, false), true);
-	assert.equal(needsWarpRecycle(1, true), false);
-	assert.equal(needsWarpRecycle(9, true), false);
+	// which is strictly worse once the relay resends after a rotation. S12
+	// removed the cool-down: a second 429 is a second signal, never a reason to
+	// sit on a burnt exit.
+	assert.equal(needsWarpRecycle(0), false);
+	assert.equal(needsWarpRecycle(1), true);
+	assert.equal(needsWarpRecycle(4), true);
+	assert.equal(needsWarpRecycle(9), true, "the count never expires into a blocker");
 });
 
 test("readFileWarpMode: tolerates a UTF-8 BOM in the config file", () => {
@@ -779,39 +780,36 @@ test("resendAfterRotation: a confirmed rotation posts /recycle once and resends 
 	);
 });
 
-test("rotateWarpExit: a rotation inside its cooldown never posts /recycle again", async () => {
-	// B1: two warp 429s a moment apart used to POST twice, and the second POST
-	// tore down the first request's in-flight resend stream.
-	const nextHealth = recyclingThenQuiet();
-	const stderr = [];
-	const originalWrite = process.stderr.write;
-	process.stderr.write = (chunk) => (stderr.push(String(chunk)), true);
-	try {
-		await driveWarp(
-			(call) => {
-				if (call.url.endsWith("/health")) return healthJson(nextHealth());
-				return new Response("", { status: 200 });
-			},
-			async (fake) => {
-				assert.equal(await rotateWarpExit(WARP_CONFIG, undefined), true);
-				assert.equal(
-					warpStateForTests().warpRecycleNotBefore > Date.now(),
-					true,
-					"the 2xx armed the cooldown",
-				);
+/* A rotation cycle the confirmation poll can read: quiet, recycling, quiet
+ * again. The entry name never changes, so only the observed window confirms it.
+ * It repeats, which is what lets one fixture serve two rotations in a row. */
+function recyclingCycle() {
+	const cycle = [
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+		{ recycling: true, exits: ["warp-18e (in_use, streams=0)"] },
+		{ recycling: false, exits: ["warp-18e (in_use, streams=1)"] },
+	];
+	let index = 0;
+	return () => cycle[index++ % cycle.length];
+}
 
-				assert.equal(await rotateWarpExit(WARP_CONFIG, undefined), false);
-				assert.equal(recyclePosts(fake.calls).length, 1, "no second POST /recycle");
-				assert.equal(
-					stderr.filter((line) => /already within its cooldown/.test(line)).length,
-					1,
-					"one line says why the original 429 is what gets delivered",
-				);
-			},
-		);
-	} finally {
-		process.stderr.write = originalWrite;
-	}
+test("rotateWarpExit: a second 429 right after a rotation rotates again (S12)", async () => {
+	// S12: the five minute cool-down only ever refused a recovery that would have
+	// worked (18 enrollments in 55 minutes and not one rate-limit refusal), so a
+	// second 429 is a second signal instead of a blocked request. What still
+	// serializes rotations is single-flight, and by then that guard is free.
+	const nextHealth = recyclingCycle();
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return healthJson(nextHealth());
+			return new Response("", { status: 200 });
+		},
+		async (fake) => {
+			assert.equal(await rotateWarpExit(WARP_CONFIG, undefined), true);
+			assert.equal(await rotateWarpExit(WARP_CONFIG, undefined), true, "a second attempt is not refused");
+			assert.equal(recyclePosts(fake.calls).length, 2, "each 429 rotates: no timer stands in for evidence");
+		},
+	);
 });
 
 test("resendAfterRotation: a 429 resend delivers the original bytes, status and content-type", async () => {
@@ -1400,12 +1398,18 @@ test("rotateWarpExit: a second 429 during the drain gets no second POST (C7)", a
 	// peer's "no resend" window from one rotation to one drain. The guard is
 	// taken after the wait, so the peer still loses its resend — as it always
 	// did — but only for the POST, not for the whole drain.
-	const nextHealth = recyclingThenQuiet();
+	//
+	// The rotation here is never confirmed on purpose: it holds the guard while it
+	// polls, which is exactly the window the peer has to find taken. (A confirmed
+	// rotation would release the guard before the peer gets there, and with S12's
+	// cool-down gone that peer is entitled to rotate for its own 429.)
 	const posts = [];
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url) => {
 		const u = String(url);
-		if (u.endsWith("/health")) return healthJson(nextHealth());
+		if (u.endsWith("/health")) {
+			return healthJson({ recycling: true, exits: ["warp-18e (in_use, streams=0)"] });
+		}
 		if (u.endsWith("/recycle")) {
 			posts.push(u);
 			return new Response("", { status: 200 });
@@ -1420,7 +1424,7 @@ test("rotateWarpExit: a second 429 during the drain gets no second POST (C7)", a
 		const first = rotateWarpExit(WARP_CONFIG, undefined);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		const second = await rotateWarpExit(WARP_CONFIG, undefined);
-		assert.equal(await first, true);
+		assert.equal(await first, false, "it was never confirmed, which is what kept the guard taken");
 		clearTimeout(peerFinishes);
 
 		assert.equal(second, false, "the loser delivers its original 429 instead of stacking a rotation");
@@ -1737,11 +1741,15 @@ test("manualWarpRecycle: it rotates once, reports it and confirms the new exit",
 	assert.equal(result.out.ok, true, "a confirmed rotation reports ok");
 	assert.equal(result.out.warpRecycles, 1, "the counter the command prints moved");
 	assert.equal(recyclePosts(result.fake.calls).length, 1, "exactly one POST");
-	assert.equal(result.out.cooldownMs > 0, true, "the cooldown is armed and reported");
+	assert.equal(
+		Object.hasOwn(result.out, "cooldownMs"),
+		false,
+		"S12: the manual path reports no cool-down, because there is none",
+	);
 });
 
-test("manualWarpRecycle: a second call inside the cooldown rotates nothing and says why", async () => {
-	const nextHealth = recyclingThenQuiet();
+test("manualWarpRecycle: a second call rotates again, because there is nothing to sit out (S12)", async () => {
+	const nextHealth = recyclingCycle();
 	const handler = (call) => {
 		if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
 		if (call.url.includes("/health")) return healthJson(nextHealth());
@@ -1753,9 +1761,8 @@ test("manualWarpRecycle: a second call inside the cooldown rotates nothing and s
 		return { first, second, calls: fake.calls };
 	});
 	assert.equal(both.first.ok, true);
-	assert.equal(both.second.ok, false, "the cooldown refuses the second rotation");
-	assert.equal(both.second.reason, "cooldown");
-	assert.equal(recyclePosts(both.calls).length, 1, "the burnt cooldown spent no POST");
+	assert.equal(both.second.ok, true, "no cool-down refuses the second rotation");
+	assert.equal(recyclePosts(both.calls).length, 2, "every call is honoured: the manual escape hatch never blocks");
 });
 
 test("manualWarpRecycle: it waits for in-flight warp streams before cutting the tunnel", async () => {
@@ -1938,11 +1945,10 @@ test("decideWarpSwap: a short retry-after means wait, because a swap burns an en
 	assert.equal(long.swap, true);
 });
 
-test("decideWarpSwap: disabled, cooling down or already in flight all refuse", () => {
+test("decideWarpSwap: disabled or already in flight refuse, and nothing else (S12)", () => {
 	assert.equal(decideWarpSwap({ exitId: EXIT_A, enabled: false }).reason, "disabled");
-	assert.equal(decideWarpSwap({ exitId: EXIT_A, onCooldown: true }).reason, "cooldown");
 	assert.equal(decideWarpSwap({ exitId: EXIT_A, inFlight: true }).reason, "in_flight");
-	assert.equal(decideWarpSwap({ exitId: EXIT_A }).swap, true);
+	assert.equal(decideWarpSwap({ exitId: EXIT_A }).swap, true, "a timer is never a reason to skip a swap");
 });
 
 test("warpSwapEnabled: only an explicit zero turns the swap off", () => {
@@ -1988,14 +1994,12 @@ test("swapWarpExit: a 202 posts the exact exit id and reports the target", () =>
 			assert.equal(calls.length, 1, "exactly one POST");
 			assert.equal(calls[0].method, "POST");
 			assert.deepEqual(JSON.parse(calls[0].body), { exit: EXIT_A }, "the id is explicit: the body-less default picks by live streams");
-			const state = warpStateForTests();
-			assert.equal(state.warpSwaps, 1);
-			assert.ok(state.warpSwapNotBefore > Date.now(), "an accepted swap arms its own cooldown");
+			assert.equal(warpStateForTests().warpSwaps, 1);
 		},
 	);
 });
 
-test("swapWarpExit: 409 no standby is an answer, never something to retry", () => {
+test("swapWarpExit: 409 no standby is an answer, and with no cool-down it is asked again (S12)", () => {
 	const calls = [];
 	return withWarpFetch(
 		async (url) => {
@@ -2009,8 +2013,8 @@ test("swapWarpExit: 409 no standby is an answer, never something to retry", () =
 			const first = await swapWarpExit(WARP_CONFIG, EXIT_A);
 			assert.deepEqual(first, { swapped: false, reason: "no_standby", status: 409, target: EXIT_A });
 			const second = await swapWarpExit(WARP_CONFIG, EXIT_A);
-			assert.equal(second.reason, "cooldown", "a 409 arms the cooldown: insisting burns enrollments while the gate is rate-limiting");
-			assert.equal(calls.length, 1, "the second call never reached the proxy");
+			assert.equal(second.reason, "no_standby", "a second attempt is not refused: there is no timer to sit out");
+			assert.equal(calls.length, 2, "the proxy is asked again instead of the relay inventing a wait");
 		},
 	);
 });
@@ -2070,8 +2074,7 @@ test("swapWarpExit: a 202 that says ok:false was not accepted (S7)", () => {
 			const result = await swapWarpExit(WARP_CONFIG, EXIT_A);
 			assert.equal(result.swapped, false, "a 202 with ok:false is a refusal that wears the success status");
 			assert.equal(result.reason, "swap_in_flight", "the proxy's own reason is kept instead of invented");
-			assert.equal(warpStateForTests().warpSwapNotBefore, 0, "a refusal spends nothing");
-			assert.equal(warpStateForTests().warpSwaps, 0);
+			assert.equal(warpStateForTests().warpSwaps, 0, "a refusal spends nothing");
 		},
 	);
 });
@@ -2119,8 +2122,7 @@ test("rotateWarpExit: an ok:false recycle is refused and spends nothing (S12)", 
 				const startedAt = Date.now();
 				const confirmed = await rotateWarpExit(WARP_CONFIG, undefined);
 				assert.equal(confirmed, false, "a no-op must not buy a resend");
-				assert.equal(warpStateForTests().warpRecycleNotBefore, 0, "nothing happened, so nothing is spent");
-				assert.equal(warpStateForTests().warpRecycles, 0);
+				assert.equal(warpStateForTests().warpRecycles, 0, "nothing happened, so nothing is spent");
 				assert.ok(
 					Date.now() - startedAt < 1_000,
 					"and it does not poll for a confirmation that cannot come",
@@ -2484,105 +2486,194 @@ test("ladder: a thin pool skips the swap and lets the rotation recover (S8)", as
 	);
 });
 
-test("ladder: a stranded swap delivers the original 429 and never recycles (S8)", async () => {
-	// The 202 is acceptance, not a settled pool: the proxy publishes the target
-	// as `draining` and enrolls the replacement afterwards, under a NEW id. When
-	// enrollments are being refused that replacement never appears, so the drained
-	// id stays and keeps `draining` forever. Resending there spends the one retry
-	// on a pool halfway through a swap, and climbing to the recycle burns the
-	// enrollments that are already scarce — the ladder stops and hands back the
-	// original 429 byte-exact.
-	const pool = (healthy, exits) => ({ ok: true, pool_size: 2, active: 1, cooling_down: 0, healthy, recycling: false, exits });
+test("ladder: a swap the pool replaced is judged settled, not stranded (S14)", async () => {
+	// S14 measures stranding BY COUNT, never by identity: a re-enrolment publishes
+	// a NEW id, so the drained id never comes back and its absence proves nothing.
+	// Here the pool is back to the same usable count under a new id, which is a
+	// settled swap — and the next run is free to spend another swap because the
+	// consecutive counter was reset instead of being pushed towards the suspension.
+	const pool = (healthy, exits) => ({ ok: true, pool_size: 2, active: healthy, cooling_down: 0, healthy, recycling: false, exits });
+	const replaced = [`${EXIT_B} (in_use, served=8, streams=0)`, "warp-fresh (healthy, served=0, streams=0)"];
 	const bodies = [
-		// our own attempt's window: EXIT_A is the only counter that moved
+		// run 1 — our own attempt's window: EXIT_A is the exit that served the 429
 		pool(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
 		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
-		// the standby guard's own read, still before the swap
+		// the standby guard: two usable exits, recorded before the swap
 		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
-		// accepted and never settled: the drained id stays, still draining
-		pool(1, [`${EXIT_A} (draining, served=42, streams=1)`, `${EXIT_B} (in_use, served=7, streams=1)`]),
+		// accepted and drained; the retry goes out on the accepted swap and is
+		// delivered, so nothing waits for the pool
+		pool(1, [`${EXIT_B} (in_use, served=7, streams=0)`]),
+		// run 2 — the drained id is gone and a brand-new id took its place: two
+		// usable exits again, so the swap SETTLED and the streak resets
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, "warp-fresh (healthy, served=0, streams=0)"]),
+		pool(2, replaced),
+		pool(2, replaced),
+		pool(1, ["warp-fresh (healthy, served=0, streams=0)"]),
 	];
 	let index = 0;
 	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
-	const nextUpstream = upstreamThen([429, 429]);
+	const nextUpstream = upstreamThen([429, 200, 429, 200]);
 	await driveWarp(
 		(call) => {
 			if (call.url.endsWith("/health")) return nextHealth();
 			if (call.url.endsWith("/swap")) {
-				return new Response(JSON.stringify({ ok: true, target: "warp-new" }), { status: 202 });
+				return new Response(JSON.stringify({ ok: true, target: EXIT_A }), { status: 202 });
 			}
-			if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
 			return nextUpstream();
 		},
 		async (fake) => {
-			setWarpRotationTimingForTests(120, 1); // deadline, not patience
-			const res = fakeRelayRes();
-			await forward(fakeReq({ marker: "stranded" }), res, RESEND_PATH, FORWARD_CONFIG);
+			const first = fakeRelayRes();
+			await forward(fakeReq({ marker: "settles" }), first, RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(first.status, 200, "the retry after an accepted swap is delivered without waiting for the drain");
 
-			assert.equal(res.status, 429, "a stranded swap recovers nothing");
-			assert.equal(res.body(), GATE_429_BODY, "the original 429 is delivered byte-exact");
+			const second = fakeRelayRes();
+			await forward(fakeReq({ marker: "settled" }), second, RESEND_PATH, FORWARD_CONFIG);
+
 			assert.equal(
-				recyclePosts(fake.calls).length,
-				0,
-				"a recycle here would burn the enrollments that are already scarce",
+				swapPosts(fake.calls).length,
+				2,
+				"a pool restored to the same usable count is a settled swap, not a stranding",
 			);
-			assert.equal(upstreamCalls(fake.calls).length, 2, "the original plus exactly one post-swap retry, no loop");
+			assert.equal(second.status, 200, "and the next run recovers with the cheap step");
+			assert.equal(upstreamCalls(fake.calls).length, 4, "original, post-swap retry, original, post-swap retry");
 		},
 	);
 });
 
-test("ladder: two stranded swaps in a row turn the targeted swap off (S8)", async () => {
-	// One stranded swap can be one exit having a bad day. Two in a row mean the
-	// pool cannot replace what the ladder drains, so the ladder must stop spending
-	// enrollments instead of grinding one every recycle cooldown: the third 429 is
-	// recovered without a `POST /swap`, and it still answers the client.
+test("ladder: a stranded drain is judged on the next run, never inline (S14)", async () => {
+	// The proxy's drain took 120s on 2026-11-05 (20:37:18 asked -> 20:39:18
+	// drained), so the old 10s settle wait labelled a healthy swap as stranded.
+	// The verdict now waits for the next run and it is a COUNT: the pool had three
+	// usable exits when the swap went out and has two now, so the swap stranded,
+	// and this run spends no second swap even though two healthy exits remain —
+	// the recovery it buys is the recycle.
+	const EXIT_C = "warp-18e3d7f901ab45c6";
+	const pool = (healthy, exits) => ({ ok: true, pool_size: 3, active: healthy, cooling_down: 0, healthy, recycling: false, exits });
+	const recycling = (exits) => ({ ...pool(2, exits), recycling: true });
+	const two = [`${EXIT_B} (in_use, served=8, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`];
+	const bodies = [
+		// run 1 — our own attempt's window: EXIT_A is the exit that served the 429
+		pool(3, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
+		pool(3, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
+		// the standby guard: three usable exits, recorded before the swap
+		pool(3, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
+		// accepted and drained; the retry is delivered on the accepted swap
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
+		// run 2 — a new 429 with the pool one usable exit short of what the swap
+		// started from: one stranding, and the swap is stood down for this run
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`]),
+		pool(2, two),
+		pool(2, two),
+		pool(2, two),
+		// the recycle's own window: the pre-POST snapshot, recycling seen, then
+		// back to quiet
+		recycling(two),
+		pool(2, two),
+	];
+	let index = 0;
+	const nextHealth = () => healthJson(bodies[Math.min(index++, bodies.length - 1)]);
+	const nextUpstream = upstreamThen([429, 200, 429, 200]);
+	let recycleCalls = 0;
+	await driveWarp(
+		(call) => {
+			if (call.url.endsWith("/health")) return nextHealth();
+			if (call.url.endsWith("/swap")) {
+				return new Response(JSON.stringify({ ok: true, target: EXIT_A }), { status: 202 });
+			}
+			if (call.url.endsWith("/recycle")) {
+				recycleCalls += 1;
+				return new Response("", { status: 200 });
+			}
+			return nextUpstream();
+		},
+		async (fake) => {
+			const first = fakeRelayRes();
+			await forward(fakeReq({ marker: "drains" }), first, RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(first.status, 200, "the retry after an accepted swap is delivered without waiting for the drain");
+
+			const second = fakeRelayRes();
+			await forward(fakeReq({ marker: "stranded" }), second, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.equal(
+				swapPosts(fake.calls).length,
+				1,
+				"one exit fewer than the swap started from is a stranding, so this run spends no swap",
+			);
+			assert.equal(recycleCalls, 1, "the recovery it does buy is the recycle");
+			assert.equal(second.status, 200, "and the recycle still recovers the turn");
+			assert.equal(upstreamCalls(fake.calls).length, 4, "original, post-swap retry, original, post-recycle retry");
+		},
+	);
+});
+
+test("ladder: two stranded drains in a row turn the targeted swap off (S14)", async () => {
+	// One stranded drain can be one exit having a bad day. Two in a row mean the
+	// pool cannot replace what the ladder drains, so the ladder stops spending
+	// enrollments instead of grinding a swap per 429: the third run spends none and
+	// still answers the client with the original 429 byte-exact.
 	//
-	// The first stranding arms both cooldowns for minutes and they are read once at
-	// load, so this case loads its own relay instance with them at zero. Two
-	// stranded swaps have to fit in one test without sleeping.
-	const FRESH = "warp-stranded-fresh";
-	const previousRecycleCooldown = process.env.RELAY_WARP_RECYCLE_COOLDOWN_MS;
-	const previousSwapCooldown = process.env.RELAY_WARP_SWAP_COOLDOWN_MS;
-	process.env.RELAY_WARP_RECYCLE_COOLDOWN_MS = "0";
-	process.env.RELAY_WARP_SWAP_COOLDOWN_MS = "0";
-	let relay;
-	try {
-		relay = await import("../relay.mjs?stranded-guard");
-	} finally {
-		for (const [key, was] of [
-			["RELAY_WARP_RECYCLE_COOLDOWN_MS", previousRecycleCooldown],
-			["RELAY_WARP_SWAP_COOLDOWN_MS", previousSwapCooldown],
-		]) {
-			if (was === undefined) delete process.env[key];
-			else process.env[key] = was;
-		}
-	}
-
+	// The verdict is deferred (S14), so each stranding is counted by the run AFTER
+	// the swap that drained the exit, which is why this needs three recoveries and
+	// no sleeping: nothing waits for a drain inside a request.
+	const FRESH = "warp-replaced-fresh";
 	const file = join(logDir(), "relay-stranded-guard.jsonl");
-	relay.setLogFileForTests(file);
-	relay.resetWarpStateForTests();
-	relay.setWarpRotationTimingForTests(0, 1); // the settle budget is spent at once
+	setLogFileForTests(file);
+	resetWarpStateForTests();
 
-	// Read in order: our own attempt's window, the attribution's after-shot, the
-	// standby guard, then the post-swap pool. The drained id is gone from that
-	// last one while the other exit's counter moved, so the tunnel is learned
-	// again on the very exit the second swap will drain. The tail repeats: the
-	// recovery reads `/health` an unpredictable number of times.
+	// Read in order, one entry per `/health` read:
+	//   run 1: our own window, the attribution's after-shot, the standby guard
+	//          (three usable exits, the count that gets recorded), then the
+	//          post-swap pool that learns EXIT_B, then the recycle's guard;
+	//   run 2: the pool that is one usable exit short, so the guard counts the
+	//          first stranding and stands the swap down — with two healthy exits
+	//          left, so nothing but the verdict can refuse it;
+	//   run 3: the pool filled back to three under a new id, nothing pending, so
+	//          the swap is allowed again and drains EXIT_B;
+	//   run 4: one exit short again, the guard counts the second stranding and
+	//          suspends the swap.
+	// The tail repeats, because a refused recycle reads `/health` once more.
+	// Three exits, not two: a stranding that leaves no standby would be refused by
+	// the standby guard anyway, and the verdict itself has to be what refuses.
 	const pool = (healthy, exits) => ({
 		ok: true,
-		pool_size: exits.length,
-		active: 1,
+		pool_size: 3,
+		active: healthy,
 		cooling_down: 0,
 		healthy,
 		recycling: false,
 		exits,
 	});
+	const EXIT_C = "warp-5b2c9ad4f1e07c33";
+	const three = [
+		`${EXIT_A} (in_use, served=42, streams=1)`,
+		`${EXIT_B} (healthy, served=7, streams=0)`,
+		`${EXIT_C} (healthy, served=3, streams=0)`,
+	];
+	const two = [`${EXIT_B} (in_use, served=8, streams=0)`, `${EXIT_C} (healthy, served=3, streams=0)`];
+	const filled = [...two, `${FRESH} (healthy, served=0, streams=0)`];
+	const drained = [`${EXIT_C} (healthy, served=3, streams=0)`];
+	const remaining = [...drained, `${FRESH} (healthy, served=1, streams=0)`];
 	const bodies = [
-		pool(2, [`${EXIT_A} (in_use, served=41, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
-		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
-		pool(2, [`${EXIT_A} (in_use, served=42, streams=1)`, `${EXIT_B} (healthy, served=7, streams=0)`]),
-		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
-		pool(2, [`${EXIT_B} (in_use, served=8, streams=0)`, `${FRESH} (healthy, served=0, streams=0)`]),
+		pool(3, [`${EXIT_A} (in_use, served=41, streams=1)`, ...three.slice(1)]),
+		pool(3, three),
+		pool(3, three),
+		pool(2, [`${EXIT_B} (in_use, served=7, streams=0)`, ...drained]),
+		pool(2, two),
+		pool(2, two),
+		pool(2, two),
+		pool(2, two),
+		pool(2, two),
+		pool(2, two),
+		pool(3, filled),
+		pool(3, filled),
+		pool(3, filled),
+		pool(2, remaining),
+		pool(2, remaining),
+		pool(2, remaining),
+		pool(2, remaining),
+		pool(2, remaining),
+		pool(2, remaining),
+		pool(2, remaining),
 	];
 	let reads = 0;
 	const nextHealth = () => healthJson(bodies[Math.min(reads++, bodies.length - 1)]);
@@ -2591,18 +2682,23 @@ test("ladder: two stranded swaps in a row turn the targeted swap off (S8)", asyn
 	const stderr = [];
 	const originalWrite = process.stderr.write;
 	process.stderr.write = (chunk) => (stderr.push(String(chunk)), true);
+	// Every recycle is refused (`202` + `ok:false`): that keeps the pool published
+	// above stable and the read order readable, and it is what the proxy does while
+	// a swap owns its state.
 	const fake = installFakeFetch((call) => {
 		if (call.url.endsWith("/health")) return nextHealth();
 		if (call.url.endsWith("/swap")) {
 			return new Response(JSON.stringify({ ok: true, target: FRESH }), { status: 202 });
 		}
-		if (call.url.endsWith("/recycle")) return new Response("{}", { status: 200 });
+		if (call.url.endsWith("/recycle")) {
+			return new Response(JSON.stringify({ ok: false, error: "no_standby" }), { status: 202 });
+		}
 		return nextUpstream();
 	});
 	try {
 		const recover = async (marker) => {
 			const res = fakeRelayRes();
-			await relay.forward(fakeReq({ marker }), res, RESEND_PATH, FORWARD_CONFIG);
+			await forward(fakeReq({ marker }), res, RESEND_PATH, FORWARD_CONFIG);
 			return res;
 		};
 
@@ -2610,29 +2706,40 @@ test("ladder: two stranded swaps in a row turn the targeted swap off (S8)", asyn
 		await recover("strand-two");
 		assert.equal(
 			swapPosts(fake.calls).length,
-			2,
-			"both swaps were attempted: the guard is about the second one, not the first",
+			1,
+			"the run that counts the first stranding spends no swap, although a standby was available",
 		);
 
 		const beforeThird = swapPosts(fake.calls).length;
-		const third = await recover("strand-three");
-		assert.equal(
-			beforeThird,
-			2,
-			"two stranded swaps were spent before the third recovery",
-		);
+		await recover("strand-three");
 		assert.equal(
 			swapPosts(fake.calls).length - beforeThird,
+			1,
+			"one stranding is not a verdict about the pool: the next run swaps again",
+		);
+
+		const beforeFourth = swapPosts(fake.calls).length;
+		const fourth = await recover("strand-four");
+		assert.equal(
+			beforeFourth,
+			2,
+			"two swaps were spent before the suspension",
+		);
+		assert.equal(
+			swapPosts(fake.calls).length - beforeFourth,
 			0,
 			"a suspended swap is never attempted again, however many 429s follow",
 		);
-		assert.equal(third.status, 429, "the client still gets an answer");
-		assert.equal(third.body(), GATE_429_BODY, "and it is the original 429, byte-exact");
+		assert.equal(fourth.status, 429, "the client still gets an answer");
+		assert.equal(fourth.body(), GATE_429_BODY, "and it is the original 429, byte-exact");
 		assert.equal(
-			relay.warpStateForTests().warpSwapUnsupported,
+			warpStateForTests().warpSwapUnsupported,
 			true,
 			"two strandings suspend the swap through the state a missing /swap sets",
 		);
+
+		await recover("strand-five");
+		assert.equal(swapPosts(fake.calls).length, 2, "and it stays out: the suspension is for the process");
 
 		const events = readEvents(file).map((event) => event.ev);
 		assert.equal(events.filter((ev) => ev === "swap_stranded").length, 2, "both strandings are on disk");
@@ -2654,7 +2761,7 @@ test("ladder: two stranded swaps in a row turn the targeted swap off (S8)", asyn
 	} finally {
 		process.stderr.write = originalWrite;
 		fake.restore();
-		relay.setWarpRotationTimingForTests();
+		setLogFileForTests("");
 	}
 });
 

@@ -74,8 +74,13 @@ cerrado con warp-minimal.
 - **S14** — La detección de `stranded` es diferida, nunca inline: el drain real
   del proxy puede durar hasta 120 s (`20:37:18` pedido → `20:39:18` drenado), así
   que ninguna espera en el camino de la request puede concluir que una salida no
-  volvió. Se evalúa en la vuelta siguiente de la escalera, comprobando si la
-  salida drenada reapareció.
+  volvió. Se evalúa en la vuelta siguiente de la escalera, y **se mide por
+  cantidad, no por identidad**: un re-enrolamiento emite un id nuevo (E7), así
+  que la ausencia del id drenado no es evidencia de nada. Antes del swap se
+  registra cuántas salidas útiles tiene el pool; en la vuelta siguiente, menos
+  salidas útiles que antes significa que el swap strandió, y el mismo número
+  (aunque con ids nuevos) significa que se asentó. Dos stranded seguidos
+  suspenden el swap; un swap asentado resetea el contador.
 
 ## Tasks
 
