@@ -63,8 +63,9 @@ todavía fallaba (`inkling-2-small-free`). El arreglo va en el registro de model
 - T1 · S1, S2 · inline/worker · merge del `compat` default en `buildPiModels` (`index.ts`)
 - T2 · S7, S11 · worker · aserciones `compat` + invariantes de set en `test/smoke.mjs`
 - T3 · S10 · worker · `README.md` + `CHANGELOG.md`
-- T4 · S8, S9 · parent · verificación end-to-end por el puente (bloqueada por L5)
+- T4 · S8, S9 · parent · verificación end-to-end por el puente — **VERIFICADO (L7)**: `inkling-2-small-free` → `OK`, `deepseek-v4.1-flash-free` → `OK`
 - T5 · S1-S3 · parent · suite (`test/relay.test.mjs`, `test/gate-tools.mjs`) + commit de unidad
+- T6 · — · parent · merge fast-forward a `master` y push — **HECHO (L7)**
 
 ## Log
 
@@ -177,3 +178,20 @@ todavía fallaba (`inkling-2-small-free`). El arreglo va en el registro de model
   11 (`crouton-alpha-free`, `iceman-free`, `inkling-2-small-free` de más).
   `node --test test/relay.test.mjs` → 164/164 OK y `node test/gate-tools.mjs` →
   OK ya verificados por el peer; no se repiten.
+- L7 (verificación end-to-end y cierre, parent): el humano instaló el fix en su
+  entorno y lo probó. **S8 y S9 verificados por ejecución propia**, no por
+  deducción: `pi -p --no-session --model oc-sdk-zen/inkling-2-small-free "Reply
+  with exactly: OK"` → `OK`, y `.../deepseek-v4.1-flash-free` → `OK` (exit 0,
+  52s). El `400 airlock_error` de S4 desapareció. Estado medido del checkout
+  instalado: `HEAD = c874617`, `supportsDeveloperRole` presente en su `index.ts`,
+  relay escuchando en `127.0.0.1:8788`.
+  Nota de fragilidad (sigue vigente): el reflog del clone instalado muestra
+  `reset: moving to FETCH_HEAD^{commit}` y `settings.json` sigue declarando la
+  fuente **sin ref**, así que ese estado no está pinneado: un `pi update
+  --extensions` o un `pi install` sin ref lo revierte a `967e6d9`.
+- L8 (decisión del humano y merge, parent): «yo uso las ramas para las pruebas,
+  creo que está bien, es hora de mergear a main». Merge **fast-forward**
+  `967e6d9..c874617` a `master`, sin force y sin PR, y push: `967e6d9..c874617
+  master -> master`. `master` y `origin/master` quedan en `c874617`, 0 adelante /
+  0 atrás. La rama `fix/compat-system-role` no se tocó: sigue en `c874617`, que
+  ahora es además la punta de `master`.
