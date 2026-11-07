@@ -6,6 +6,22 @@
 
 ## 0.4.0 (unreleased)
 
+- **`system`, not `developer`, for every `oc-sdk-zen` model**: each registered
+  model now carries a provider-wide `compat` default — `supportsDeveloperRole:
+  false` and `maxTokensField: "max_tokens"` — merged under the family fields, so
+  `deepseek` keeps `allowsSyntheticReasoningContentForToolCalls: false` and
+  `kimi` keeps `requiresReasoningContentForToolCalls: true` plus
+  `thinkingFormat: "zai"`. Left undefined, `pi-ai`'s `detectCompat` read the
+  loopback `baseUrl` and the provider's own id as a standard endpoint and
+  resolved both the other way, so every `reasoning` model went out with
+  `role: "developer"` and `max_completion_tokens`. Measured through the relay on
+  2026-10-14: with `system`, 11/11 registered models answer `200` SSE; with
+  `developer`, 10/11 — `inkling-2-small-free` returns `400 upstream failed:
+  [airlock_error] invalid request: unknown variant 'developer', expected one of
+  'system','user','assistant','tool'`. OpenCode's own client sends `system` for
+  all 134 models, so that is the gate's real contract. Other providers
+  (`nvidia`, `opencode-go`) are untouched, where `developer` may be correct.
+
 - **A targeted swap before the hard rotation**: a WARP `429` is now attributed to
   the exit that served it through the proxy's monotonic `served` counter, and the
   ladder replaces only that exit (`POST /swap`) plus one resend, falling back to

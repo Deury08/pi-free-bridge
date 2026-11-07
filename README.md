@@ -581,6 +581,24 @@ upstream no salen del relay.
   — los nombres se inspeccionan; `[read, bash]` en cualquier orden pasa,
   `[bash]` solo o dos nombres arbitrarios no
 
+**Rol del mensaje y campo de tokens:** el puente registra **cada** modelo de
+`oc-sdk-zen` con `compat: { supportsDeveloperRole: false, maxTokensField:
+"max_tokens" }`, porque el gate acepta `system` y `max_tokens`. Si el `compat` se
+deja sin definir, `detectCompat` (`pi-ai/dist/api/openai-completions.js:1260`)
+trata al provider como endpoint estándar — `baseUrl` loopback y un id propio — y
+resuelve `supportsDeveloperRole: true` y `max_completion_tokens`; con eso
+`openai-completions.js:887` emite `role: "developer"` para todo modelo con
+`reasoning: true`. Medido el 2026-10-14 por el relay: con `system` responden
+**11/11** modelos registrados; con `developer`, 10/11 — `inkling-2-small-free`
+devuelve `400 upstream failed: [airlock_error] invalid request: unknown variant
+'developer', expected one of 'system','user','assistant','tool'`. El cliente de
+referencia (OpenCode, `@ai-sdk/openai-compatible`) manda `system` para sus 134
+modelos, así que ése es el contrato real. Es un default del provider aplicado por
+**merge**, no por reemplazo: `deepseek` conserva
+`allowsSyntheticReasoningContentForToolCalls: false` y `kimi` conserva
+`requiresReasoningContentForToolCalls: true` + `thinkingFormat: "zai"`. No se
+aplica a `nvidia` ni a `opencode-go`, donde `developer` puede ser correcto.
+
 **Session id:** el gate rechaza ids autogenerados (`ses_<hex><base62>`,
 `ses_000…`, basura) y no existe endpoint para crear sesiones. El paquete **no
 incluye** ningún id: el relay cosecha uno del store local de OpenCode al
@@ -659,8 +677,10 @@ incluida la cosecha de sesión contra un store temporal (`opencode.db` y
 `session_diff/`), sin fixture de SQLite.
 `test/gate-tools.mjs` cubre el contrato de tools a nivel de transcript.
 `test/smoke.mjs` aserciona el registro contra el registry real: el provider y
-todos los modelos apuntan a `http://127.0.0.1:<puerto>/v1`, y el provider ya no
-declara headers (los pone el relay).
+todos los modelos apuntan a `http://127.0.0.1:<puerto>/v1`, el provider ya no
+declara headers (los pone el relay), y cada modelo declara
+`supportsDeveloperRole: false` + `maxTokensField: "max_tokens"` sin perder el
+`compat` propio de su familia.
 
 ## Tripwire tras un cambio del vendor
 

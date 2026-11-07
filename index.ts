@@ -1156,15 +1156,29 @@ function buildPiModels(raw: RegistryModel[]) {
 			input: declaredInput.length > 0 ? declaredInput : ["text"],
 		};
 
+		// The gate's contract is `role: "system"` and `max_tokens`. pi-ai's
+		// `detectCompat` reads a loopback baseUrl with the provider's own id as a
+		// standard endpoint, so it infers `supportsDeveloperRole: true` and
+		// `max_completion_tokens` and every `reasoning` model goes out with
+		// `role: "developer"`. One backend refuses it outright:
+		// `400 ... unknown variant 'developer', expected one of
+		// 'system','user','assistant','tool'`. Pin both on every model of this
+		// provider instead of letting detection decide, and merge the family
+		// fields under it.
+		const compat: Record<string, unknown> = {
+			supportsDeveloperRole: false,
+			maxTokensField: "max_tokens",
+		};
+
 		// DeepSeek and Kimi need reasoning_content replayed on tool-call turns.
 		if (family.includes("deepseek")) {
-			model.compat = { allowsSyntheticReasoningContentForToolCalls: false };
+			compat.allowsSyntheticReasoningContentForToolCalls = false;
 		} else if (family.includes("kimi")) {
-			model.compat = {
-				requiresReasoningContentForToolCalls: true,
-				thinkingFormat: "zai",
-			};
+			compat.requiresReasoningContentForToolCalls = true;
+			compat.thinkingFormat = "zai";
 		}
+
+		model.compat = compat;
 
 		return model;
 	});
