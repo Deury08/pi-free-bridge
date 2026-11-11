@@ -704,3 +704,7 @@ bien, casi siempre venció el session id, no el puente.
   sin actualizar el paquete; las bajas también se propagan. Nada se escribe
   de vuelta en ese archivo.
 - No se guardan credenciales: el puente se autentica con la literal `public`.
+
+## Licencia
+
+MIT — ver [`LICENSE`](LICENSE).
