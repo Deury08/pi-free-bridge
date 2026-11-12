@@ -387,6 +387,17 @@ builds exactly `opencode/${channel}/${version}/${name}`. So a relay that reads
 `service.json` can derive its user-agent instead of pinning one, and the pinned
 v1 string stays as the fallback when OpenCode is absent.
 
+Implemented as `resolveUserAgent`: `RELAY_USER_AGENT`, then the installed
+`service.json`, then the pinned constant. A version that would malform the
+header (a space splits it, a slash invents a segment) is refused rather than
+sent, and the resolved `source` says which of the three answered.
+
+A real registration carries `version` but no `channel` or `name`
+(`packages/client/src/effect/service.ts`), so the header it yields is
+`opencode/<version>/opencode` — the three-segment form measured above. The
+four-segment form stays supported because `App.useragent` builds it from the
+same three fields.
+
 The model catalog is readable from the same install. `kv` holds
 `models-dev:v2:catalog` (11.3 MB) whose value is `{ updatedAt, digest, body }`,
 with `body` a JSON string; alongside it `models-dev:v2:catalog:meta` carries an

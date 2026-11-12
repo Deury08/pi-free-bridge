@@ -18,6 +18,7 @@
   "files": [
     "index.ts",
     "relay.mjs",
+    "model-catalog.mjs",
     "README.md",
     "LICENSE"
   ],

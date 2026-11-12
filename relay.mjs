@@ -221,6 +221,83 @@ export function basicAuthFor(password) {
 	return `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
 }
 
+/** Pure: the identity strings a v2 registration carries.
+ *
+ *  A field that is not a string is dropped rather than coerced: a `version` of
+ *  `2` is not the string "2", and guessing here would put a value in a header
+ *  the gate reads. */
+export function serviceIdentity(raw) {
+	let parsed;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+
+	const identity = {};
+	for (const field of ["version", "channel", "name"]) {
+		if (typeof parsed[field] === "string") identity[field] = parsed[field];
+	}
+	return identity;
+}
+
+/** One user-agent segment: no space (it splits the header) and no slash (it
+ *  invents a segment the format does not have). */
+const UA_SEGMENT = /^[0-9A-Za-z][0-9A-Za-z.-]*$/;
+
+/** Pure: OpenCode v2 builds `opencode/${channel}/${version}/${name}`
+ *  (`App.useragent` in `packages/core/src/app.ts`), so the header is derivable
+ *  from the install instead of pinned to a version that will drift. The pin
+ *  stays as the fallback: measured 2026-11-12, the gate accepts the pinned v1
+ *  string, the v2 format and the v2 format without a channel alike. */
+export function deriveUserAgent(identity) {
+	if (!identity || typeof identity !== "object") return undefined;
+	const { version, channel, name } = identity;
+	if (typeof version !== "string" || !UA_SEGMENT.test(version)) return undefined;
+
+	const segments = ["opencode"];
+	if (typeof channel === "string" && channel) {
+		if (!UA_SEGMENT.test(channel)) return undefined;
+		segments.push(channel);
+	}
+	segments.push(version);
+	if (typeof name === "string" && name) {
+		if (!UA_SEGMENT.test(name)) return undefined;
+		segments.push(name);
+	} else {
+		segments.push("opencode");
+	}
+	return segments.join("/");
+}
+
+/** The identity an installed OpenCode records, or `undefined` when there is no
+ *  readable registration. Read-only and best-effort by design. */
+function readServiceIdentity(servicePath) {
+	let raw;
+	try {
+		raw = readFileSync(servicePath, "utf8");
+	} catch {
+		return undefined;
+	}
+	return serviceIdentity(raw);
+}
+
+/** Resolve the user-agent and where it came from.
+ *
+ *  Precedence: the explicit override, then the installed OpenCode naming
+ *  itself, then the pinned constant. `source` exists so an operator can tell
+ *  a drifted constant from a derived header without reading the code. */
+export function resolveUserAgent({ env = process.env, servicePath = openCodeServicePath() } = {}) {
+	const override = env.RELAY_USER_AGENT;
+	if (override) return { userAgent: override, source: "env" };
+
+	const derived = deriveUserAgent(readServiceIdentity(servicePath));
+	if (derived) return { userAgent: derived, source: "service" };
+
+	return { userAgent: DEFAULT_USER_AGENT, source: "default" };
+}
+
 /** Ask the local OpenCode server to create a session and return its id.
  *
  *  The gate validates session ids against OpenCode's registry: a fabricated
@@ -2271,7 +2348,7 @@ async function startServer() {
 		session: session.sessionId,
 		sessionSource: session.source,
 		cwd: process.env.RELAY_CWD || process.cwd(),
-		userAgent: process.env.RELAY_USER_AGENT || DEFAULT_USER_AGENT,
+		userAgent: resolveUserAgent().userAgent,
 		apiKey: process.env.RELAY_API_KEY || "public",
 		warpMode: resolveWarpModeHot(envOverride, readFileWarpMode(process.env.RELAY_CONFIG_PATH || "")),
 		warpModeSource: envOverride ? "env" : "config",

@@ -4,6 +4,8 @@ import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFile
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { readRegistry } from "./model-catalog.mjs";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 
@@ -32,7 +34,7 @@ const API_KEY = "public";
  *  The Pi path uses the relay's copy; this one stays for the registry refresh. */
 const USER_AGENT = "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
-const REGISTRY_PATHS = [
+export const REGISTRY_PATHS = [
 	join(homedir(), ".cache", "opencode", "models.json"),
 	join(homedir(), ".config", "opencode", "models.json"),
 ];
@@ -323,7 +325,7 @@ function writeBridgeConfig(patch: BridgeConfig): void {
 }
 
 /** `~/.local/share/opencode`, the store the official client writes. */
-const OPENCODE_SHARE_DIR = join(homedir(), ".local", "share", "opencode");
+export const OPENCODE_SHARE_DIR = join(homedir(), ".local", "share", "opencode");
 
 /** Newest `storage/session_diff/ses_*.json` file name, by mtime (fs only). */
 function harvestSessionFromDiff(shareDir: string = OPENCODE_SHARE_DIR): string | undefined {
@@ -1084,10 +1086,6 @@ type RegistryModel = {
 	meta: Record<string, unknown>;
 };
 
-function resolveRegistryPath(): string | undefined {
-	return REGISTRY_PATHS.find((p) => existsSync(p));
-}
-
 /** A model is free when every cost field it actually declares is zero.
  *
  *  The registry omits `cache_write` on most free models, so testing all four
@@ -1101,19 +1099,18 @@ function isFree(meta: Record<string, unknown>): boolean {
 }
 
 function discoverFreeModels(liveIds: Set<string>): { models: RegistryModel[]; source: string; skipped: string[] } {
-	const path = resolveRegistryPath();
-	if (!path) return { models: [], source: "registry not found", skipped: [] };
+	const registry = readRegistry({ shareDir: OPENCODE_SHARE_DIR, filePaths: REGISTRY_PATHS, wanted: liveIds });
+	if (!registry) return { models: [], source: "registry not found", skipped: [] };
 
-	let data: Record<string, any>;
-	try {
-		data = JSON.parse(readFileSync(path, "utf-8"));
-	} catch (err) {
-		return { models: [], source: `registry unreadable: ${(err as Error).message}`, skipped: [] };
-	}
-
-	const registryModels = data?.opencode?.models;
+	const registryModels = registry.data?.opencode?.models;
 	if (!registryModels || typeof registryModels !== "object") {
-		return { models: [], source: `registry has no "opencode.models": ${path}`, skipped: [] };
+		// `readRegistry` reports why when there was something it could not read;
+		// otherwise the source names the one that answered with the wrong shape.
+		return {
+			models: [],
+			source: registry.data ? `registry has no "opencode.models": ${registry.source}` : registry.source,
+			skipped: [],
+		};
 	}
 
 	const models: RegistryModel[] = [];
@@ -1135,7 +1132,7 @@ function discoverFreeModels(liveIds: Set<string>): { models: RegistryModel[]; so
 	}
 
 	models.sort((a, b) => a.id.localeCompare(b.id));
-	return { models, source: path, skipped };
+	return { models, source: registry.source, skipped };
 }
 
 /** Ask the surface which models it advertises, then keep the free ones. */

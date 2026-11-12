@@ -18,6 +18,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -25,6 +26,7 @@ import test from "node:test";
 import {
 	basicAuthFor,
 	classifyGate429,
+	deriveUserAgent,
 	ensureEnvBlock,
 	forwardedHeaders,
 	ensureGateTools,
@@ -34,8 +36,11 @@ import {
 	parseServiceRegistration,
 	resolveRelaySession,
 	resolveSessionFromStore,
+	resolveUserAgent,
+	serviceIdentity,
 	toUpstreamUrl,
 } from "../relay.mjs";
+import { coversRegistry, normalizeV2Cost, parseV2CatalogRow, readRegistry, v2CatalogToRegistry } from "../model-catalog.mjs";
 
 // ---------------------------------------------------------------------------
 // ensureEnvBlock (S21)
@@ -3685,4 +3690,268 @@ test("ladder: a parked exit skips the swap and takes the rotation (S13)", async 
 			assert.equal(res.status, 200, "the rotation's resend delivered the turn");
 		},
 	);
+});
+
+// ---------------------------------------------------------------------------
+// deriveUserAgent / serviceIdentity / resolveUserAgent (S23)
+// ---------------------------------------------------------------------------
+
+/** The v2 registration file, as `--service` writes it. */
+function registerService(dir, fields) {
+	const path = join(dir, "service.json");
+	writeFileSync(path, JSON.stringify({ url: "http://127.0.0.1:49374", password: "pw", pid: 1, ...fields }));
+	return path;
+}
+
+test("serviceIdentity: keeps the identity strings the registration carries", () => {
+	assert.deepEqual(serviceIdentity(JSON.stringify({ version: "2.2.7", channel: "stable", name: "opencode" })), {
+		version: "2.2.7",
+		channel: "stable",
+		name: "opencode",
+	});
+});
+
+test("serviceIdentity: returns undefined for unusable input and drops non-strings", () => {
+	for (const raw of ["", "not json", "null", "[]", "42"]) {
+		assert.equal(serviceIdentity(raw), undefined, `no identity from ${JSON.stringify(raw)}`);
+	}
+	assert.deepEqual(
+		serviceIdentity(JSON.stringify({ version: 2, channel: null })),
+		{},
+		"a non-string field must not survive as a version",
+	);
+});
+
+test("deriveUserAgent: builds App.useragent's format from an identity", () => {
+	assert.equal(
+		deriveUserAgent({ version: "2.2.7", channel: "stable", name: "opencode" }),
+		"opencode/stable/2.2.7/opencode",
+		"the v2 format carries the channel",
+	);
+	assert.equal(deriveUserAgent({ version: "2.2.7" }), "opencode/2.2.7/opencode", "channel and name are optional");
+});
+
+test("deriveUserAgent: refuses anything that would malform the header", () => {
+	assert.equal(deriveUserAgent(undefined), undefined);
+	assert.equal(deriveUserAgent({}), undefined);
+	assert.equal(deriveUserAgent({ version: "" }), undefined);
+	assert.equal(deriveUserAgent({ version: "2.2.7 beta" }), undefined, "a space splits the user-agent");
+	assert.equal(deriveUserAgent({ version: "2/2" }), undefined, "a slash invents a segment");
+	assert.equal(deriveUserAgent({ version: "2.2.7", channel: "sta ble" }), undefined);
+});
+
+test("resolveUserAgent: the explicit override wins over everything", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-ua-"));
+	const servicePath = registerService(dir, { version: "2.2.7" });
+
+	const resolved = resolveUserAgent({ env: { RELAY_USER_AGENT: "mine/1.0" }, servicePath });
+
+	assert.deepEqual(resolved, { userAgent: "mine/1.0", source: "env" });
+});
+
+test("resolveUserAgent: derives from the installed v2 when no override is set", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-ua-"));
+	const servicePath = registerService(dir, { version: "2.2.7", channel: "stable", name: "opencode" });
+
+	const resolved = resolveUserAgent({ env: {}, servicePath });
+
+	assert.deepEqual(resolved, { userAgent: "opencode/stable/2.2.7/opencode", source: "service" });
+});
+
+test("resolveUserAgent: falls back to the pinned constant when nothing is installed", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-ua-"));
+
+	for (const servicePath of [join(dir, "absent.json"), registerService(dir, {})]) {
+		const resolved = resolveUserAgent({ env: {}, servicePath });
+		assert.equal(resolved.source, "default", `expected the fallback for ${servicePath}`);
+		assert.match(resolved.userAgent, /^opencode\//);
+	}
+});
+
+// ---------------------------------------------------------------------------
+// model-catalog: v2 keeps the registry in SQLite, with a different cost shape
+// ---------------------------------------------------------------------------
+
+/** The real `kv` body shape, trimmed to what the conversion has to survive. */
+const V2_BODY = JSON.stringify({
+	anthropic: { models: { "claude-x": { cost: { text: { input: { price: 3 } } } } } },
+	opencode: {
+		models: {
+			"free-one-free": {
+				id: "free-one-free",
+				name: "Free One",
+				cost: { text: { input: { price: 0, cache: { read: 0 } }, output: { price: 0 } } },
+			},
+			"paid-one": {
+				id: "paid-one",
+				cost: { text: { input: { price: 0.25, cache: { read: 0.025 } }, output: { price: 2 } } },
+			},
+			"already-flat-free": { id: "already-flat-free", cost: { input: 0, output: 0 } },
+			"no-cost": { id: "no-cost" },
+		},
+	},
+});
+
+test("v2CatalogToRegistry: reads only opencode.models and keeps the metadata", () => {
+	const registry = v2CatalogToRegistry(V2_BODY);
+
+	assert.deepEqual(Object.keys(registry), ["opencode"], "other providers are noise for the extension");
+	assert.deepEqual(Object.keys(registry.opencode.models).sort(), [
+		"already-flat-free",
+		"free-one-free",
+		"no-cost",
+		"paid-one",
+	]);
+	assert.equal(registry.opencode.models["free-one-free"].name, "Free One", "metadata survives the conversion");
+});
+
+test("v2CatalogToRegistry: flattens the v2 cost shape into the registry's numbers", () => {
+	const models = v2CatalogToRegistry(V2_BODY).opencode.models;
+
+	assert.deepEqual(models["free-one-free"].cost, { input: 0, output: 0, cache_read: 0 });
+	assert.deepEqual(models["paid-one"].cost, { input: 0.25, output: 2, cache_read: 0.025 });
+});
+
+test("v2CatalogToRegistry: leaves a flat cost and a missing cost alone", () => {
+	const models = v2CatalogToRegistry(V2_BODY).opencode.models;
+
+	assert.deepEqual(models["already-flat-free"].cost, { input: 0, output: 0 }, "a flat cost must not be mangled");
+	assert.equal(models["no-cost"].cost, undefined, "an absent cost stays absent, so the model is not free");
+});
+
+test("v2CatalogToRegistry: refuses a body it cannot read", () => {
+	for (const body of ["", "not json", "null", "[]", "{}", JSON.stringify({ opencode: {} })]) {
+		assert.equal(v2CatalogToRegistry(body), undefined, `no registry from ${JSON.stringify(body)}`);
+	}
+});
+
+test("coversRegistry: a registry that names every advertised id is fresh enough", () => {
+	const data = { opencode: { models: { a: {}, b: {} } } };
+
+	assert.equal(coversRegistry(data, new Set(["a", "b"])), true);
+	assert.equal(coversRegistry(data, new Set(["a", "c"])), false, "a missing advertised id is stale");
+	assert.equal(coversRegistry(data, new Set()), true, "asking nothing accepts the registry as it is");
+	assert.equal(coversRegistry(undefined, new Set(["a"])), false);
+});
+
+/** The `kv` store v2 keeps, as a throwaway database. `undefined` when this Node
+ *  has no `node:sqlite`, so the tests that need it can say so. */
+function writeV2Store(models) {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-kv-"));
+	let DatabaseSync;
+	try {
+		({ DatabaseSync } = createRequire(import.meta.url)("node:sqlite"));
+	} catch {
+		return undefined;
+	}
+	if (typeof DatabaseSync !== "function") return undefined;
+
+	const db = new DatabaseSync(join(shareDir, "opencode.db"));
+	db.exec("create table kv (key text primary key, value text)");
+	const body = JSON.stringify({ opencode: { models } });
+	db.prepare("insert into kv (key, value) values (?, ?)").run(
+		"models-dev:v2:catalog",
+		JSON.stringify({ updatedAt: Date.now(), digest: "d", body }),
+	);
+	db.close();
+	return shareDir;
+}
+
+function writeRegistryFile(models) {
+	const path = join(mkdtempSync(join(tmpdir(), "pfb-reg-")), "models.json");
+	writeFileSync(path, JSON.stringify({ opencode: { models } }));
+	return path;
+}
+
+test("readRegistry: the file answers while it can name what the surface advertises", () => {
+	const path = writeRegistryFile({ "from-file-free": { name: "File" } });
+	const shareDir = writeV2Store({ "from-kv-free": { name: "Kv" } });
+
+	// A v2 store is present and does not need to be read at all: reading it
+	// costs the 11.3 MB parse that the file makes unnecessary.
+	const registry = readRegistry({ shareDir, filePaths: [path], wanted: new Set(["from-file-free"]) });
+
+	assert.equal(registry.source, `registry-file: ${path}`);
+	assert.ok(registry.data.opencode.models["from-file-free"]);
+});
+
+test("readRegistry: the v2 store answers when the file cannot name an advertised model", () => {
+	const path = writeRegistryFile({ "from-file-free": {} });
+	const shareDir = writeV2Store({ "from-file-free": {}, "from-kv-free": {} });
+	const registry = readRegistry({ shareDir, filePaths: [path], wanted: new Set(["from-kv-free"]) });
+
+	assert.equal(registry.source, "v2-catalog: models-dev:v2:catalog");
+	assert.ok(registry.data.opencode.models["from-kv-free"], "the fresher store supplies the missing model");
+});
+
+test("readRegistry: the v2 store answers when there is no file at all", () => {
+	const shareDir = writeV2Store({ "only-kv-free": {} });
+	const absent = join(mkdtempSync(join(tmpdir(), "pfb-none-")), "models.json");
+
+	const registry = readRegistry({ shareDir, filePaths: [absent], wanted: new Set(["only-kv-free"]) });
+
+	assert.equal(registry.source, "v2-catalog: models-dev:v2:catalog");
+});
+
+test("readRegistry: a corrupt file keeps its reason instead of looking absent", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-bad-"));
+	const path = join(dir, "models.json");
+	writeFileSync(path, "{not json");
+
+	const registry = readRegistry({ shareDir: dir, filePaths: [path], wanted: new Set() });
+
+	assert.match(registry.source, /^registry unreadable: /, registry.source);
+	assert.equal(registry.data, undefined, "nothing was read, and the reason survives");
+});
+
+test("readRegistry: nothing on the machine means no registry", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-empty-"));
+
+	assert.equal(readRegistry({ shareDir: dir, filePaths: [join(dir, "absent.json")] }), undefined);
+});
+
+test("normalizeV2Cost: a cost it cannot read honestly is returned untouched", () => {
+	const half = { text: { input: { price: 0, cache: { read: 0 } } } };
+
+	assert.equal(normalizeV2Cost(half), half, "no output price means no conversion, not a guess");
+});
+
+test("deriveUserAgent: refuses line terminators and tabs, not just spaces and slashes", () => {
+	for (const version of ["2.2.7\n", "2.2.7\r", "2.2.7\t", "2.2.7 ", " 2.2.7"]) {
+		assert.equal(deriveUserAgent({ version }), undefined, `version ${JSON.stringify(version)} must be refused`);
+	}
+});
+
+test("package files allowlist: every relative module index.ts imports ships", () => {
+	const root = join(import.meta.dirname, "..");
+	const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
+	const source = readFileSync(join(root, "index.ts"), "utf-8");
+	const relative = [...source.matchAll(/^\s*import\s[^;]*?from\s+"(\.[^"]+)"/gm)].map((m) => m[1]);
+
+	assert.ok(relative.length > 0, "no relative import found — the assertion would be vacuous");
+	for (const spec of relative) {
+		assert.ok(pkg.files.includes(spec.replace("./", "")), `${spec} is missing from package.json files`);
+	}
+});
+
+test("parseV2CatalogRow: unwraps the kv row and keeps its freshness", () => {
+	const row = JSON.stringify({ updatedAt: 1794461236812, digest: "abc", body: V2_BODY });
+	const parsed = parseV2CatalogRow(row);
+
+	assert.equal(parsed.updatedAt, 1794461236812, "the row's timestamp is what freshness compares");
+	assert.ok(parsed.data.opencode.models["free-one-free"], "the body converts through the same path");
+	assert.equal(parseV2CatalogRow("not json"), undefined);
+	assert.equal(parseV2CatalogRow(JSON.stringify({ updatedAt: 1 })), undefined, "a row without a body yields nothing");
+	assert.equal(parseV2CatalogRow(undefined), undefined);
+});
+
+test("coversRegistry: freshness is id presence, not cost values", () => {
+	// Stale costs on a fully-named file are accepted: the registry decides which
+	// ids exist and `isFree` decides which of them are free. A missing advertised
+	// id is the only staleness that changes the registered set, which is why the
+	// catalog is consulted for that and not for a newer price.
+	const data = { opencode: { models: { a: { cost: { input: 5, output: 6 } } } } };
+
+	assert.equal(coversRegistry(data, new Set(["a"])), true);
+	assert.equal(coversRegistry(data, new Set(["a", "b"])), false);
 });

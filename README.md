@@ -176,6 +176,65 @@ cosechado por Pi (`RELAY_SESSION_PI`) > cosecha local del relay. El origen
 quedará visibible en `/health` (`sessionSource`) y `/free-bridge-session`:
 `env`, `config`, `pi-harvest`, `opencode.db` o `session-diff`.
 
+## Identidad y catálogo del OpenCode instalado
+
+El relay no lleva escrito a mano lo que OpenCode puede decir de sí mismo. Si hay
+una instalación en la máquina, se lee de ahí; si no, quedan las constantes fijas
+como respaldo. Nada de esto es un requisito: el bridge funciona igual sin
+OpenCode.
+
+### User-agent
+
+`App.useragent` de OpenCode v2 arma `opencode/${channel}/${version}/${name}`
+(`packages/core/src/app.ts`). El relay reproduce ese formato leyendo
+`service.json`, así que la versión no se queda vieja en el código.
+
+Precedencia:
+
+1. `RELAY_USER_AGENT` — override explícito.
+2. `service.json` → `opencode/<version>/opencode`. Ese archivo trae `version`,
+   pero no `channel` ni `name`, así que el header que produce es el de tres
+   segmentos — la forma que también se midió en `200`. `deriveUserAgent` acepta
+   las tres partes porque `App.useragent` las arma todas.
+3. La constante fija `opencode/1.19.3 …`.
+
+Medido el 2026-11-12 contra el gate, las tres formas devuelven `200`: la versión
+en el header **no** es determinante. Lo que sí importa es el bloque `<env>`, el
+array `tools` y los cinco headers (`GATE-DIAGNOSIS.md` §9.7).
+
+### Catálogo de modelos
+
+OpenCode v1 escribía `~/.cache/opencode/models.json`; v2 guarda lo mismo en
+SQLite, en `kv.models-dev:v2:catalog`, envuelto como `{updatedAt, digest, body}`.
+`readRegistry` (`model-catalog.mjs`) lee el archivo y consulta el almacén SQLite
+solo cuando el archivo no puede nombrar algún modelo que la superficie anuncia.
+
+La regla no es "gana el más fresco" por elegancia, es medida: parsear los 11,3 MB
+del `kv` en cada arranque costaba ~0,3 s y ~87 MB de RSS para ganar un único
+modelo libre, mientras que un archivo que no puede nombrar lo anunciado sí es
+inservible y ahí el `kv` es la respuesta.
+
+Dos trampas que el código cubre:
+
+- **La forma del `cost` cambia.** El archivo declara `{input: 0, output: 0}`; v2
+  anida `{text: {input: {price: 0}}}`. Se normaliza antes de clasificar: sin eso,
+  `isFree` diría "pago" para todo y no se registraría ningún modelo, en
+  silencio.
+- **El catálogo no reemplaza a `liveIds`.** El catálogo es el registro — 143
+  modelos bajo `opencode`, 52 libres al normalizar el `cost`, medido el
+  2026-11-12. Lo usable lo decide la superficie, que anuncia 11 por
+  `/inference/v1/models`. `liveIds` se queda como estaba: sin él, el picker se
+  llenaría de entradas que el gate no sirve.
+
+`model-catalog.mjs` es un módulo nuevo y está en el `files` de `package.json`:
+el paquete publica una allowlist, y un archivo que no esté ahí no viaja en el
+tarball.
+
+El smoke test resuelve el registro con la misma función que registra
+(`readRegistry`), no con una copia propia: si verificara contra otra fuente podría
+pasar mientras la registración usa otra cosa, que es justo el fallo silencioso que
+este cambio evita.
+
 ## Egress WARP (`off` / `auto` / `on`)
 
 [`warp-minimal`](https://github.com/Deury08/warp-minimal) es el proxy que aporta la

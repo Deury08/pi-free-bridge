@@ -31,22 +31,10 @@ const EXCLUDED_MODELS = [
 	"jev-1.13-free",
 ];
 
-// S11: the registered set is checked against the registry itself, so the test
-// reads the same file `index.ts` reads, in the same probe order (REGISTRY_PATHS).
-const REGISTRY_PATHS = [
-	join(homedir(), ".cache", "opencode", "models.json"),
-	join(homedir(), ".config", "opencode", "models.json"),
-];
-const registryPath = REGISTRY_PATHS.find((p) => existsSync(p));
-assert.ok(registryPath, "no OpenCode registry found — run this on a machine with opencode installed");
-
-// `discoverFreeModels` reads `data.opencode.models`: a flat id → metadata map
-// living under the `opencode` provider entry, not a list of models.
-const registryModels = JSON.parse(readFileSync(registryPath, "utf-8"))?.opencode?.models;
-assert.ok(
-	registryModels && typeof registryModels === "object",
-	`registry has no "opencode.models" map: ${registryPath} — the registered set cannot be verified against it`,
-);
+// S11: the registered set is checked against the registry itself. The probe
+// order and the store path are the product's own exported constants, resolved
+// below once `liveIds` is known: duplicating them here would let the check drift
+// to a different file than the one registration reads.
 
 let captured = null;
 const pi = {
@@ -82,6 +70,25 @@ const bridgeConfig = JSON.parse(readFileSync(BRIDGE_CONFIG_PATH, "utf-8"));
 assert.ok(
 	Array.isArray(bridgeConfig.liveIds),
 	`${BRIDGE_CONFIG_PATH} has no liveIds array — there is nothing to check the registered set against`,
+);
+
+// S11: resolved through the same function `index.ts` registers from. Reading the
+// file directly would let the check pass against one source while registration
+// used another.
+const { readRegistry } = await import("../model-catalog.mjs");
+const registry = readRegistry({
+	shareDir: bridgeModule.OPENCODE_SHARE_DIR,
+	filePaths: bridgeModule.REGISTRY_PATHS,
+	wanted: new Set(bridgeConfig.liveIds),
+});
+assert.ok(registry?.data, `no OpenCode registry found (${registry?.source ?? "none"}) — this test needs one to verify against`);
+
+// `discoverFreeModels` reads `data.opencode.models`: a flat id → metadata map
+// living under the `opencode` provider entry, not a list of models.
+const registryModels = registry.data.opencode?.models;
+assert.ok(
+	registryModels && typeof registryModels === "object",
+	`registry has no "opencode.models" map: ${registry.source} — the registered set cannot be verified against it`,
 );
 
 // S1/S2: provider id and the loopback relay surface (S35)
@@ -145,7 +152,7 @@ const configuredIds = new Set(bridgeConfig.liveIds);
 assert.deepEqual(
 	ids.filter((id) => !registryIds.has(id)),
 	[],
-	`registered ids missing from the OpenCode registry ${registryPath}`,
+	`registered ids missing from the OpenCode registry (${registry.source})`,
 );
 
 // S11: registered ⊆ the local bridge config's liveIds
