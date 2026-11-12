@@ -3686,3 +3686,36 @@ test("ladder: a parked exit skips the swap and takes the rotation (S13)", async 
 		},
 	);
 });
+
+test("egressHeaders: v1 is five headers, v2 adds the affinity set", async () => {
+	const { egressHeaders } = await import("../relay.mjs");
+	const config = {
+		userAgent: "opencode/2.2.7/opencode",
+		apiKey: "public",
+		session: "ses_abc",
+	};
+
+	const dflt = egressHeaders(config);
+	assert.equal(Object.keys(dflt).length, 5, "an absent wireMode is v1");
+	assert.equal(dflt["x-session-affinity"], undefined);
+
+	const v1 = egressHeaders({ ...config, wireMode: "v1" });
+	assert.deepEqual(Object.keys(v1).sort(), [
+		"authorization",
+		"content-type",
+		"user-agent",
+		"x-opencode-session",
+		"x-opencode-session-id",
+	]);
+	assert.equal(v1["content-type"], "application/json");
+	assert.equal(v1["authorization"], "Bearer public");
+	assert.equal(v1["x-opencode-session"], "ses_abc");
+	assert.equal(v1["x-opencode-session-id"], "ses_abc");
+
+	const v2 = egressHeaders({ ...config, wireMode: "v2" });
+	assert.equal(v2["x-session-affinity"], "ses_abc", "root affinity is the session id");
+	assert.equal(v2["X-Session-Id"], "ses_abc");
+	assert.equal(v2["x-opencode-client"], "opencode");
+	assert.equal(v2["authorization"], "Bearer public", "the v1 set survives under v2");
+	assert.equal(Object.keys(v2).length, 8);
+});

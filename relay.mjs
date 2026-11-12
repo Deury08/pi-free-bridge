@@ -548,16 +548,31 @@ export function isNetworkError(err) {
 let warpPreferred = false;
 let lastEgress = undefined;
 
+/** Pure: the upstream headers for one egress attempt. `wireMode` "v2" adds the
+ *  three headers the v2 client sends besides the v1 set
+ *  (packages/core/src/session/model-request.ts:313-324). For a root session
+ *  `affinity` is the session id, so both headers carry it. Default "v1" is
+ *  byte-identical to the previous behaviour. */
+export function egressHeaders(config) {
+	const headers = {
+		"content-type": "application/json",
+		"user-agent": config.userAgent,
+		authorization: `Bearer ${config.apiKey}`,
+		"x-opencode-session": config.session,
+		"x-opencode-session-id": config.session,
+	};
+	if (config.wireMode === "v2") {
+		headers["x-session-affinity"] = config.session;
+		headers["X-Session-Id"] = config.session;
+		headers["x-opencode-client"] = "opencode";
+	}
+	return headers;
+}
+
 function egressFetch(config, pathname, { body }, egress) {
 	const opts = {
 		method: "POST",
-		headers: {
-			"content-type": "application/json",
-			"user-agent": config.userAgent,
-			authorization: `Bearer ${config.apiKey}`,
-			"x-opencode-session": config.session,
-			"x-opencode-session-id": config.session,
-		},
+		headers: egressHeaders(config),
 		body,
 	};
 	if (egress === "warp") opts.proxy = config.warpProxy;
@@ -2273,6 +2288,7 @@ async function startServer() {
 		cwd: process.env.RELAY_CWD || process.cwd(),
 		userAgent: process.env.RELAY_USER_AGENT || DEFAULT_USER_AGENT,
 		apiKey: process.env.RELAY_API_KEY || "public",
+		wireMode: process.env.RELAY_WIRE_MODE === "v2" ? "v2" : "v1",
 		warpMode: resolveWarpModeHot(envOverride, readFileWarpMode(process.env.RELAY_CONFIG_PATH || "")),
 		warpModeSource: envOverride ? "env" : "config",
 		warpConfigPath: process.env.RELAY_CONFIG_PATH || "",
