@@ -2248,6 +2248,7 @@ export async function handle(req, res, config) {
 			sessionSource: config.sessionSource,
 			warpMode: config.warpMode,
 			warpModeSource: config.warpModeSource,
+			wireMode: config.wireMode,
 			warpProxy: config.warpProxy,
 			warp429Streak: warp429Streak,
 			// Gate-decode S3: `FreeUsageLimitError` is not evidence of quota. This field
