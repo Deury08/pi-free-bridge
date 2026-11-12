@@ -737,3 +737,105 @@ bien, casi siempre venció el session id, no el puente.
 ## Licencia
 
 MIT — ver [`LICENSE`](LICENSE).
+
+---
+
+## Relay standalone: sin Bun y sin OpenCode
+
+El relay puede correr solo, como un único ejecutable. **No hace falta instalar
+Bun, Node, ni OpenCode**, ni la extensión de Pi: el ejecutable trae el runtime
+adentro, genera su propio session id y trae los modelos adentro.
+
+### 1. Descargá el archivo de tu sistema
+
+En la página de **Releases** de este repositorio:
+
+| Tu sistema | Archivo |
+| --- | --- |
+| Windows 64 bits | `relay-windows-x64.exe` |
+| Linux 64 bits | `relay-linux-x64` |
+| Linux ARM (Raspberry, servidores ARM) | `relay-linux-arm64` |
+| macOS con Intel | `relay-darwin-x64` |
+| macOS con Apple Silicon (M1 o posterior) | `relay-darwin-arm64` |
+
+Si no sabés qué Mac tenés: menú Apple → *Acerca de esta Mac*. Si dice "Chip
+Apple M…" es ARM; si dice "Procesador Intel" es el otro.
+
+### 2. Corrélo
+
+**Windows** — abrí PowerShell en la carpeta donde lo bajaste:
+
+```powershell
+Unblock-File .\relay-windows-x64.exe
+.\relay-windows-x64.exe
+```
+
+`Unblock-File` evita el aviso de "Windows protegió tu PC" con archivos bajados
+de internet. Si aun así aparece, *Más información → Ejecutar de todas formas*.
+
+**macOS** — abrí Terminal en la carpeta donde lo bajaste:
+
+```bash
+chmod +x relay-darwin-arm64
+./relay-darwin-arm64
+```
+
+Si macOS lo bloquea por no estar firmado, dos caminos: clic derecho sobre el
+archivo → *Abrir* → *Abrir*, o quitarle la cuarentena:
+
+```bash
+xattr -d com.apple.quarantine relay-darwin-arm64
+```
+
+**Linux**:
+
+```bash
+chmod +x relay-linux-x64
+./relay-linux-x64
+```
+
+### 3. Comprobá que está vivo
+
+En otra terminal:
+
+```bash
+curl http://127.0.0.1:8788/health
+```
+
+Tiene que devolver un JSON con `"ok":true`. Para cortarlo, `Ctrl+C` en la
+terminal donde corre.
+
+### Opciones
+
+Todo tiene un valor por defecto: sin configurar nada, el relay escucha en el
+puerto 8788 y apunta al upstream de OpenCode.
+
+| Variable | Para qué | Por defecto |
+| --- | --- | --- |
+| `PORT` | Puerto donde escucha | `8788` |
+| `RELAY_UPSTREAM` | URL del upstream | `https://opencode.ai/inference/v1` |
+| `RELAY_WARP_MODE` | `off` / `auto` / `on` (usa el proxy WARP) | `off` |
+| `RELAY_WARP_PROXY` | URL del proxy WARP | `http://127.0.0.1:8789` |
+| `RELAY_WIRE_MODE` | `v1` / `v2` (set de headers) | `v1` |
+| `RELAY_API_KEY` | Credencial enviada al upstream | `public` |
+
+Ejemplo, en Linux o macOS:
+
+```bash
+PORT=9000 RELAY_WARP_MODE=on ./relay-linux-x64
+```
+
+En PowerShell:
+
+```powershell
+$env:PORT=9000; $env:RELAY_WARP_MODE="on"; .\relay-windows-x64.exe
+```
+
+> Sin proxy WARP la IP local queda expuesta al límite diario del free tier. Si
+> el relay responde 429, `RELAY_WARP_MODE=on` cambia la salida.
+
+### Lo que este ejecutable NO hace
+
+No registra los modelos en el selector de Pi: eso lo hace la extensión. El
+binario es el relay solo — sirve para correr el puente aparte, en otra máquina,
+o adentro de un contenedor.
