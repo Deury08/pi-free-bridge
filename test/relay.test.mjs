@@ -23,9 +23,14 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+	basicAuthFor,
+	classifyGate429,
 	ensureEnvBlock,
 	forwardedHeaders,
 	ensureGateTools,
+	harvestNewestSessionId,
+	mintSessionFromService,
+	parseServiceRegistration,
 	resolveRelaySession,
 	resolveSessionFromStore,
 	toUpstreamUrl,
@@ -287,6 +292,71 @@ test("resolveSessionFromStore: ignores session_diff files that are not ses_*.jso
 	assert.equal(result, undefined);
 });
 
+// ---------------------------------------------------------------------------
+// harvestNewestSessionId: OpenCode v1 vs v2 schema
+// ---------------------------------------------------------------------------
+//
+// OpenCode v1 stores sessions in `session`, v2 in `session_v2`. The harvest has
+// to read whichever schema the local store has. `bun:sqlite` is a Bun-only
+// import, so the table resolution is a pure function over a db-like object and
+// is covered here under plain Node.
+
+/** A `runSql` stand-in: throws for tables this fake schema does not have, so
+ *  the harvest exercises the same absent-table path as a real driver. */
+function fakeRun(tables) {
+	return (sql) => {
+		const table = /^select id from (\w+)/.exec(sql)?.[1];
+		if (table === undefined || !(table in tables)) {
+			throw new Error(`no such table: ${table}`);
+		}
+		return tables[table].map((id) => ({ id }));
+	};
+}
+
+test("harvestNewestSessionId: reads the v1 `session` table", () => {
+	assert.equal(harvestNewestSessionId(fakeRun({ session: ["ses_newest", "ses_older"] })), "ses_newest");
+});
+
+test("harvestNewestSessionId: reads the v2 `session_v2` table when `session` is absent", () => {
+	assert.equal(harvestNewestSessionId(fakeRun({ session_v2: ["ses_v2_newest"] })), "ses_v2_newest");
+});
+
+test("harvestNewestSessionId: an empty v1 table does not shadow a populated v2 table", () => {
+	assert.equal(harvestNewestSessionId(fakeRun({ session: [], session_v2: ["ses_from_v2"] })), "ses_from_v2");
+});
+
+test("harvestNewestSessionId: skips rows whose id is not a ses_ id", () => {
+	assert.equal(harvestNewestSessionId(fakeRun({ session: ["not-a-session", "ses_real"] })), "ses_real");
+});
+
+test("harvestNewestSessionId: resolves nothing when no candidate table exists", () => {
+	assert.equal(harvestNewestSessionId(fakeRun({})), undefined);
+});
+
+// The extension harvests the store with `node:sqlite`, whose DatabaseSync has
+// `prepare()` and no `query()`. Driving the real driver here is what pins that
+// API contract: a `query()`-based harvest compiles, resolves nothing, and the
+// v2 schema below turns GREEN only when `prepare()` is the path taken.
+test("harvestNewestSessionId: reads a real `session_v2` store through node:sqlite", async () => {
+	const { DatabaseSync } = await import("node:sqlite");
+	const store = mkdtempSync(join(tmpdir(), "pfb-sqlite-"));
+	const dbPath = join(store, "opencode.db");
+
+	const seed = new DatabaseSync(dbPath);
+	seed.exec("create table session_v2 (id text, time_created integer)");
+	seed.prepare("insert into session_v2 values (?, ?)").run("ses_old", 1);
+	seed.prepare("insert into session_v2 values (?, ?)").run("ses_new", 2);
+	seed.close();
+
+	const db = new DatabaseSync(dbPath, { readOnly: true });
+	try {
+		const id = harvestNewestSessionId((sql) => db.prepare(sql).all());
+		assert.equal(id, "ses_new");
+	} finally {
+		db.close();
+	}
+});
+
 // Importing the module must not have started the server: if it had, this test
 // file would never exit. This assertion documents that contract explicitly.
 test("importing relay.mjs has no side effects", () => {
@@ -308,12 +378,20 @@ function writeStore(shareDir, files) {
 	}
 }
 
+// Every precedence test injects a minter: without one the real
+// mintSessionFromService would reach the machine's own OpenCode daemon and
+// create a session as a test side effect.
+const noService = async () => undefined;
+
 test("resolveRelaySession: user override wins over a Pi-supplied id", async () => {
 	process.env.RELAY_SESSION = "ses_override";
 	process.env.RELAY_SESSION_SOURCE = "env";
 	process.env.RELAY_SESSION_PI = "ses_pi_harvest";
 	try {
-		const result = await resolveRelaySession({ shareDir: join(tmpdir(), "pfb-empty-none-00") });
+		const result = await resolveRelaySession({
+			shareDir: join(tmpdir(), "pfb-empty-none-00"),
+			mintSession: noService,
+		});
 		assert.equal(result.sessionId, "ses_override");
 		assert.equal(result.source, "env");
 	} finally {
@@ -328,7 +406,7 @@ test("resolveRelaySession: Pi-supplied id beats the relay's local store", async 
 	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
 	process.env.RELAY_SESSION_PI = "ses_pi_harvest";
 	try {
-		const result = await resolveRelaySession({ shareDir });
+		const result = await resolveRelaySession({ shareDir, mintSession: noService });
 		assert.equal(result.sessionId, "ses_pi_harvest");
 		assert.equal(result.source, "pi-harvest");
 	} finally {
@@ -339,9 +417,164 @@ test("resolveRelaySession: Pi-supplied id beats the relay's local store", async 
 test("resolveRelaySession: without a Pi-supplied id, the relay harvests locally", async () => {
 	const shareDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
 	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
-	const result = await resolveRelaySession({ shareDir });
+	const result = await resolveRelaySession({ shareDir, mintSession: noService });
 	assert.equal(result.sessionId, "ses_local");
 	assert.equal(result.source, "session-diff");
+});
+
+// ---------------------------------------------------------------------------
+// The local OpenCode service (gate-decode S4, S7)
+// ---------------------------------------------------------------------------
+//
+// The gate validates session ids against OpenCode's registry, so a fabricated
+// id is rejected while a server-issued one is accepted even though it never
+// served a request. Asking the server replaces scraping `opencode.db`, which is
+// what broke on v2 (`session` -> `session_v2`).
+
+/** Run `fn` against a throwaway loopback server, so the minter is exercised end
+ *  to end without the machine's real daemon. */
+async function withFakeService(handler, fn) {
+	const server = createServer(handler);
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const { port } = server.address();
+	try {
+		return await fn(`http://127.0.0.1:${port}`);
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+	}
+}
+
+test("parseServiceRegistration: accepts a loopback registration", () => {
+	const parsed = parseServiceRegistration(
+		JSON.stringify({ url: "http://127.0.0.1:49374", password: "pw", pid: 1, version: "2.2.7" }),
+	);
+
+	assert.deepEqual(parsed, { url: "http://127.0.0.1:49374", password: "pw" });
+});
+
+test("parseServiceRegistration: rejects a registration pointing off loopback", () => {
+	assert.equal(parseServiceRegistration(JSON.stringify({ url: "http://10.0.0.5:49374", password: "pw" })), undefined);
+});
+
+test("parseServiceRegistration: rejects a registration without a password", () => {
+	assert.equal(parseServiceRegistration(JSON.stringify({ url: "http://127.0.0.1:1" })), undefined);
+});
+
+test("parseServiceRegistration: rejects garbage instead of throwing", () => {
+	assert.equal(parseServiceRegistration("not json"), undefined);
+	assert.equal(parseServiceRegistration("{}"), undefined);
+});
+
+test("basicAuthFor: builds the credential the local server expects", () => {
+	assert.equal(basicAuthFor("pw"), `Basic ${Buffer.from("opencode:pw").toString("base64")}`);
+});
+
+test("mintSessionFromService: returns the id the local server issues", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-service-"));
+	const servicePath = join(dir, "service.json");
+	const seen = [];
+
+	await withFakeService((req, res) => {
+		seen.push({ url: req.url, method: req.method, auth: req.headers.authorization });
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ data: { id: "ses_from_service" } }));
+	}, async (url) => {
+		writeFileSync(servicePath, JSON.stringify({ url, password: "pw" }));
+		assert.equal(await mintSessionFromService({ servicePath }), "ses_from_service");
+	});
+
+	assert.deepEqual(seen, [{ url: "/api/session", method: "POST", auth: basicAuthFor("pw") }]);
+});
+
+test("mintSessionFromService: an absent registration resolves nothing", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-service-"));
+
+	assert.equal(await mintSessionFromService({ servicePath: join(dir, "service.json") }), undefined);
+});
+
+test("mintSessionFromService: a refused port resolves nothing", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-service-"));
+	const servicePath = join(dir, "service.json");
+	// Port 1 on loopback is refused; the minter must swallow it, not throw.
+	writeFileSync(servicePath, JSON.stringify({ url: "http://127.0.0.1:1", password: "pw" }));
+
+	assert.equal(await mintSessionFromService({ servicePath, timeoutMs: 500 }), undefined);
+});
+
+test("mintSessionFromService: a foreign service shape resolves nothing", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-service-"));
+	const servicePath = join(dir, "service.json");
+
+	await withFakeService((req, res) => {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ id: "not-our-shape" }));
+	}, async (url) => {
+		writeFileSync(servicePath, JSON.stringify({ url, password: "pw" }));
+		assert.equal(await mintSessionFromService({ servicePath }), undefined);
+	});
+});
+
+test("resolveRelaySession: the local service beats the store harvest", async () => {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
+
+	const result = await resolveRelaySession({ shareDir, mintSession: async () => "ses_service" });
+
+	assert.equal(result.sessionId, "ses_service");
+	assert.equal(result.source, "service");
+});
+
+test("resolveRelaySession: an absent local service falls through to the store", async () => {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
+
+	const result = await resolveRelaySession({ shareDir, mintSession: noService });
+
+	assert.equal(result.sessionId, "ses_local");
+	assert.equal(result.source, "session-diff");
+});
+
+test("resolveRelaySession: a minter returning a non-ses_ id is ignored", async () => {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	writeStore(shareDir, [["ses_local.json", new Date("2026-01-01")]]);
+
+	const result = await resolveRelaySession({ shareDir, mintSession: async () => "garbage" });
+
+	assert.equal(result.sessionId, "ses_local");
+	assert.equal(result.source, "session-diff");
+});
+
+// ---------------------------------------------------------------------------
+// classifyGate429: the vendor's 429 label is not evidence (gate-decode S3)
+// ---------------------------------------------------------------------------
+//
+// Measured 2026-11-12 against the live gate: `FreeUsageLimitError` is returned
+// for an unknown session id, for a contract violation and for a real daily
+// quota, always with the same 00:00-UTC `retry-after`. The classifier therefore
+// ranks what the relay can justify instead of repeating the vendor's label.
+
+test("classifyGate429: never claims quota when the relay cannot justify it", () => {
+	const result = classifyGate429({ sessionSource: "service" });
+
+	assert.equal(result.cause, "undetermined");
+	assert.match(result.detail, /do not report quota/);
+});
+
+test("classifyGate429: an unverified session id is the first suspect", () => {
+	for (const sessionSource of ["env", "config"]) {
+		assert.equal(classifyGate429({ sessionSource }).cause, "session_suspect");
+	}
+});
+
+test("classifyGate429: two warp 429s rule the egress out", () => {
+	const result = classifyGate429({ sessionSource: "service", warp429Streak: 2 });
+
+	assert.equal(result.cause, "not_egress");
+});
+
+test("classifyGate429: a registry-backed id on the first 429 stays undetermined", () => {
+	assert.equal(classifyGate429({ sessionSource: "service", warp429Streak: 1 }).cause, "undetermined");
+	assert.equal(classifyGate429({ sessionSource: "opencode.db" }).cause, "undetermined");
 });
 
 // ---------------------------------------------------------------------------

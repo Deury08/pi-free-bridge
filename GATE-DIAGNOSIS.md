@@ -215,3 +215,58 @@ Caveat: that directory is temporary. Anything worth keeping must move into the r
 - The upstream allowlist can change again. This is a compatibility shim, not a fix.
 - The `<env>` requirement may be a hygiene heuristic rather than a hard contract; only the positive and negative cases above are proven.
 - `repro.mjs` in this repo runs on **node** with a short system prompt, so it now always fails. It no longer reflects reality and should be rewritten or retired.
+
+---
+
+## 9. Re-measured 2026-11-12: `FreeUsageLimitError` is not evidence of quota
+
+Section 8's limits are now partly closed, and one of them was wrong in a way that
+matters operationally.
+
+### 9.1 One error code, three unrelated causes
+
+`429 {"type":"error","error":{"type":"FreeUsageLimitError", …}}` is the vendor's
+answer for **all** of the following. `retry-after` does **not** separate them: it
+carried the same 00:00-UTC window in every case, so a header-only heuristic
+cannot tell them apart.
+
+| Id origin | Contract | Result |
+|---|---|---|
+| Real OpenCode usage (`ses_e321cfd0…`) | correct | `200 SSE-CHUNK` |
+| Issued by the local server via `POST /api/session`, **never used** (5 ids) | correct | `200 SSE-CHUNK` (5/5) |
+| Fabricated `ses_` + 26 chars from the real alphabet | correct | `429` |
+| `no-soy-un-id`, `ses_` alone, empty string | correct | `429` |
+| Real id | `user-agent: opencode/1.19.0`, no `<env>` block | `429` |
+| Real id | `Platform: linux` instead of `win32` | `200 SSE-CHUNK` |
+
+### 9.2 What that corrects
+
+- **The session id is validated against OpenCode's registry, not its shape.**
+  A prefix and a plausible alphabet are not enough.
+- **Sessions can be created.** §4's "no endpoint creates a session" is true only
+  of the remote surface (`/inference/v1/session` → 404). The **local** server
+  exposes `POST /api/session`, and its ids are accepted before they ever serve a
+  request. Scraping `opencode.db` is therefore optional, not mandatory.
+- **`Platform:` is not load-bearing.** `linux` passes, so the hardcoded `win32`
+  is cosmetic rather than a gate requirement. Left as a follow-up.
+- **The `user-agent` version digit is load-bearing.** `1.19.3` passes where
+  `1.19.0` does not, with everything else identical.
+
+### 9.3 Method note that cost a full round
+
+The first probe round measured from **Node**, without the `<env>` block, and
+reported `FreeUsageLimitError` for every case — including the control. That was
+a false negative: the relay exists precisely because the gate rejects Node's
+TLS ClientHello, and the `<env>` block is part of the accepted contract. A
+measurement only counts when it reproduces the relay's real request shape:
+
+```
+Bun egress
+user-agent: opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14
+system message includes <env>\n  Working directory: …\n  Platform: …\n</env>
+headers: content-type, user-agent, authorization: Bearer <any>,
+         x-opencode-session + x-opencode-session-id (same value)
+```
+
+Anything else gets the same 429 that means "quota" in every existing document.
+That is how five chained diagnoses stayed misattributed at once.

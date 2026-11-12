@@ -350,9 +350,38 @@ function harvestSessionFromDiff(shareDir: string = OPENCODE_SHARE_DIR): string |
 	return newest?.id;
 }
 
-/** Newest `session` row from `opencode.db` via `node:sqlite` when available.
- *  Synchronous best-effort: a missing module, table or permission returns
- *  undefined and lets the caller fall through to the diff harvest. */
+/** The session table by OpenCode generation: v1 created `session`, v2 creates
+ *  `session_v2`. Oldest schema first so a v1 store keeps its original path. */
+const SESSION_TABLES: readonly string[] = ["session", "session_v2"];
+
+/** Newest `ses_` id from the first candidate table that yields one. An absent
+ *  table is skipped, and an empty (or all foreign-id) table does not shadow the
+ *  next candidate. `runSql` keeps this independent of the driver API: Bun's
+ *  `bun:sqlite` exposes `query(sql).all()`, Node's `node:sqlite` only exposes
+ *  `prepare(sql).all()`. Mirrors relay.mjs, which harvests the same store. */
+function harvestNewestSessionId(
+	runSql: (sql: string) => { id?: unknown }[],
+	tables: readonly string[] = SESSION_TABLES,
+): string | undefined {
+	for (const table of tables) {
+		let rows: { id?: unknown }[];
+		try {
+			rows = runSql(`select id from ${table} order by time_created desc limit 5`);
+		} catch {
+			// Table absent from this schema, or unreadable: try the next candidate.
+			continue;
+		}
+		for (const row of rows) {
+			if (row && typeof row.id === "string" && row.id.startsWith("ses_")) return row.id;
+		}
+	}
+	return undefined;
+}
+
+/** Newest `ses_` row from `opencode.db` via `node:sqlite` when available, in
+ *  either the v1 `session` or the v2 `session_v2` table. Synchronous
+ *  best-effort: a missing module, table or permission returns undefined and
+ *  lets the caller fall through to the diff harvest. */
 function harvestSessionFromDb(shareDir: string = OPENCODE_SHARE_DIR): string | undefined {
 	const dbPath = join(shareDir, "opencode.db");
 	if (!existsSync(dbPath)) return undefined;
@@ -361,14 +390,11 @@ function harvestSessionFromDb(shareDir: string = OPENCODE_SHARE_DIR): string | u
 		const { DatabaseSync } = require("node:sqlite") as { DatabaseSync?: unknown };
 		if (typeof DatabaseSync !== "function") return undefined;
 		const db = new (DatabaseSync as new (path: string, opts?: object) => {
-			query(sql: string): { all(): { id?: unknown }[] };
+			prepare(sql: string): { all(): { id?: unknown }[] };
 			close(): void;
 		})(dbPath, { readOnly: true });
 		try {
-			const rows = db.query("select id from session order by time_created desc limit 5").all();
-			for (const row of rows) {
-				if (row && typeof row.id === "string" && row.id.startsWith("ses_")) return row.id;
-			}
+			return harvestNewestSessionId((sql) => db.prepare(sql).all());
 		} finally {
 			db.close();
 		}

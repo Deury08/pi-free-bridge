@@ -131,15 +131,139 @@ export function toUpstreamUrl(upstreamBase, pathname) {
 //
 // The package ships no session id. The gate only trusts ids the official
 // OpenCode client created, so one is harvested from the local store: newest
-// `session` row first, newest `storage/session_diff/ses_*.json` second.
+// session row first, newest `storage/session_diff/ses_*.json` second.
 // `bun:sqlite` is imported dynamically so importing this module under plain
 // Node (the helper tests) never touches it.
 
 const SESSION_ID = /^ses_/;
 
+/**
+ * The session table by OpenCode generation: v1 created `session`, v2 creates
+ * `session_v2`. Ordered oldest-schema-first so a v1 store keeps its original
+ * path and a v2 store simply skips the absent table.
+ */
+export const SESSION_TABLES = ["session", "session_v2"];
+
+/**
+ * Newest `ses_` id from the first candidate table that yields one. An absent
+ * or unreadable table is skipped rather than fatal, and an empty (or all
+ * foreign-id) table does not shadow the next candidate. Takes a `runSql`
+ * callback instead of a db so it stays independent of the driver API: Bun's
+ * `bun:sqlite` exposes `query(sql).all()`, Node's `node:sqlite` only exposes
+ * `prepare(sql).all()`.
+ */
+export function harvestNewestSessionId(runSql, tables = SESSION_TABLES) {
+	for (const table of tables) {
+		let rows;
+		try {
+			rows = runSql(`select id from ${table} order by time_created desc limit 5`);
+		} catch {
+			// Table absent from this schema, or unreadable: try the next candidate.
+			continue;
+		}
+		for (const row of rows) {
+			const id = row && typeof row.id === "string" ? row.id : undefined;
+			if (id && SESSION_ID.test(id)) return id;
+		}
+	}
+	return undefined;
+}
+
 /** `~/.local/share/opencode`, the store the official client writes. */
 function openCodeShareDir() {
 	return join(homedir(), ".local", "share", "opencode");
+}
+
+/** OpenCode's state root. It branches on nothing: the XDG layout is used on
+ *  every platform, so `~/.local/state` applies on Windows too
+ *  (`packages/util/src/global-roots.ts`). `XDG_STATE_HOME` still wins. */
+function openCodeStateDir() {
+	return join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode");
+}
+
+/** The local server's registration file. Only `--service` mode writes it, and
+ *  OpenCode's own client calls it "the complete discovery contract": a
+ *  foreground `opencode serve` scans ports from 4096, so probing is not viable. */
+export function openCodeServicePath() {
+	return join(openCodeStateDir(), "service.json");
+}
+
+/** Pure: the parts of the registration file we act on, or `undefined` when it is
+ *  unusable. Loopback only: a registration pointing anywhere else is foreign and
+ *  must never receive the credential. */
+export function parseServiceRegistration(raw) {
+	let parsed;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!parsed || typeof parsed !== "object") return undefined;
+	const url = typeof parsed.url === "string" ? parsed.url.trim() : "";
+	const password = typeof parsed.password === "string" ? parsed.password : "";
+	if (!url || !password) return undefined;
+
+	let host;
+	try {
+		host = new URL(url).hostname;
+	} catch {
+		return undefined;
+	}
+	if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1" && host !== "[::1]") {
+		return undefined;
+	}
+	return { url: url.replace(/\/+$/, ""), password };
+}
+
+/** Pure: the Basic credential the local server requires. The username is fixed
+ *  to `opencode` (`packages/server/src/auth.ts`). */
+export function basicAuthFor(password) {
+	return `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
+}
+
+/** Ask the local OpenCode server to create a session and return its id.
+ *
+ *  The gate validates session ids against OpenCode's registry: a fabricated
+ *  `ses_` id is rejected even when its shape is right, while a server-issued one
+ *  is accepted although it has never served a request (measured 2026-11-12,
+ *  5/5). Asking the server replaces scraping `opencode.db`, so the bridge stops
+ *  depending on a table name OpenCode renames between major versions.
+ *
+ *  Best-effort by construction: an absent or stale registration, a refused port,
+ *  a foreign listener or a body that is not ours all return `undefined`, and the
+ *  caller falls through to the store harvest. The relay never spawns the daemon
+ *  — lifecycle belongs to the operator. */
+export async function mintSessionFromService({
+	servicePath = openCodeServicePath(),
+	timeoutMs = 2000,
+} = {}) {
+	let raw;
+	try {
+		raw = readFileSync(servicePath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const registration = parseServiceRegistration(raw);
+	if (!registration) return undefined;
+
+	try {
+		const response = await fetch(`${registration.url}/api/session`, {
+			method: "POST",
+			headers: {
+				authorization: basicAuthFor(registration.password),
+				"content-type": "application/json",
+			},
+			body: "{}",
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+		if (!response.ok) return undefined;
+		const body = await response.json();
+		const id = body && body.data && typeof body.data.id === "string" ? body.data.id : undefined;
+		return id && SESSION_ID.test(id) ? id : undefined;
+	} catch {
+		// Absent daemon, refused port, foreign listener, or a non-JSON body.
+		return undefined;
+	}
 }
 
 async function readSessionFromDb(shareDir) {
@@ -150,11 +274,8 @@ async function readSessionFromDb(shareDir) {
 		const { Database } = await import("bun:sqlite");
 		const db = new Database(dbPath, { readonly: true });
 		try {
-			const rows = db.query("select id from session order by time_created desc limit 5").all();
-			for (const row of rows) {
-				const id = row && typeof row.id === "string" ? row.id : undefined;
-				if (id && SESSION_ID.test(id)) return id;
-			}
+			const id = harvestNewestSessionId((sql) => db.query(sql).all());
+			if (id) return id;
 		} finally {
 			db.close();
 		}
@@ -207,9 +328,13 @@ export async function resolveSessionFromStore({ shareDir = openCodeShareDir() } 
 }
 
 /** Verde (bun-upgrades S2): precedence is user override, then the
- *  Pi-harvested id, then the relay's local store. Exported for tests; takes
- *  the local store root as an argument so tests can inject a temp store. */
-export async function resolveRelaySession({ shareDir } = {}) {
+ *  Pi-harvested id, then the local server, then the relay's local store.
+ *  Exported for tests; takes the store root and the minter as arguments so
+ *  tests can inject a temp store and a fake server. */
+export async function resolveRelaySession({
+	shareDir,
+	mintSession = mintSessionFromService,
+} = {}) {
 	// Precedence (bun-upgrades S2): user override, then the id the extension
 	// harvested on Pi's machine (works when OpenCode lives elsewhere), then the
 	// relay's own local store (same machine as OpenCode).
@@ -224,6 +349,14 @@ export async function resolveRelaySession({ shareDir } = {}) {
 	const fromPi = process.env.RELAY_SESSION_PI?.trim();
 	if (fromPi && /^ses_/.test(fromPi)) {
 		return { sessionId: fromPi, source: "pi-harvest" };
+	}
+	// Gate-decode S4: ask the server before scraping the store. Its id is
+	// registry-backed, so it survives even a store the bridge cannot read, and it
+	// never depends on a table name OpenCode renames. A missing daemon here is not
+	// an error: the store harvest below is the fallback, unchanged.
+	const minted = await mintSession();
+	if (minted && SESSION_ID.test(minted)) {
+		return { sessionId: minted, source: "service" };
 	}
 	return resolveSessionFromStore(shareDir ? { shareDir } : {});
 }
@@ -671,6 +804,44 @@ export function bumpWarp429Streak(streak, status, egress) {
 	if (status === 429) return streak + 1;
 	if (typeof status === "number" && status < 400) return 0;
 	return streak;
+}
+
+/** Pure: the cause the relay can actually justify when the gate answers 429.
+ *
+ *  The vendor returns `FreeUsageLimitError` for three unrelated conditions: an
+ *  unknown session id, a contract violation (user-agent or the `<env>` block),
+ *  and a real daily quota. `retry-after` is identical for all three — measured
+ *  2026-11-12, an id the registry never issued carried the same 00:00-UTC
+ *  window as an exhausted quota — so a 429 on its own confirms nothing.
+ *
+ *  Ranked by the evidence the relay holds, never by the vendor's label:
+ *  - two consecutive warp 429s: the exit is not the variable, so rotating is
+ *    not the answer; the id or the contract is.
+ *  - an id the relay could not vouch for (`env`, `config`): suspect, because a
+ *    stale or fabricated `ses_` id fails exactly like a spent quota.
+ *  - otherwise: undetermined. One rotation separates quota from the rest, and
+ *    reporting "quota" before it is the false negative that cost this project
+ *    five chained diagnoses. */
+export function classifyGate429({ sessionSource, warp429Streak = 0 } = {}) {
+	if (warp429Streak >= 2) {
+		return {
+			cause: "not_egress",
+			detail:
+				"two warp 429s in a row: the exit is not the variable, so check the session id or the request contract",
+		};
+	}
+	if (sessionSource === "env" || sessionSource === "config") {
+		return {
+			cause: "session_suspect",
+			detail:
+				"the session id was not issued by the local server, and a stale or fabricated one fails exactly like a spent quota",
+		};
+	}
+	return {
+		cause: "undetermined",
+		detail:
+			"quota, session id or contract: rotate once to separate quota from the rest, and do not report quota before that",
+	};
 }
 
 /** Pure: rotate on the first warp 429 of a burst. S12 removed the cool-down,
@@ -1973,6 +2144,9 @@ export async function handle(req, res, config) {
 			warpModeSource: config.warpModeSource,
 			warpProxy: config.warpProxy,
 			warp429Streak: warp429Streak,
+			// Gate-decode S3: `FreeUsageLimitError` is not evidence of quota. This field
+			// carries what the relay can justify, not the label the vendor chose.
+			gate429: classifyGate429({ sessionSource: config.sessionSource, warp429Streak }),
 			warpRecycles: warpRecycles,
 			warpResends: warpResends,
 			// The ladder is invisible from outside for a different reason than the

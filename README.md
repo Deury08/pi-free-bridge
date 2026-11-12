@@ -599,20 +599,33 @@ modelos, así que ése es el contrato real. Es un default del provider aplicado 
 `requiresReasoningContentForToolCalls: true` + `thinkingFormat: "zai"`. No se
 aplica a `nvidia` ni a `opencode-go`, donde `developer` puede ser correcto.
 
-**Session id:** el gate rechaza ids autogenerados (`ses_<hex><base62>`,
-`ses_000…`, basura) y no existe endpoint para crear sesiones. El paquete **no
-incluye** ningún id: el relay cosecha uno del store local de OpenCode al
-arrancar, en este orden:
+**Session id:** el gate valida el id contra el registro de OpenCode, no contra
+su forma. Medido el 2026-11-12: un `ses_<hex><base62>` fabricado da 429, y uno
+emitido por el servidor **local** da 200 aunque nunca haya servido un request
+(5 de 5). El paquete **no incluye** ningún id: el relay lo resuelve al arrancar,
+en este orden:
 
 1. `RELAY_SESSION` — sólo lo setea la extensión cuando hay un override explícito.
-2. La sesión más nueva de `~/.local/share/opencode/opencode.db`
-   (`select id from session order by time_created desc limit 5`, primero que
-   empiece con `ses_`). Se abre en modo lectura y cualquier falla se ignora.
-3. El archivo `ses_*.json` más reciente por mtime en
+2. `RELAY_SESSION_PI` — el id que la extensión cosechó en la máquina de Pi.
+3. **El servidor local de OpenCode** — se lee
+   `~/.local/state/opencode/service.json` (respeta `XDG_STATE_HOME`) y se hace
+   `POST {url}/api/session` con Basic `opencode:<password>`. Ese id está
+   respaldado por el registro, así que es la fuente principal. **Nunca se
+   arranca el daemon**: si el archivo falta, está viejo o el puerto rechaza, se
+   sigue de largo (el rechazo tarda ~9 ms, no 2 s).
+4. La sesión más nueva de `~/.local/share/opencode/opencode.db`, en la tabla
+   `session_v2` (v1 usaba `session`); si una no existe se prueba la otra. Se
+   abre en modo lectura y cualquier falla se ignora.
+5. El archivo `ses_*.json` más reciente por mtime en
    `~/.local/share/opencode/storage/session_diff/`.
 
+Las sesiones que emite el servidor local persisten en `opencode.db` igual que
+las de uso real, así que el paso 4 las encuentra cuando el paso 3 no está
+disponible.
+
 Si ninguno existe, el relay no arranca y escribe una sola línea accionable:
-corré OpenCode una vez o seteá `PI_FREE_BRIDGE_SESSION_ID`.
+corré `opencode service start`, corré OpenCode una vez, o seteá
+`PI_FREE_BRIDGE_SESSION_ID`.
 
 Para forzar otro id:
 
