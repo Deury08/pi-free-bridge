@@ -3746,3 +3746,31 @@ test("wire mode: env wins over the config file, v1 is the default", async () => 
 	assert.equal(readFileWireMode(broken), undefined, "a malformed file is undefined, never a throw");
 	assert.equal(readFileWireMode(path.join(dir, "absent.json")), undefined);
 });
+
+test("refreshWireMode: rereads the file per call, an env override pins it", async () => {
+	const { refreshWireMode } = await import("../relay.mjs");
+	const fs = await import("node:fs");
+	const os = await import("node:os");
+	const path = await import("node:path");
+
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pfb-hot-"));
+	const file = path.join(dir, "bridge.json");
+	const config = { wireMode: "v1", wireModeSource: "config", wireConfigPath: file };
+
+	fs.writeFileSync(file, JSON.stringify({ wireMode: "v2" }));
+	refreshWireMode(config);
+	assert.equal(config.wireMode, "v2", "a config change applies without a restart");
+
+	fs.writeFileSync(file, JSON.stringify({ wireMode: "v1" }));
+	refreshWireMode(config);
+	assert.equal(config.wireMode, "v1", "and it applies back");
+
+	fs.writeFileSync(file, JSON.stringify({ warpEnabled: "on" }));
+	refreshWireMode(config);
+	assert.equal(config.wireMode, "v1", "an absent field keeps the last known mode");
+
+	fs.writeFileSync(file, JSON.stringify({ wireMode: "v2" }));
+	const pinned = { wireMode: "v1", wireModeSource: "env", wireConfigPath: file };
+	refreshWireMode(pinned);
+	assert.equal(pinned.wireMode, "v1", "the env override pins the mode");
+});

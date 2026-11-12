@@ -650,6 +650,18 @@ function refreshWarpMode(config) {
 	}
 }
 
+/** Hot reload (relay-wire-hot-reload): re-read the wire mode from the same
+ *  config file the warp mode uses. An absent field is normal — it means v1, the
+ *  header set every shipped install sends — so nothing is warned about and the
+ *  last known mode stands. A RELAY_WIRE_MODE env override pins the mode. */
+function refreshWireMode(config) {
+	if (config.wireModeSource === "env" || !config.wireConfigPath) return;
+	const fileMode = readFileWireMode(config.wireConfigPath);
+	if (fileMode) config.wireMode = fileMode;
+}
+
+export { refreshWireMode };
+
 /* relay-warp-auto-recycle (user-approved): the opencode free gate counts quota
  *  per (session, egress IP) and per UTC day, so a warp 429 means that exit IP
  *  burnt its day and only the proxy can re-enroll it. The streak that detects it
@@ -2227,6 +2239,7 @@ export async function handle(req, res, config) {
 	// Hot reload (relay-warp-hot-reload): one cheap config re-read per request
 	// drives both /health and /v1.
 	refreshWarpMode(config);
+	refreshWireMode(config);
 
 	const { pathname } = new URL(req.url ?? "/", "http://127.0.0.1");
 
@@ -2322,6 +2335,8 @@ async function startServer() {
 		warpMode: resolveWarpModeHot(envOverride, readFileWarpMode(process.env.RELAY_CONFIG_PATH || "")),
 		warpModeSource: envOverride ? "env" : "config",
 		warpConfigPath: process.env.RELAY_CONFIG_PATH || "",
+		wireConfigPath: process.env.RELAY_CONFIG_PATH || "",
+		wireModeSource: normalizeWireMode(process.env.RELAY_WIRE_MODE) ? "env" : "config",
 		warpProxy: process.env.RELAY_WARP_PROXY || WARP_PROXY_DEFAULT,
 		warpHealthPath: process.env.RELAY_WARP_HEALTH_PATH || WARP_HEALTH_PATH_DEFAULT,
 	};
