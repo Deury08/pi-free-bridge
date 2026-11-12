@@ -818,6 +818,7 @@ puerto 8788 y apunta al upstream de OpenCode.
 | `RELAY_WARP_PROXY` | URL del proxy WARP | `http://127.0.0.1:8789` |
 | `RELAY_WIRE_MODE` | `v1` / `v2` (set de headers) | `v1` |
 | `RELAY_API_KEY` | Credencial enviada al upstream | `public` |
+| `RELAY_STDIN_LIFETIME` | `off` mantiene el relay vivo aunque se cierre la entrada estándar (servicios, contenedores, `nohup`) | activo |
 
 Ejemplo, en Linux o macOS:
 
@@ -833,6 +834,11 @@ $env:PORT=9000; $env:RELAY_WARP_MODE="on"; .\relay-windows-x64.exe
 
 > Sin proxy WARP la IP local queda expuesta al límite diario del free tier. Si
 > el relay responde 429, `RELAY_WARP_MODE=on` cambia la salida.
+
+**Si lo vas a correr como servicio**, en un contenedor o con `nohup`, agregá
+`RELAY_STDIN_LIFETIME=off`. Sin eso el relay se apaga solo cuando se cierra su
+entrada estándar: esa es la conducta que usa la extensión para no dejar procesos
+huérfanos cuando Pi se cae, y en un binario suelto juega en contra.
 
 ### Lo que este ejecutable NO hace
 
