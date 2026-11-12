@@ -322,6 +322,21 @@ function writeBridgeConfig(patch: BridgeConfig): void {
 	}
 }
 
+/** Normalize a wire mode: "v1" | "v2", or undefined for anything else. */
+function normalizeWireMode(value: unknown): "v1" | "v2" | undefined {
+	const text = typeof value === "string" ? value.trim().toLowerCase() : "";
+	return text === "v1" || text === "v2" ? text : undefined;
+}
+
+/** The mode the relay will actually use: the env override wins, then the config
+ *  file, then "v1". Mirrors relay.mjs `resolveWireModeHot` so this command
+ *  reports what is on the wire instead of what was last written. */
+function resolveWireMode(): "v1" | "v2" {
+	const override = normalizeWireMode(process.env.RELAY_WIRE_MODE);
+	if (override) return override;
+	return normalizeWireMode((readBridgeConfig() as { wireMode?: unknown }).wireMode) ?? "v1";
+}
+
 /** `~/.local/share/opencode`, the store the official client writes. */
 const OPENCODE_SHARE_DIR = join(homedir(), ".local", "share", "opencode");
 
@@ -485,6 +500,8 @@ type RelayOptions = {
 	upstream: string;
 	/** off | auto | on (bun-upgrades S5); resolved by ensureRelay when absent. */
 	warpMode?: string;
+	/** v1 | v2 upstream wire; absent means v1 (relay-wire-hot-reload). */
+	wireMode?: "v1" | "v2";
 	/** Absolute http://host:port of the WARP proxy the relay must use. */
 	warpProxy?: string;
 	cwd: string;
@@ -2173,6 +2190,41 @@ export default function (pi: ExtensionAPI) {
 				`WARP mode set to ${next} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
 				"info",
 			);
+		},
+	});
+
+	pi.registerCommand("free-bridge-wire", {
+		description: "Show or set the upstream wire mode: v1 (five headers, default) | v2 (adds the affinity set)",
+		handler: async (args: string, ctx) => {
+			const requested = normalizeWireMode(args);
+			if (args.trim() && !requested) {
+				ctx.ui.notify(`Unknown wire mode: ${args.trim()} — expected v1 or v2; nothing was changed`, "warning");
+				return;
+			}
+			if (requested) {
+				writeBridgeConfig({ wireMode: requested });
+				ctx.ui.notify(`pi-free-bridge: wire mode set to ${requested} in ${BRIDGE_CONFIG_PATH}`, "info");
+				return;
+			}
+			const current = resolveWireMode();
+			const envOverride = normalizeWireMode(process.env.RELAY_WIRE_MODE);
+			const header = `pi-free-bridge wire: ${current} (config)${envOverride ? ` — env override wins: ${envOverride}` : ""}`;
+			if (!(ctx.hasUI && typeof ctx.ui.select === "function")) {
+				ctx.ui.notify(
+					`${header}\nv1: content-type, user-agent, authorization, x-opencode-session, x-opencode-session-id\nv2: the five above, plus x-session-affinity, X-Session-Id, x-opencode-client`,
+					"info",
+				);
+				return;
+			}
+			const selected = await ctx.ui.select(`🔌 Gentle wire 🪢 — modo actual: ${current}`, [
+				"v1 — los cinco headers de siempre (por defecto)",
+				"v2 — agrega x-session-affinity, X-Session-Id, x-opencode-client",
+			]);
+			if (selected === undefined) return;
+			const chosen = normalizeWireMode(String(selected).slice(0, 2));
+			if (!chosen) return;
+			writeBridgeConfig({ wireMode: chosen });
+			ctx.ui.notify(`pi-free-bridge: wire mode set to ${chosen} in ${BRIDGE_CONFIG_PATH}`, "info");
 		},
 	});
 

@@ -196,6 +196,16 @@ Regla invariante: **no hay failover a mitad de stream.** Si la conexión muere
 después del primer byte, el stream termina tal como está — reintentarlo
 corrompería la respuesta SSE.
 
+**Modo del cable (v1 / v2):** `/free-bridge-wire` sin argumentos abre un selector
+con las dos versiones y marca cuál está activa; `/free-bridge-wire v1|v2` la fija.
+Se guarda como `wireMode` en el mismo config y el relay lo relee en cada request,
+igual que el warp: no hay que reiniciar ni reiniciar Pi. Por defecto es `v1`, los
+cinco headers que ya manda toda instalación; `v2` agrega `x-session-affinity`,
+`X-Session-Id` y `x-opencode-client`. `RELAY_WIRE_MODE` (env) gana sobre el archivo.
+`x-opencode-project` queda afuera a propósito: el bridge no tiene concepto de
+proyecto y un id inventado sería una variable más en la medición que este modo
+existe para hacer.
+
 **Hot reload:** el relay relee `warpEnabled` del config en **cada request**
 (la extension se lo pasa por `RELAY_CONFIG_PATH`), así que cambiar el modo con
 `/free-bridge-warp off|auto|on` no reinicia ni mata el relay: el pid sobrevive y

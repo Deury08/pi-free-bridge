@@ -586,6 +586,32 @@ export function resolveWarpModeHot(override, fileValue) {
 	return normalizeWarpMode(override) ?? normalizeWarpMode(fileValue) ?? "off";
 }
 
+/** Normalize a wire mode: "v1" | "v2", or undefined for anything else. */
+export function normalizeWireMode(value) {
+	const text = typeof value === "string" ? value.trim().toLowerCase() : "";
+	return text === "v1" || text === "v2" ? text : undefined;
+}
+
+/** Per-request wire mode (relay-wire-hot-reload). Precedence: the env override,
+ *  then the extension's config file, then "v1" — the header set every shipped
+ *  install already sends, so an absent field changes nothing. */
+export function resolveWireModeHot(override, fileValue) {
+	return normalizeWireMode(override) ?? normalizeWireMode(fileValue) ?? "v1";
+}
+
+/** The `wireMode` field of the extension's config file, or undefined on any
+ *  missing/foreign/malformed file. Never throws, so the caller keeps the last
+ *  known mode. */
+export function readFileWireMode(path) {
+	try {
+		const raw = readFileSync(path, "utf8");
+		const parsed = JSON.parse(raw.startsWith("\uFEFF") ? raw.slice(1) : raw);
+		return normalizeWireMode(parsed && typeof parsed === "object" ? parsed.wireMode : undefined);
+	} catch {
+		return undefined;
+	}
+}
+
 /** Read the extension's persisted config file and return its normalized warp
  *  mode, or undefined on any missing/foreign/malformed file so the caller can
  *  keep the last known mode. Never throws. */
@@ -2288,7 +2314,10 @@ async function startServer() {
 		cwd: process.env.RELAY_CWD || process.cwd(),
 		userAgent: process.env.RELAY_USER_AGENT || DEFAULT_USER_AGENT,
 		apiKey: process.env.RELAY_API_KEY || "public",
-		wireMode: process.env.RELAY_WIRE_MODE === "v2" ? "v2" : "v1",
+		wireMode: resolveWireModeHot(
+			process.env.RELAY_WIRE_MODE,
+			readFileWireMode(process.env.RELAY_CONFIG_PATH || ""),
+		),
 		warpMode: resolveWarpModeHot(envOverride, readFileWarpMode(process.env.RELAY_CONFIG_PATH || "")),
 		warpModeSource: envOverride ? "env" : "config",
 		warpConfigPath: process.env.RELAY_CONFIG_PATH || "",

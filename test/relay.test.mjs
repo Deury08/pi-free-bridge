@@ -3719,3 +3719,30 @@ test("egressHeaders: v1 is five headers, v2 adds the affinity set", async () => 
 	assert.equal(v2["authorization"], "Bearer public", "the v1 set survives under v2");
 	assert.equal(Object.keys(v2).length, 8);
 });
+
+test("wire mode: env wins over the config file, v1 is the default", async () => {
+	const { normalizeWireMode, resolveWireModeHot, readFileWireMode } = await import("../relay.mjs");
+	const fs = await import("node:fs");
+	const os = await import("node:os");
+	const path = await import("node:path");
+
+	assert.equal(normalizeWireMode(" V2 "), "v2", "case and padding are normalized");
+	assert.equal(normalizeWireMode("v1"), "v1");
+	assert.equal(normalizeWireMode("v3"), undefined);
+	assert.equal(normalizeWireMode(undefined), undefined);
+
+	assert.equal(resolveWireModeHot("v2", "v1"), "v2", "the env override wins");
+	assert.equal(resolveWireModeHot(undefined, "v2"), "v2", "the config file answers next");
+	assert.equal(resolveWireModeHot(undefined, undefined), "v1", "an absent field keeps the shipped wire");
+	assert.equal(resolveWireModeHot("bogus", "v2"), "v2", "an unusable override falls through");
+
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pfb-wire-"));
+	const ok = path.join(dir, "bridge.json");
+	fs.writeFileSync(ok, "\uFEFF" + JSON.stringify({ wireMode: "v2", warpMode: "on" }));
+	assert.equal(readFileWireMode(ok), "v2", "a BOM does not hide the value");
+
+	const broken = path.join(dir, "broken.json");
+	fs.writeFileSync(broken, "{not json");
+	assert.equal(readFileWireMode(broken), undefined, "a malformed file is undefined, never a throw");
+	assert.equal(readFileWireMode(path.join(dir, "absent.json")), undefined);
+});
