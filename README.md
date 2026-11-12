@@ -609,8 +609,8 @@ en este orden:
 2. `RELAY_SESSION_PI` — el id que la extensión cosechó en la máquina de Pi.
 3. **El servidor local de OpenCode** — se lee
    `~/.local/state/opencode/service.json` (respeta `XDG_STATE_HOME`) y se hace
-   `POST {url}/api/session` con Basic `opencode:<password>`. Ese id está
-   respaldado por el registro, así que es la fuente principal. **Nunca se
+   `POST {url}/api/session` con Basic `opencode:<password>`. Su id es el que el
+   gate acepta (medido 5/5), así que es la fuente principal. **Nunca se
    arranca el daemon**: si el archivo falta, está viejo o el puerto rechaza, se
    sigue de largo (el rechazo tarda ~9 ms, no 2 s).
 4. La sesión más nueva de `~/.local/share/opencode/opencode.db`, en la tabla

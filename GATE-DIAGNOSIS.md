@@ -241,8 +241,13 @@ cannot tell them apart.
 
 ### 9.2 What that corrects
 
-- **The session id is validated against OpenCode's registry, not its shape.**
-  A prefix and a plausible alphabet are not enough.
+- **A correct-looking id is not enough, but the discriminator is unknown.**
+  A fabricated `ses_` plus 26 characters drawn from the real alphabet is
+  rejected, while ids the local generator emits are accepted. What the gate
+  reads *inside* the string — a checksum, an embedded timestamp, a machine
+  component — is **not** known. Calling it a "registry" was wrong: the local
+  server never contacts the vendor, so the vendor cannot be checking against
+  ids it issued. Section 9.4 keeps that question open.
 - **Sessions can be created.** §4's "no endpoint creates a session" is true only
   of the remote surface (`/inference/v1/session` → 404). The **local** server
   exposes `POST /api/session`, and its ids are accepted before they ever serve a
@@ -270,3 +275,39 @@ headers: content-type, user-agent, authorization: Bearer <any>,
 
 Anything else gets the same 429 that means "quota" in every existing document.
 That is how five chained diagnoses stayed misattributed at once.
+
+### 9.4 Open question: is a minted id portable to another machine?
+
+The practical case: mint ids on one machine that runs the OpenCode service, then
+use the bridge on a machine that has no OpenCode at all. Transport already works
+— the id is just a string, carried by `RELAY_SESSION` or
+`PI_FREE_BRIDGE_SESSION_ID`. What is **not** proven is whether the gate accepts
+a string minted elsewhere.
+
+The reasoning narrows it down without settling it. The local server inserts the
+row into its own SQLite store and never calls the vendor, so the vendor's first
+sight of that id is the request itself — its acceptance cannot depend on having
+issued it. That leaves the string's own contents, and two ids sampled here
+(`ses_e321cfd0effe…`, `ses_e31a219e1ffe…`) share a 2-hex prefix, which is
+suggestive but far from decisive.
+
+Attempted 2026-11-12 and **inconclusive**: minted id, known-good id and garbage
+all returned 429 in the same window, including the known-good id under a normal
+environment. The gate was closed by that day's probing, so the run carried no
+working control and proves nothing. Do not read it as "not portable".
+
+Decisive experiment, to run after the quota window resets (00:00 UTC):
+
+1. Mint one id on machine A.
+2. From machine B — or from the same machine with `HOME`, `XDG_DATA_HOME` and
+   `XDG_STATE_HOME` pointed at empty directories, which leaves no
+   `service.json` and no `opencode.db` reachable — send the relay's exact
+   request shape with that id.
+3. **In the same run**, send a known-good control id and a garbage id.
+   - control 200, minted 200, garbage 429 → portable.
+   - control 200, minted 429 → not portable; something machine-bound is inside
+     the id.
+   - control 429 → quota closed again; the run is void, repeat later.
+
+The control is mandatory. Without it every fault returns the same
+`FreeUsageLimitError`, which is the trap the rest of this document is about.
