@@ -332,10 +332,37 @@ The probes that appeared to prove "a fabricated id is rejected" used
 26 characters from the base62 alphabet, because the first twelve must be hex.
 Those results carry no information about whether a well-formed id is accepted.
 
-What remains genuinely unverified is whether the gate accepts a correctly
-generated id, and that cannot be tested while the quota window is closed. Note
+What remained unverified at that point was whether the gate accepts a correctly
+generated id. Section 9.6 settles it. Note
 what would have to be true for it to fail: the vendor would have to validate a
 value that, by construction, carries no signature and is produced entirely on
 the client. To close it, after 00:00 UTC send **one generated id and one
 known-good control in the same run** — the control is what makes the result
 readable at all.
+
+### 9.6 Result: a generated id is accepted (measured through the relay)
+
+Two relay instances were started with `HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`
+and `XDG_CONFIG_HOME` pointing at directories that were never even created —
+no `opencode.db`, no `service.json`, no OpenCode anywhere on either path. Both
+reported `sessionSource: "generated"`.
+
+| Relay | Egress | Session id | Result |
+|---|---|---|---|
+| A | local | `ses_e31910589ffetdmY19DkHMOxi9` (generated) | `429 FreeUsageLimitError` |
+| B | warp (`RELAY_WARP_MODE=on`) | generated | `200`, six chunks, `finish_reason: "stop"`, `content: "OK"` |
+
+A generated id therefore needs nothing external, and the 429 on relay A was the
+**per-IP daily quota**, not the id: the same generator produced an id that
+completed a request the moment it left through a different exit. Relay A's log
+records the relay parking that egress itself —
+`local egress parked for 64097s after its own 429`.
+
+Two operational notes from the same run:
+
+- The relay ties its lifetime to stdin (`relay.mjs:2290`): started with stdin on
+  `/dev/null` it prints its listening line and exits immediately. Any supervisor
+  must hold the pipe open.
+- The `EADDRINUSE` message tells the operator to set
+  `PI_FREE_BRIDGE_RELAY_PORT`, but the code reads `PORT` (`relay.mjs:2237`).
+  Following the advice has no effect. Left as a follow-up, not fixed here.
