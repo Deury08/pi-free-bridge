@@ -871,6 +871,9 @@ export function bumpWarp429Streak(streak, status, egress) {
  *  window as an exhausted quota — so a 429 on its own confirms nothing.
  *
  *  Ranked by the evidence the relay holds, never by the vendor's label:
+ *  - the local egress is parked after burning its own quota: that IS the answer,
+ *    and reporting "undetermined" while the relay has already parked the exit
+ *    hides the one fact it knows for certain.
  *  - two consecutive warp 429s: the exit is not the variable, so rotating is
  *    not the answer; the id or the contract is.
  *  - an id the relay could not vouch for (`env`, `config`): suspect, because a
@@ -878,7 +881,13 @@ export function bumpWarp429Streak(streak, status, egress) {
  *  - otherwise: undetermined. One rotation separates quota from the rest, and
  *    reporting "quota" before it is the false negative that cost this project
  *    five chained diagnoses. */
-export function classifyGate429({ sessionSource, warp429Streak = 0 } = {}) {
+export function classifyGate429({ sessionSource, warp429Streak = 0, parkedSeconds = 0 } = {}) {
+	if (parkedSeconds > 0) {
+		return {
+			cause: "egress_parked",
+			detail: `the local egress spent its own free quota and stays parked for another ${parkedSeconds}s: route through warp or wait, and stop suspecting the id`,
+		};
+	}
 	if (warp429Streak >= 2) {
 		return {
 			cause: "not_egress",
@@ -2202,7 +2211,11 @@ export async function handle(req, res, config) {
 			warp429Streak: warp429Streak,
 			// Gate-decode S3: `FreeUsageLimitError` is not evidence of quota. This field
 			// carries what the relay can justify, not the label the vendor chose.
-			gate429: classifyGate429({ sessionSource: config.sessionSource, warp429Streak }),
+			gate429: classifyGate429({
+				sessionSource: config.sessionSource,
+				warp429Streak,
+				parkedSeconds: Math.max(0, Math.ceil((localParkedUntil - Date.now()) / 1000)),
+			}),
 			warpRecycles: warpRecycles,
 			warpResends: warpResends,
 			// The ladder is invisible from outside for a different reason than the

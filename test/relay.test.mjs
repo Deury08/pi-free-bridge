@@ -567,8 +567,19 @@ test("classifyGate429: an unverified session id is the first suspect", () => {
 	}
 });
 
-test("classifyGate429: two warp 429s rule the egress out", () => {
-	const result = classifyGate429({ sessionSource: "service", warp429Streak: 2 });
+test("classifyGate429: a parked egress is the answer, not a mystery", () => {
+	const result = classifyGate429({ sessionSource: "service", parkedSeconds: 64097 });
+
+	assert.equal(result.cause, "egress_parked");
+	assert.match(result.detail, /64097s/);
+	// It outranks every weaker guess: the relay already parked the exit itself.
+	assert.equal(
+		classifyGate429({ sessionSource: "env", warp429Streak: 5, parkedSeconds: 10 }).cause,
+		"egress_parked",
+	);
+});
+
+test("classifyGate429: two warp 429s rule the egress out", () => {	const result = classifyGate429({ sessionSource: "service", warp429Streak: 2 });
 
 	assert.equal(result.cause, "not_egress");
 });
