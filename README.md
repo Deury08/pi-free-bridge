@@ -599,20 +599,39 @@ modelos, así que ése es el contrato real. Es un default del provider aplicado 
 `requiresReasoningContentForToolCalls: true` + `thinkingFormat: "zai"`. No se
 aplica a `nvidia` ni a `opencode-go`, donde `developer` puede ser correcto.
 
-**Session id:** el gate rechaza ids autogenerados (`ses_<hex><base62>`,
-`ses_000…`, basura) y no existe endpoint para crear sesiones. El paquete **no
-incluye** ningún id: el relay cosecha uno del store local de OpenCode al
-arrancar, en este orden:
+**Session id:** el id lo genera el **cliente**, no el proveedor. Es `ses_` + 12
+hex de un contador de milisegundos (+ secuencia intra-ms) + 14 caracteres
+alfanuméricos aleatorios, tal como lo arma
+`packages/schema/src/identifier.ts` de OpenCode. Nada lo firma ni lo registra:
+verificado reproduciendo 8 ids reales de `session_v2` con esa fórmula (8/8). Por
+eso el formato importa — los 12 primeros **tienen** que ser hex — pero ninguna
+máquina necesita tener OpenCode para conseguirlo.
+
+El paquete **no incluye** ningún id. El relay lo resuelve al arrancar, en este
+orden:
 
 1. `RELAY_SESSION` — sólo lo setea la extensión cuando hay un override explícito.
-2. La sesión más nueva de `~/.local/share/opencode/opencode.db`
-   (`select id from session order by time_created desc limit 5`, primero que
-   empiece con `ses_`). Se abre en modo lectura y cualquier falla se ignora.
-3. El archivo `ses_*.json` más reciente por mtime en
+2. `RELAY_SESSION_PI` — el id que la extensión cosechó en la máquina de Pi.
+3. **El servidor local de OpenCode** — se lee
+   `~/.local/state/opencode/service.json` (respeta `XDG_STATE_HOME`) y se hace
+   `POST {url}/api/session` con Basic `opencode:<password>`. Su id es el que el
+   gate acepta (medido 5/5), así que es la fuente principal. **Nunca se
+   arranca el daemon**: si el archivo falta, está viejo o el puerto rechaza, se
+   sigue de largo (el rechazo tarda ~9 ms, no 2 s).
+4. La sesión más nueva de `~/.local/share/opencode/opencode.db`, en la tabla
+   `session_v2` (v1 usaba `session`); si una no existe se prueba la otra. Se
+   abre en modo lectura y cualquier falla se ignora.
+5. El archivo `ses_*.json` más reciente por mtime en
    `~/.local/share/opencode/storage/session_diff/`.
+6. **Genera uno** con el mismo algoritmo de OpenCode (`source: "generated"`).
 
-Si ninguno existe, el relay no arranca y escribe una sola línea accionable:
-corré OpenCode una vez o seteá `PI_FREE_BRIDGE_SESSION_ID`.
+Las sesiones que emite el servidor local persisten en `opencode.db` igual que
+las de uso real, así que el paso 4 las encuentra cuando el paso 3 no está
+disponible.
+
+El paso 6 es el que hace que una máquina **sin OpenCode instalado** arranque el
+relay en vez de fallar. Antes el relay se negaba a arrancar con una línea
+pidiendo correr OpenCode; ahora genera el id y sigue.
 
 Para forzar otro id:
 

@@ -215,3 +215,192 @@ Caveat: that directory is temporary. Anything worth keeping must move into the r
 - The upstream allowlist can change again. This is a compatibility shim, not a fix.
 - The `<env>` requirement may be a hygiene heuristic rather than a hard contract; only the positive and negative cases above are proven.
 - `repro.mjs` in this repo runs on **node** with a short system prompt, so it now always fails. It no longer reflects reality and should be rewritten or retired.
+
+---
+
+## 9. Re-measured 2026-11-12: `FreeUsageLimitError` is not evidence of quota
+
+Section 8's limits are now partly closed, and one of them was wrong in a way that
+matters operationally.
+
+### 9.1 One error code, three unrelated causes
+
+`429 {"type":"error","error":{"type":"FreeUsageLimitError", …}}` is the vendor's
+answer for **all** of the following. `retry-after` does **not** separate them: it
+carried the same 00:00-UTC window in every case, so a header-only heuristic
+cannot tell them apart.
+
+| Id origin | Contract | Result |
+|---|---|---|
+| Real OpenCode usage (`ses_e321cfd0…`) | correct | `200 SSE-CHUNK` |
+| Issued by the local server via `POST /api/session`, **never used** (5 ids) | correct | `200 SSE-CHUNK` (5/5) |
+| Fabricated `ses_` + 26 chars from the real alphabet | correct | `429` |
+| `no-soy-un-id`, `ses_` alone, empty string | correct | `429` |
+| Real id | `user-agent: opencode/1.19.0`, no `<env>` block | `429` |
+| Real id | `Platform: linux` instead of `win32` | `200 SSE-CHUNK` |
+
+### 9.2 What that corrects
+
+- **A correct-looking id is not enough, but the discriminator is unknown.**
+  A fabricated `ses_` plus 26 characters drawn from the real alphabet is
+  rejected, while ids the local generator emits are accepted. What the gate
+  reads *inside* the string — a checksum, an embedded timestamp, a machine
+  component — is **not** known. Calling it a "registry" was wrong: the local
+  server never contacts the vendor, so the vendor cannot be checking against
+  ids it issued. Section 9.4 keeps that question open.
+- **Sessions can be created.** §4's "no endpoint creates a session" is true only
+  of the remote surface (`/inference/v1/session` → 404). The **local** server
+  exposes `POST /api/session`, and its ids are accepted before they ever serve a
+  request. Scraping `opencode.db` is therefore optional, not mandatory.
+- **`Platform:` is not load-bearing.** `linux` passes, so the hardcoded `win32`
+  is cosmetic rather than a gate requirement. Left as a follow-up.
+- **The `user-agent` format is tolerant, and an earlier reading of it was
+  wrong.** The probe behind "`1.19.3` passes where `1.19.0` does not" changed
+  two variables at once: that case also dropped the `<env>` block. Measured
+  separately (section 9.7), the version digit does not decide anything. What is
+  load-bearing is the `<env>` block and the `tools` array.
+
+### 9.3 Method note that cost a full round
+
+The first probe round measured from **Node**, without the `<env>` block, and
+reported `FreeUsageLimitError` for every case — including the control. That was
+a false negative: the relay exists precisely because the gate rejects Node's
+TLS ClientHello, and the `<env>` block is part of the accepted contract. A
+measurement only counts when it reproduces the relay's real request shape:
+
+```
+Bun egress
+user-agent: opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14
+system message includes <env>\n  Working directory: …\n  Platform: …\n</env>
+headers: content-type, user-agent, authorization: Bearer <any>,
+         x-opencode-session + x-opencode-session-id (same value)
+```
+
+Anything else gets the same 429 that means "quota" in every existing document.
+That is how five chained diagnoses stayed misattributed at once.
+
+### 9.4 The id is generated locally, so nothing needs harvesting
+
+OpenCode builds session ids in `packages/schema/src/identifier.ts`, and
+`SessionID.create` is simply `"ses_" + descending()`:
+
+```ts
+const length = 26
+const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+export function create(descending: boolean, timestamp = Date.now()) {
+  if (timestamp !== lastTimestamp) { lastTimestamp = timestamp; counter = 0 }
+  counter++
+  const current = BigInt(timestamp) * 0x1000n + BigInt(counter)
+  const value = descending ? ~current : current
+  const time = Array.from({ length: 6 }, (_, index) =>
+    Number((value >> BigInt(40 - 8 * index)) & 0xffn).toString(16).padStart(2, "0")).join("")
+  const bytes = crypto.getRandomValues(new Uint8Array(length - 12))
+  return time + Array.from(bytes, (byte) => chars[byte % 62]).join("")
+}
+```
+
+So an id is `ses_` + twelve hex characters encoding a truncated millisecond
+counter plus a per-millisecond sequence, plus fourteen base62 characters of
+randomness. **Nothing about it is registered, signed or issued by anyone.**
+
+Verified against real data: eight ids read from `session_v2` were reproduced
+exactly with this formula, once the timestamp was allowed to fall up to 12 ms
+before `time_created` (the row is inserted after the id is made). 8/8.
+
+| Question | Answer |
+|---|---|
+| Does the id need a running daemon? | No |
+| Does it need `service.json` or the local API? | No |
+| Does it need `opencode.db` or `session_diff`? | No |
+| Does the target machine need OpenCode installed? | No |
+| Does it need a binary shipped alongside the bridge? | No |
+
+The relay now generates the id when nothing can be harvested (`source:
+"generated"`). That is what makes a machine which has never installed OpenCode
+start the relay instead of failing with advice to run it.
+
+This also settles the idea of launching a copied daemon purely as an id factory.
+It works — `OPENCODE_PASSWORD=<pw> opencode serve --stdio` prints
+`{"url":…}` and accepts `POST {url}/api/session` — but it is strictly worse than
+the generator: a process to start and reap, a binary to distribute, and a table
+of platform artifacts to maintain, all to reproduce fifteen lines that are
+already written down in the upstream source.
+
+### 9.5 Correcting the earlier negative measurement
+
+The probes that appeared to prove "a fabricated id is rejected" used
+`ses_ZZZZZZZZZZZZZZZZZZZZZZZZZZ`. `Z` is not a hex digit, so those ids were
+**malformed**, not unregistered. The same applies to any probe that drew all
+26 characters from the base62 alphabet, because the first twelve must be hex.
+Those results carry no information about whether a well-formed id is accepted.
+
+What remained unverified at that point was whether the gate accepts a correctly
+generated id. Section 9.6 settles it. Note
+what would have to be true for it to fail: the vendor would have to validate a
+value that, by construction, carries no signature and is produced entirely on
+the client. To close it, after 00:00 UTC send **one generated id and one
+known-good control in the same run** — the control is what makes the result
+readable at all.
+
+### 9.6 Result: a generated id is accepted (measured through the relay)
+
+Two relay instances were started with `HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`
+and `XDG_CONFIG_HOME` pointing at directories that were never even created —
+no `opencode.db`, no `service.json`, no OpenCode anywhere on either path. Both
+reported `sessionSource: "generated"`.
+
+| Relay | Egress | Session id | Result |
+|---|---|---|---|
+| A | local | `ses_e31910589ffetdmY19DkHMOxi9` (generated) | `429 FreeUsageLimitError` |
+| B | warp (`RELAY_WARP_MODE=on`) | generated | `200`, six chunks, `finish_reason: "stop"`, `content: "OK"` |
+
+A generated id therefore needs nothing external, and the 429 on relay A was the
+**per-IP daily quota**, not the id: the same generator produced an id that
+completed a request the moment it left through a different exit. Relay A's log
+records the relay parking that egress itself —
+`local egress parked for 64097s after its own 429`.
+
+Two operational notes from the same run:
+
+- The relay ties its lifetime to stdin (`relay.mjs:2290`): started with stdin on
+  `/dev/null` it prints its listening line and exits immediately. Any supervisor
+  must hold the pipe open.
+- The `EADDRINUSE` message tells the operator to set
+  `PI_FREE_BRIDGE_RELAY_PORT`, but the code reads `PORT` (`relay.mjs:2237`).
+  Following the advice has no effect. Left as a follow-up, not fixed here.
+
+### 9.7 Result: the bridge can take its identity from the installed v2
+
+Two questions were measured through the relay itself, so the `<env>` block, the
+`tools` array, the five headers, the Bun TLS fingerprint and the warp exit were
+all supplied by the real code path; only `RELAY_USER_AGENT` changed.
+
+| User-agent | Result |
+|---|---|
+| `opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14` (control) | `200` |
+| `opencode/stable/2.2.7/opencode` (v2 format) | `200` |
+| `opencode/2.2.7/opencode` | `200` |
+
+That v2 format is not a guess: `App.useragent` in `packages/core/src/app.ts`
+builds exactly `opencode/${channel}/${version}/${name}`. So a relay that reads
+`service.json` can derive its user-agent instead of pinning one, and the pinned
+v1 string stays as the fallback when OpenCode is absent.
+
+The model catalog is readable from the same install. `kv` holds
+`models-dev:v2:catalog` (11.3 MB) whose value is `{ updatedAt, digest, body }`,
+with `body` a JSON string; alongside it `models-dev:v2:catalog:meta` carries an
+etag. Sampled 2026-11-12T04:17Z — the same day — it lists **67** entries whose id
+ends in `-free`, against the 8 the repository snapshot carries.
+
+That 67 is the registry, **not** the usable set: the free tier advertises 11 via
+`/inference/v1/models`, and the snapshot is a stale subset of those. So reading
+the v2 catalog buys fresher metadata and a wider registry; it does not widen what
+the free tier will serve.
+
+### 9.8 What still has to be written by hand
+
+Small and stable, and no install can supply them: the `<env>` block, the `tools`
+array, and the five request headers. Everything else — the session id, the
+user-agent, the model registry — can come from either the generator or the
+install.
