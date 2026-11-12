@@ -31,7 +31,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.4
 
       - name: Compile
         run: bun build --compile --target=${{ matrix.target }} relay.mjs --outfile dist/${{ matrix.asset }}
@@ -67,6 +67,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # A downloaded binary that will be executed needs something to compare
+      # against. Without this file a consumer can only trust the transport.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:
