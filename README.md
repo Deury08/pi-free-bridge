@@ -599,11 +599,16 @@ modelos, así que ése es el contrato real. Es un default del provider aplicado 
 `requiresReasoningContentForToolCalls: true` + `thinkingFormat: "zai"`. No se
 aplica a `nvidia` ni a `opencode-go`, donde `developer` puede ser correcto.
 
-**Session id:** el gate valida el id contra el registro de OpenCode, no contra
-su forma. Medido el 2026-11-12: un `ses_<hex><base62>` fabricado da 429, y uno
-emitido por el servidor **local** da 200 aunque nunca haya servido un request
-(5 de 5). El paquete **no incluye** ningún id: el relay lo resuelve al arrancar,
-en este orden:
+**Session id:** el id lo genera el **cliente**, no el proveedor. Es `ses_` + 12
+hex de un contador de milisegundos (+ secuencia intra-ms) + 14 caracteres
+alfanuméricos aleatorios, tal como lo arma
+`packages/schema/src/identifier.ts` de OpenCode. Nada lo firma ni lo registra:
+verificado reproduciendo 8 ids reales de `session_v2` con esa fórmula (8/8). Por
+eso el formato importa — los 12 primeros **tienen** que ser hex — pero ninguna
+máquina necesita tener OpenCode para conseguirlo.
+
+El paquete **no incluye** ningún id. El relay lo resuelve al arrancar, en este
+orden:
 
 1. `RELAY_SESSION` — sólo lo setea la extensión cuando hay un override explícito.
 2. `RELAY_SESSION_PI` — el id que la extensión cosechó en la máquina de Pi.
@@ -618,14 +623,15 @@ en este orden:
    abre en modo lectura y cualquier falla se ignora.
 5. El archivo `ses_*.json` más reciente por mtime en
    `~/.local/share/opencode/storage/session_diff/`.
+6. **Genera uno** con el mismo algoritmo de OpenCode (`source: "generated"`).
 
 Las sesiones que emite el servidor local persisten en `opencode.db` igual que
 las de uso real, así que el paso 4 las encuentra cuando el paso 3 no está
 disponible.
 
-Si ninguno existe, el relay no arranca y escribe una sola línea accionable:
-corré `opencode service start`, corré OpenCode una vez, o seteá
-`PI_FREE_BRIDGE_SESSION_ID`.
+El paso 6 es el que hace que una máquina **sin OpenCode instalado** arranque el
+relay en vez de fallar. Antes el relay se negaba a arrancar con una línea
+pidiendo correr OpenCode; ahora genera el id y sigue.
 
 Para forzar otro id:
 

@@ -331,6 +331,57 @@ export async function resolveSessionFromStore({ shareDir = openCodeShareDir() } 
  *  Pi-harvested id, then the local server, then the relay's local store.
  *  Exported for tests; takes the store root and the minter as arguments so
  *  tests can inject a temp store and a fake server. */
+// ---------------------------------------------------------------------------
+// Generating the session id (gate-decode S8)
+// ---------------------------------------------------------------------------
+//
+// OpenCode builds its session ids in `packages/schema/src/identifier.ts`:
+//
+//     current = BigInt(timestamp) * 0x1000n + BigInt(counter)
+//     value   = descending ? ~current : current
+//     id      = "ses_" + sixHexBytes(value) + fourteenBase62(random)
+//
+// Reproduced against eight real ids read from `session_v2`: all eight matched
+// once the timestamp was allowed to sit up to 12 ms before `time_created`, which
+// is just the row being inserted after the id is made. So the generator is the
+// source of truth, and every other source — `service.json`, the local API, the
+// SQLite scrape — was an approximation of it. This needs no daemon, no store, no
+// running OpenCode and no binary to ship.
+//
+// It also corrects an earlier reading of the measurements: `ses_` plus 26 base62
+// characters is NOT sufficient, because the first twelve must be hex. The
+// negative probes used non-hex characters (`ses_ZZZZ…`), so they failed as
+// malformed rather than as unregistered.
+const SESSION_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let lastSessionIdMs = 0;
+let sessionIdCounter = 0;
+
+/** Reproduces OpenCode's own session id byte for byte.
+ *
+ *  The counter disambiguates ids minted inside the same millisecond, exactly as
+ *  the original does, so a burst never collides. `random` is injectable so a
+ *  test can pin the suffix while keeping the encoded prefix observable. */
+export function generateSessionId(
+	timestamp = Date.now(),
+	random = (bytes) => crypto.getRandomValues(bytes),
+) {
+	if (timestamp !== lastSessionIdMs) {
+		lastSessionIdMs = timestamp;
+		sessionIdCounter = 0;
+	}
+	sessionIdCounter++;
+	const current = BigInt(timestamp) * 0x1000n + BigInt(sessionIdCounter);
+	const value = ~current;
+	let out = "";
+	for (let index = 0; index < 6; index++) {
+		out += Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+			.toString(16)
+			.padStart(2, "0");
+	}
+	for (const byte of random(new Uint8Array(14))) out += SESSION_ID_ALPHABET[byte % 62];
+	return "ses_" + out;
+}
+
 export async function resolveRelaySession({
 	shareDir,
 	mintSession = mintSessionFromService,
@@ -358,7 +409,12 @@ export async function resolveRelaySession({
 	if (minted && SESSION_ID.test(minted)) {
 		return { sessionId: minted, source: "service" };
 	}
-	return resolveSessionFromStore(shareDir ? { shareDir } : {});
+	// Gate-decode S8: nothing to harvest, so generate. The id is the one OpenCode
+	// itself would have written, which means a machine that has never installed
+	// OpenCode now starts the relay instead of failing with advice to run it.
+	const fromStore = await resolveSessionFromStore(shareDir ? { shareDir } : {});
+	if (fromStore?.sessionId) return fromStore;
+	return { sessionId: generateSessionId(), source: "generated" };
 }
 
 // ---------------------------------------------------------------------------

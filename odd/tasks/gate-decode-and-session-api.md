@@ -14,6 +14,8 @@ Branch: `feat/gate-decode-and-session-api`.
 - **S6** — "corrigelo los dos": both improvements ship together.
 - **S7** — the local service must never be spawned by the relay. Absent or stale registration falls through to the existing harvest; `/free-bridge-doctor` names the manual command.
 
+- **S8** — The session id is generated, not harvested. OpenCode builds it in `packages/schema/src/identifier.ts` as `ses_` + 12 hex (a truncated millisecond counter plus an intra-millisecond sequence) + 14 base62 random characters. Reproduced 8/8 against real ids in `session_v2`. When nothing can be harvested the relay generates one, so a machine with no OpenCode starts instead of refusing. No daemon, binary, store or local API is involved.
+
 ## Tasks
 
 - T1 — Session id from the local service API, inserted between `pi-harvest` and the store harvest (S4, S7) — commit `feat(relay): mint the session id from the local OpenCode service`
@@ -22,6 +24,7 @@ Branch: `feat/gate-decode-and-session-api`.
 - T4 — Docs: `GATE-DIAGNOSIS.md` 429 decode table, `HANDOFF.md` contract re-measurement, `README.md` session source (S1, S3) — commit `docs: record the measured gate contract and the 429 decode`
 - T5 — Suite green (170 existing + new) and the change reviewed against the four lenses (S6)
 
+- T6 — Reproduce OpenCode's id generator as the final fallback (S8) — commit `feat(relay): generate the session id instead of requiring OpenCode`
 ## Log
 
 - **L1** — "mira los demas md y la carpeta con la copia de opencode 2 para ver como podemos mejorar este bridge"
@@ -35,3 +38,6 @@ Branch: `feat/gate-decode-and-session-api`.
 - **L9** — T3 dropped by the operator's decision. `test/relay.test.mjs:740` already pins `needsWarpRecycle(9) === true` with the note "the count never expires into a blocker", and `relay.mjs:850` records S12's reasoning (a second 429 is a second signal; the rotation is guarded by single-flight, not a clock). No measurement refutes that, and the request itself said the retry must not change. The diagnosis survives in `/health.gate429`; the ladder stays byte-identical.
 - **L10** — `Platform: win32` in the `<env>` block is not load-bearing: `Platform: linux` also returned 200 SSE-CHUNK (2026-11-12). Recorded as a follow-up, not fixed here.
 - **L11** — Slice boundary: the feature landed as **one commit of 595 authored lines** (`401cbeb`) covering T1 and T2 together. A file-level split was not possible: `relay.mjs` carries both behaviours and `test/relay.test.mjs` covers both, so splitting by file would leave a commit that does not build. Splitting by hunk would have staged a half-populated module. Delivery decision: one PR at 595 lines, or split by concern (session API separated from the 429 decode) if the reviewer prefers two — the two halves touch disjoint functions, so the split is mechanical if wanted.
+- **L12** — "pero si analisas el daemon para cosechar tu la id?" — steering the design away from spawning a copied daemon and toward reading the generator itself.
+- **L13** — Decision: the generator beats the daemon. `OPENCODE_PASSWORD=<pw> opencode serve --stdio` was found to be a viable id factory (it prints `{"url":…}` and accepts `POST /api/session`, and only `--service` writes `service.json`), but it costs a process, a binary to distribute and a platform artifact table to reproduce fifteen lines already present upstream. Not implemented.
+- **L14** — Correction: the earlier negative probe (`ses_ZZZZ…`) measured a *malformed* id, because `Z` is not hex, not an unregistered one. Recorded in `GATE-DIAGNOSIS.md` 9.5 so the wrong conclusion is not inherited.

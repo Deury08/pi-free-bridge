@@ -276,38 +276,66 @@ headers: content-type, user-agent, authorization: Bearer <any>,
 Anything else gets the same 429 that means "quota" in every existing document.
 That is how five chained diagnoses stayed misattributed at once.
 
-### 9.4 Open question: is a minted id portable to another machine?
+### 9.4 The id is generated locally, so nothing needs harvesting
 
-The practical case: mint ids on one machine that runs the OpenCode service, then
-use the bridge on a machine that has no OpenCode at all. Transport already works
-— the id is just a string, carried by `RELAY_SESSION` or
-`PI_FREE_BRIDGE_SESSION_ID`. What is **not** proven is whether the gate accepts
-a string minted elsewhere.
+OpenCode builds session ids in `packages/schema/src/identifier.ts`, and
+`SessionID.create` is simply `"ses_" + descending()`:
 
-The reasoning narrows it down without settling it. The local server inserts the
-row into its own SQLite store and never calls the vendor, so the vendor's first
-sight of that id is the request itself — its acceptance cannot depend on having
-issued it. That leaves the string's own contents, and two ids sampled here
-(`ses_e321cfd0effe…`, `ses_e31a219e1ffe…`) share a 2-hex prefix, which is
-suggestive but far from decisive.
+```ts
+const length = 26
+const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-Attempted 2026-11-12 and **inconclusive**: minted id, known-good id and garbage
-all returned 429 in the same window, including the known-good id under a normal
-environment. The gate was closed by that day's probing, so the run carried no
-working control and proves nothing. Do not read it as "not portable".
+export function create(descending: boolean, timestamp = Date.now()) {
+  if (timestamp !== lastTimestamp) { lastTimestamp = timestamp; counter = 0 }
+  counter++
+  const current = BigInt(timestamp) * 0x1000n + BigInt(counter)
+  const value = descending ? ~current : current
+  const time = Array.from({ length: 6 }, (_, index) =>
+    Number((value >> BigInt(40 - 8 * index)) & 0xffn).toString(16).padStart(2, "0")).join("")
+  const bytes = crypto.getRandomValues(new Uint8Array(length - 12))
+  return time + Array.from(bytes, (byte) => chars[byte % 62]).join("")
+}
+```
 
-Decisive experiment, to run after the quota window resets (00:00 UTC):
+So an id is `ses_` + twelve hex characters encoding a truncated millisecond
+counter plus a per-millisecond sequence, plus fourteen base62 characters of
+randomness. **Nothing about it is registered, signed or issued by anyone.**
 
-1. Mint one id on machine A.
-2. From machine B — or from the same machine with `HOME`, `XDG_DATA_HOME` and
-   `XDG_STATE_HOME` pointed at empty directories, which leaves no
-   `service.json` and no `opencode.db` reachable — send the relay's exact
-   request shape with that id.
-3. **In the same run**, send a known-good control id and a garbage id.
-   - control 200, minted 200, garbage 429 → portable.
-   - control 200, minted 429 → not portable; something machine-bound is inside
-     the id.
-   - control 429 → quota closed again; the run is void, repeat later.
+Verified against real data: eight ids read from `session_v2` were reproduced
+exactly with this formula, once the timestamp was allowed to fall up to 12 ms
+before `time_created` (the row is inserted after the id is made). 8/8.
 
-The control is mandatory. Without it every fault returns the same
-`FreeUsageLimitError`, which is the trap the rest of this document is about.
+| Question | Answer |
+|---|---|
+| Does the id need a running daemon? | No |
+| Does it need `service.json` or the local API? | No |
+| Does it need `opencode.db` or `session_diff`? | No |
+| Does the target machine need OpenCode installed? | No |
+| Does it need a binary shipped alongside the bridge? | No |
+
+The relay now generates the id when nothing can be harvested (`source:
+"generated"`). That is what makes a machine which has never installed OpenCode
+start the relay instead of failing with advice to run it.
+
+This also settles the idea of launching a copied daemon purely as an id factory.
+It works — `OPENCODE_PASSWORD=<pw> opencode serve --stdio` prints
+`{"url":…}` and accepts `POST {url}/api/session` — but it is strictly worse than
+the generator: a process to start and reap, a binary to distribute, and a table
+of platform artifacts to maintain, all to reproduce fifteen lines that are
+already written down in the upstream source.
+
+### 9.5 Correcting the earlier negative measurement
+
+The probes that appeared to prove "a fabricated id is rejected" used
+`ses_ZZZZZZZZZZZZZZZZZZZZZZZZZZ`. `Z` is not a hex digit, so those ids were
+**malformed**, not unregistered. The same applies to any probe that drew all
+26 characters from the base62 alphabet, because the first twelve must be hex.
+Those results carry no information about whether a well-formed id is accepted.
+
+What remains genuinely unverified is whether the gate accepts a correctly
+generated id, and that cannot be tested while the quota window is closed. Note
+what would have to be true for it to fail: the vendor would have to validate a
+value that, by construction, carries no signature and is produced entirely on
+the client. To close it, after 00:00 UTC send **one generated id and one
+known-good control in the same run** — the control is what makes the result
+readable at all.

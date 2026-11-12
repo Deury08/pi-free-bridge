@@ -28,6 +28,7 @@ import {
 	ensureEnvBlock,
 	forwardedHeaders,
 	ensureGateTools,
+	generateSessionId,
 	harvestNewestSessionId,
 	mintSessionFromService,
 	parseServiceRegistration,
@@ -575,6 +576,49 @@ test("classifyGate429: two warp 429s rule the egress out", () => {
 test("classifyGate429: a registry-backed id on the first 429 stays undetermined", () => {
 	assert.equal(classifyGate429({ sessionSource: "service", warp429Streak: 1 }).cause, "undetermined");
 	assert.equal(classifyGate429({ sessionSource: "opencode.db" }).cause, "undetermined");
+});
+
+// ---------------------------------------------------------------------------
+// generateSessionId: OpenCode's own generator, reproduced (gate-decode S8)
+// ---------------------------------------------------------------------------
+//
+// `packages/schema/src/identifier.ts` is the source. These tests pin the three
+// properties that make the generated id indistinguishable from a real one: the
+// shape, the encoded timestamp, and the per-millisecond counter.
+
+const zeros = (bytes) => bytes.fill(0);
+
+test("generateSessionId: the shape is 12 hex followed by 14 base62", () => {
+	const id = generateSessionId(1794463622689, zeros);
+
+	assert.match(id, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+});
+
+test("generateSessionId: the prefix decodes back to its timestamp", () => {
+	const timestamp = 1794463700001;
+	const id = generateSessionId(timestamp, zeros);
+	const low48 = BigInt(`0x${id.slice(4, 16)}`);
+	const current = 0xffffffffffffn - low48; // value is ~current
+
+	// The low 12 bits are the counter, the rest is the timestamp modulo 2^36.
+	assert.equal(current % 0x1000n, 1n, "the first id of a millisecond carries counter 1");
+	assert.equal((current - 1n) / 0x1000n, BigInt(timestamp) % 2n ** 36n);
+});
+
+test("generateSessionId: a burst in one millisecond never repeats", () => {
+	const timestamp = 1794463800002;
+	const ids = new Set(Array.from({ length: 50 }, () => generateSessionId(timestamp, zeros)));
+
+	assert.equal(ids.size, 50, "the counter disambiguates ids minted in the same ms");
+});
+
+test("resolveRelaySession: an empty machine falls back to a generated id", async () => {
+	const shareDir = mkdtempSync(join(tmpdir(), "pfb-empty-"));
+
+	const result = await resolveRelaySession({ shareDir, mintSession: noService });
+
+	assert.equal(result.source, "generated");
+	assert.match(result.sessionId, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
 });
 
 // ---------------------------------------------------------------------------
