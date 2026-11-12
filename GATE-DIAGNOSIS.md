@@ -254,8 +254,11 @@ cannot tell them apart.
   request. Scraping `opencode.db` is therefore optional, not mandatory.
 - **`Platform:` is not load-bearing.** `linux` passes, so the hardcoded `win32`
   is cosmetic rather than a gate requirement. Left as a follow-up.
-- **The `user-agent` version digit is load-bearing.** `1.19.3` passes where
-  `1.19.0` does not, with everything else identical.
+- **The `user-agent` format is tolerant, and an earlier reading of it was
+  wrong.** The probe behind "`1.19.3` passes where `1.19.0` does not" changed
+  two variables at once: that case also dropped the `<env>` block. Measured
+  separately (section 9.7), the version digit does not decide anything. What is
+  load-bearing is the `<env>` block and the `tools` array.
 
 ### 9.3 Method note that cost a full round
 
@@ -366,3 +369,38 @@ Two operational notes from the same run:
 - The `EADDRINUSE` message tells the operator to set
   `PI_FREE_BRIDGE_RELAY_PORT`, but the code reads `PORT` (`relay.mjs:2237`).
   Following the advice has no effect. Left as a follow-up, not fixed here.
+
+### 9.7 Result: the bridge can take its identity from the installed v2
+
+Two questions were measured through the relay itself, so the `<env>` block, the
+`tools` array, the five headers, the Bun TLS fingerprint and the warp exit were
+all supplied by the real code path; only `RELAY_USER_AGENT` changed.
+
+| User-agent | Result |
+|---|---|
+| `opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14` (control) | `200` |
+| `opencode/stable/2.2.7/opencode` (v2 format) | `200` |
+| `opencode/2.2.7/opencode` | `200` |
+
+That v2 format is not a guess: `App.useragent` in `packages/core/src/app.ts`
+builds exactly `opencode/${channel}/${version}/${name}`. So a relay that reads
+`service.json` can derive its user-agent instead of pinning one, and the pinned
+v1 string stays as the fallback when OpenCode is absent.
+
+The model catalog is readable from the same install. `kv` holds
+`models-dev:v2:catalog` (11.3 MB) whose value is `{ updatedAt, digest, body }`,
+with `body` a JSON string; alongside it `models-dev:v2:catalog:meta` carries an
+etag. Sampled 2026-11-12T04:17Z — the same day — it lists **67** entries whose id
+ends in `-free`, against the 8 the repository snapshot carries.
+
+That 67 is the registry, **not** the usable set: the free tier advertises 11 via
+`/inference/v1/models`, and the snapshot is a stale subset of those. So reading
+the v2 catalog buys fresher metadata and a wider registry; it does not widen what
+the free tier will serve.
+
+### 9.8 What still has to be written by hand
+
+Small and stable, and no install can supply them: the `<env>` block, the `tools`
+array, and the five request headers. Everything else — the session id, the
+user-agent, the model registry — can come from either the generator or the
+install.
