@@ -67,9 +67,9 @@ S7. Constraints unchanged: no wire changes, no touching
 | T2 | S1, S3, S4 | inline | done — commit `ad35cf0` |
 | T3 | S3, S6 | inline | done — commit `ad35cf0` |
 | T4 | S3, S6 | inline | done — commit `ad35cf0` |
-| T5 | S5 | inline | done — commit `ad35cf0` |
+| T5 | S5 | inline | done — commits `ad35cf0`, `8bae10b` |
 | T6 | S1 | inline | done — commit `ad35cf0` (the old versioned-name helper and `restartRelayWithConfiguredBin` are gone) |
-| T7 | S5 | inline | done — commit `RELATEDOCS` |
+| T7 | S5 | inline | done — commit `5ed4c62` |
 
 ## Log
 
