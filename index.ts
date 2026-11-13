@@ -2349,9 +2349,28 @@ export default async function (pi: ExtensionAPI) {
 
 	const session = resolveSessionId();
 	const live = resolveLiveIds();
-	// The catalog comes from the service itself, never from the OpenCode cache
-	// file: that file only exists on a machine that already has OpenCode, which
-	// is the opposite of the machine this bridge is for.
+
+	// The relay first, then its catalog: the extension no longer has a door of
+	// its own to the service, so asking for models before the relay exists is
+	// asking a process that is not running. Starting it here also keeps the
+	// original intent (the first real request never pays the spawn cost).
+	// A failure is reported once and retried on the first real request; it must
+	// never take Pi down at startup.
+	if (process.env.PI_FREE_BRIDGE_DRY_RUN !== "1") {
+		await ensureRelay({
+			port: RELAY_PORT,
+			sessionId: session.sessionId,
+			sessionSource: session.source,
+			upstream: UPSTREAM_URL,
+			cwd: process.cwd(),
+		}).catch((err) => {
+			console.error(`pi-free-bridge: relay not ready — ${(err as Error).message}`);
+		});
+	}
+
+	// The catalog comes from the relay, never from the OpenCode cache file: that
+	// file only exists on a machine that already has OpenCode, which is the
+	// opposite of the machine this bridge is for.
 	const discovered =
 		process.env.PI_FREE_BRIDGE_SKIP_CATALOG === "1"
 			? { models: [] as RegistryModel[], source: "catalog fetch skipped", skipped: [] as string[] }
@@ -2382,21 +2401,6 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	g[REG_KEY] = true;
-
-	// Start the relay early so the first request does not pay the spawn cost.
-	// A failure is reported once and retried by gateStreamSimple on the first
-	// real request; it must never take Pi down at startup.
-	if (process.env.PI_FREE_BRIDGE_DRY_RUN !== "1") {
-		void ensureRelay({
-			port: RELAY_PORT,
-			sessionId: session.sessionId,
-			sessionSource: session.source,
-			upstream: UPSTREAM_URL,
-			cwd: process.cwd(),
-		}).catch((err) => {
-			console.error(`pi-free-bridge: relay not ready — ${(err as Error).message}`);
-		});
-	}
 
 	// Keep the picker able to see the models this bridge just registered. Silent
 	// when the scope is already healthy; this is a repair, not a notification.
