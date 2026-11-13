@@ -188,3 +188,8 @@ and someone verifying one should not have to hold the others in their head.
   readable 502 and offers nothing. Making the route walk the same egress ladder
   as `forward` is the follow-up; it was not done here because there is no
   evidence today that direct access fails (L11).
+- `cfb8bed` — the dead discovery path removed (`discoverFreeModels`,
+  `fetchLiveFreeIds`, `resolveRegistryPath`, `isFree`, `REGISTRY_PATHS`,
+  `USER_AGENT`): 76 lines out, no behaviour in. Verifiable alone: grep the
+  extension for `models.json` and find nothing. `SNAPSHOT_LIVE_FREE_IDS` stays
+  and only feeds the DRY_RUN printout, so it is no longer a catalog fallback.
