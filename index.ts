@@ -1962,269 +1962,432 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	pi.registerCommand("free-bridge-session", {
-		description: "Show or set the OpenCode session id used by the free-tier gate",
-		handler: async (args: string, ctx) => {
-			const next = args.trim();
-			if (!next) {
-				// S34: report the id actually on the wire, which may have been
-				// harvested by the relay rather than set here.
-				const health = await fetchRelayHealth(RELAY_PORT);
-				ctx.ui.notify(
-					health?.sessionId
-						? `pi-free-bridge session: ${health.sessionId} (from ${health.sessionSource})`
-						: "pi-free-bridge session: resolved at the first request by the relay — " +
-								"run OpenCode once, or set PI_FREE_BRIDGE_SESSION_ID",
-					"info",
-				);
+	// -----------------------------------------------------------------------
+	// Command surface (spec odd/tasks/relay-download.md, S1-S3).
+	//
+	// Only three commands stay registered: `free-bridge` (this menu),
+	// `free-bridge-warp-recycle` (for incidents) and `free-bridge-doctor`
+	// (direct only, never in the menu). The other capabilities still work —
+	// they are reached from the menu instead of from autocomplete, because
+	// every registered command, aliases included, costs a completion entry.
+	// -----------------------------------------------------------------------
+
+	/** The seven menu entries, in the order the owner dictated. Never reorder. */
+	const MENU_ITEMS = [
+		"Instalar / actualizar relay",
+		"Estado del relay",
+		"WARP: on / off",
+		"Reciclar WARP",
+		"Cable: v1 / v2",
+		"Modelos",
+		"Refrescar sesión",
+	] as const;
+
+	/** Named menu indices, so the dispatch never depends on a bare number. */
+	const MENU_INSTALL = 0;
+	const MENU_STATUS = 1;
+	const MENU_WARP = 2;
+	const MENU_RECYCLE = 3;
+	const MENU_WIRE = 4;
+	const MENU_MODELS = 5;
+	const MENU_REFRESH = 6;
+
+	/** ctx shape the menu needs: notify/confirm always, select when Pi offers it. */
+	type MenuCtx = WarpPromptContext & {
+		ui: { select?(title: string, options: string[]): Promise<string | undefined> };
+	};
+
+	/** Health payload fields this file reads beyond the shared type. */
+	type RelayHealthExtras = { wireMode?: string };
+
+	/** Rotate the WARP exit now. Shared by menu item 4 and the
+	 *  `free-bridge-warp-recycle` command — one body, never two copies. */
+	async function runWarpRecycle(ctx: MenuCtx): Promise<void> {
+		const before = await fetchRelayHealth(RELAY_PORT);
+		if (!before) {
+			ctx.ui.notify(
+				`pi-free-bridge: the relay does not answer on ${relayHealthUrl(RELAY_PORT)} — nothing to rotate.`,
+				"error",
+			);
+			return;
+		}
+
+		const lines = [
+			"pi-free-bridge warp recycle",
+			`  relay:   ${relayHealthUrl(RELAY_PORT)}`,
+			`  mode:    ${before.warpMode ?? "unknown"}${
+				before.warpModeSource ? ` (from ${before.warpModeSource})` : ""
+			}`,
+			`  before:  streak ${before.warp429Streak ?? 0}, ${before.warpRecycles ?? 0} recycle(s), last egress ${
+				before.lastEgress ?? "none"
+			}`,
+		];
+
+		if ((before.warpMode ?? "off") === "off") {
+			lines.push(
+				"",
+				"  warp is off, so the 429 came from the direct egress: rotating WARP",
+				"  cannot fix it. Choose «WARP: on / off» in the menu (or on) first.",
+			);
+			ctx.ui.notify(lines.join("\n"), "error");
+			return;
+		}
+
+		const outcome = await requestWarpRecycle(RELAY_PORT);
+
+		if (outcome.kind === "absent") {
+			lines.push("", "  FAILED — the relay did not accept the request.");
+			ctx.ui.notify(lines.join("\n"), "error");
+			return;
+		}
+
+		if (outcome.kind === "timeout") {
+			lines.push(
+				"",
+				"  no answer in 25s. A rotation can wait up to two minutes for responses",
+				"  still being delivered over the tunnel, and it rotates on its own when that",
+				"  wait ends. Re-run this command to read the result.",
+				"",
+				"  Heads up: if this session talks through the bridge, the rotation replaces",
+				"  the exit under your own answer. Best run from a session that does not.",
+			);
+			ctx.ui.notify(lines.join("\n"), "info");
+			return;
+		}
+
+		const body = outcome.body;
+		if (outcome.status === 404) {
+			// The route is part of the relay build, not of the extension: a 404
+			// means an older relay is answering, and calling that a refusal would
+			// send the reader looking for a step that does not exist.
+			lines.push(
+				"",
+				`  the relay on port ${RELAY_PORT} has no /warp/recycle route: it is still`,
+				"  running an older build. Restart Pi so the extension spawns the new one,",
+				"  then run this command again.",
+			);
+			ctx.ui.notify(lines.join("\n"), "error");
+			return;
+		}
+
+		// One line per step, never an aggregate verdict: the sweep is the answer
+		// (which exit it drained, what the proxy said, what the pool looks like
+		// afterwards), and a single "rotated" would hide exactly the two-exit
+		// case where one swap is the whole recovery.
+		const steps = body.steps ?? [];
+		lines.push("  steps:");
+		if (steps.length === 0) {
+			lines.push("    (the relay reported no step)");
+		}
+		for (const [index, step] of steps.entries()) {
+			const action = step.action === "swap" ? `swap ${step.exit ?? "an unnamed exit"}` : "recycle";
+			const usable =
+				typeof step.usable === "number" ? `${step.usable} usable exit(s)` : "usable count unknown";
+			lines.push(`    ${index + 1}. ${action} — ${step.outcome ?? "unknown"}, ${usable}`);
+		}
+		lines.push(
+			"",
+			`  result:  ${body.ok ? "recovered" : `stopped (${body.reason ?? "unknown"})`}`,
+			`  after:   ${body.warpRecycles ?? before.warpRecycles ?? 0} recycle(s), streak ${
+				body.warp429Streak ?? 0
+			}`,
+		);
+
+		if (!body.ok) {
+			lines.push(
+				"",
+				"  in_flight      another rotation is running right now — look again shortly.",
+				"  no_proxy       the relay has no WARP proxy configured.",
+				"  not_confirmed  the proxy took the POST but never showed a new exit.",
+				"  no_standby     the proxy has no standby exit — the pool is one exit thin.",
+				"  unavailable    the proxy has no /swap route (older build) — only a recycle is left.",
+				"  cooldown       an exit is parked for 30 minutes by the proxy; the recycle clears it.",
+			);
+		}
+
+		lines.push(
+			"",
+			"  The sweep is also what runs by itself on the next request after a warp 429;",
+			"  this command is for when it did not, or when you do not want to spend a turn.",
+		);
+		ctx.ui.notify(lines.join("\n"), body.ok ? "info" : "error");
+	}
+
+	/** Menu item 2: what the relay is doing right now. */
+	async function showRelayStatus(ctx: MenuCtx): Promise<void> {
+		const health = await fetchRelayHealth(RELAY_PORT);
+		const extras = health as (RelayHealthExtras & typeof health) | null;
+		const wireOnWire = extras?.wireMode;
+		const lines = [
+			"pi-free-bridge relay",
+			`  url:        ${RELAY_URL}`,
+			`  process:    ${describeRelay()}`,
+			`  health:     ${health ? "answering" : "not answering"} (${relayHealthUrl(RELAY_PORT)})`,
+			`  session:    ${
+				health?.sessionId
+					? `${health.sessionId} (from ${health.sessionSource})`
+					: "resolved at the first request by the relay"
+			}`,
+			`  models:     ${discovered.models.length} free from ${discovered.source}`,
+			`  warp:       ${health?.warpMode ?? resolveWarpMode()}${
+				health?.lastEgress ? ` — last egress ${health.lastEgress}` : ""
+			}`,
+			`  cable:      ${wireOnWire ?? resolveWireMode()}`,
+			`  bun:        ${resolveBunPath() ?? "not found"}`,
+			`  upstream:   ${UPSTREAM_URL}`,
+		];
+		ctx.ui.notify(lines.join("\n"), health ? "info" : "warning");
+	}
+
+	/** Menu item 6: the free models this extension registered. */
+	function showFreeModels(ctx: MenuCtx): void {
+		const lines = [
+			`pi-free-bridge: ${discovered.models.length} free models from ${discovered.source}`,
+			...discovered.models.map((m) => `  ${PROVIDER}/${m.id}`),
+		];
+		ctx.ui.notify(lines.join("\n"), "info");
+	}
+
+	/** Menu item 7: re-fetch the live free-model list and re-register the provider. */
+	async function refreshLiveModels(ctx: MenuCtx): Promise<void> {
+		ctx.ui.notify("Refreshing the live free-model list…", "info");
+		try {
+			const registryFree = new Set<string>();
+			for (const [id, meta] of Object.entries<Record<string, unknown>>(
+				JSON.parse(readFileSync(resolveRegistryPath()!, "utf-8"))?.opencode?.models ?? {},
+			)) {
+				if (isFree(meta) && !EXCLUDED_MODELS.has(id)) registryFree.add(id);
+			}
+			const liveIds = await fetchLiveFreeIds(registryFree);
+			if (liveIds.length === 0) {
+				ctx.ui.notify("The surface advertised no free models; keeping the current list", "warning");
 				return;
 			}
-			if (!/^ses_/.test(next)) {
-				ctx.ui.notify("Session id must start with ses_", "warning");
-				return;
-			}
-			const persisted = writeBridgeConfig({ sessionId: next });
-
-			// S25: restart the relay so no request can carry the previous id.
-			await stopRelay();
-			let relayNote = "";
-			try {
-				await ensureRelay({
-					port: RELAY_PORT,
-					sessionId: next,
-					sessionSource: persisted ? "config" : "env",
-					upstream: UPSTREAM_URL,
-					cwd: process.cwd(),
-				});
-			} catch (err) {
-				relayNote = ` Relay restart failed: ${(err as Error).message}`;
-			}
-
+			writeBridgeConfig({ liveIds });
+			const refreshed = discoverFreeModels(new Set(liveIds));
 			pi.registerProvider(PROVIDER, {
 				apiKey: API_KEY,
 				api: API,
 				baseUrl: RELAY_URL,
 				authHeader: true,
-				models: buildPiModels(discovered.models),
+				models: buildPiModels(refreshed.models),
 				streamSimple: gateStreamSimple,
 			});
 			ctx.ui.notify(
-				`${persisted
-					? `Session id set to ${next} and saved to ${BRIDGE_CONFIG_PATH}`
-					: `Session id set to ${next} for this session only (could not write ${BRIDGE_CONFIG_PATH})`}.${relayNote}`,
-				relayNote ? "warning" : "info",
+				`${PROVIDER} now registers ${refreshed.models.length} free models: ${refreshed.models.map((m) => m.id).join(", ")}`,
+				"info",
 			);
-		},
-	});
+		} catch (err) {
+			ctx.ui.notify(`Could not refresh: ${(err as Error).message}`, "error");
+		}
+	}
 
-	pi.registerCommand("free-bridge-refresh", {
-		description: "Re-fetch the live free-model list from OpenCode and re-register the provider",
-		handler: async (_args: string, ctx) => {
-			ctx.ui.notify("Refreshing the live free-model list…", "info");
-			try {
-				const registryFree = new Set<string>();
-				for (const [id, meta] of Object.entries<Record<string, unknown>>(
-					JSON.parse(readFileSync(resolveRegistryPath()!, "utf-8"))?.opencode?.models ?? {},
-				)) {
-					if (isFree(meta) && !EXCLUDED_MODELS.has(id)) registryFree.add(id);
+	/** Menu item 3: report the WARP mode and switch it. */
+	async function promptWarpMode(ctx: MenuCtx): Promise<void> {
+		const envOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
+		const health = await fetchRelayHealth(RELAY_PORT);
+		const onWire = health?.warpMode
+			? `relay reports ${health.warpMode}${health.lastEgress ? `, last egress ${health.lastEgress}` : ""}`
+			: "relay not running";
+		const current = resolveWarpMode();
+		const warpTarget = resolveWarpTarget();
+		ctx.ui.notify(
+			[
+				`pi-free-bridge warp: ${current} (config)${envOverride ? ` — env override wins: ${envOverride}` : ""}`,
+				onWire,
+				`target: ${describeWarpTarget(warpTarget)}`,
+				`health: ${warpTarget.healthUrl}`,
+				"off: direct only; auto: direct first, WARP on rate limit; on: always WARP.",
+			].join("\n"),
+			"info",
+		);
+
+		// Entering this item: is WARP answering? If not, launch the installed
+		// binary; only when no binary exists is the download offered (yes/no).
+		// Nothing is downloaded at Pi startup.
+		await ensureWarpWithPrompt(ctx);
+
+		// Menú rápido: cambiar el modo sin tener que escribirlo completo.
+		// Usa ctx.ui.select (opciones seleccionables) cuando Pi lo expone,
+		// igual que /gentle:yolo; si no, cae a confirmaciones encadenadas.
+		const modes = ["on", "auto", "off"] as const;
+		const modeLabel: Record<string, string> = {
+			on: "siempre WARP",
+			auto: "directo primero, WARP ante rate limit",
+			off: "solo directo",
+		};
+		let chosen: string | undefined;
+
+		if (ctx.hasUI && typeof ctx.ui.select === "function") {
+			const selected = await ctx.ui.select(
+				`🚀 Gentle WARP 🔥 — modo actual: ${current}`,
+				modes.map((m) => `${m} — ${modeLabel[m]}`),
+			);
+			// ctx.ui.select devuelve el string completo de la opción
+			// (p. ej. "on — siempre WARP"); extraer solo el modo puro.
+			chosen = selected ? String(selected).split(" ")[0] : undefined;
+			if (!WARP_MODES.includes(chosen)) chosen = undefined;
+		} else if (ctx.hasUI) {
+			if (
+				await ctx.ui.confirm(
+					"pi-free-bridge",
+					`Modo actual: ${current}.\n\n¿Querés cambiarlo?\n1) on — siempre WARP\n2) auto — directo primero, WARP ante rate limit\n3) off — solo directo`,
+				)
+			) {
+				if (current !== "on") {
+					chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "on" (WARP siempre)?`)) ? "on" : undefined;
 				}
-				const liveIds = await fetchLiveFreeIds(registryFree);
-				if (liveIds.length === 0) {
-					ctx.ui.notify("The surface advertised no free models; keeping the current list", "warning");
-					return;
+				if (!chosen && current !== "auto") {
+					chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "auto" (directo primero, WARP ante rate limit)?`)) ? "auto" : undefined;
 				}
-				writeBridgeConfig({ liveIds });
-				const refreshed = discoverFreeModels(new Set(liveIds));
-				pi.registerProvider(PROVIDER, {
-					apiKey: API_KEY,
-					api: API,
-					baseUrl: RELAY_URL,
-					authHeader: true,
-					models: buildPiModels(refreshed.models),
-					streamSimple: gateStreamSimple,
-				});
-				ctx.ui.notify(
-					`${PROVIDER} now registers ${refreshed.models.length} free models: ${refreshed.models.map((m) => m.id).join(", ")}`,
-					"info",
-				);
-			} catch (err) {
-				ctx.ui.notify(`Could not refresh: ${(err as Error).message}`, "error");
+				if (!chosen && current !== "off") {
+					chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "off" (solo directo)?`)) ? "off" : undefined;
+				}
 			}
-		},
-	});
+		}
 
-	pi.registerCommand("free-bridge-models", {
-		description: "List the free OpenCode models registered by pi-free-bridge",
-		handler: async (_args: string, ctx) => {
-			const lines = [
-				`pi-free-bridge: ${discovered.models.length} free models from ${discovered.source}`,
-				...discovered.models.map((m) => `  ${PROVIDER}/${m.id}`),
-			];
-			ctx.ui.notify(lines.join("\n"), "info");
-		},
-	});
+		if (!chosen) {
+			ctx.ui.notify("Sin cambios en el modo WARP.", "info");
+			return;
+		}
 
-	pi.registerCommand("free-bridge-warp", {
-		description: "Show or set the WARP egress mode: off | auto | on; bin <path> configures the binary",
-		handler: async (args: string, ctx) => {
-			const binArgs = args.trim().match(/^bin\s+(.+)/i);
-			if (binArgs) {
-				const binPath = binArgs[1].trim();
-				if (!existsSync(binPath)) {
-					ctx.ui.notify(`File not found: ${binPath} — nothing was changed`, "warning");
-				} else {
-					writeBridgeConfig({ warpBin: binPath });
-					ctx.ui.notify(`pi-free-bridge: warpBin set to ${binPath} in ${BRIDGE_CONFIG_PATH}`, "info");
-				}
-				return;
-			}
-			const next = normalizeWarpMode(args);
-			if (!next) {
-				const envOverride = normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE);
-				const health = await fetchRelayHealth(RELAY_PORT);
-				const onWire = health?.warpMode ? `relay reports ${health.warpMode}${health.lastEgress ? `, last egress ${health.lastEgress}` : ""}` : "relay not running";
-				const current = resolveWarpMode();
-				const warpTarget = resolveWarpTarget();
+		if (normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE)) {
+			ctx.ui.notify(
+				`PI_FREE_BRIDGE_WARP_MODE is set: it beats the config. Unset it to use ${chosen}.`,
+				"warning",
+			);
+			return;
+		}
+
+		// bun-upgrades S4: a non-off mode needs warp-minimal alive. The guided
+		// download only runs after an explicit yes.
+		if (chosen !== "off" && !(await ensureWarpWithPrompt(ctx))) {
+			if (chosen === "on") {
+				// `on` is WARP-only; switching without a working WARP would fail
+				// every request until WARP comes up.
 				ctx.ui.notify(
-					[
-						`pi-free-bridge warp: ${current} (config)${envOverride ? ` — env override wins: ${envOverride}` : ""}`,
-						onWire,
-						`target: ${describeWarpTarget(warpTarget)}`,
-						`health: ${warpTarget.healthUrl}`,
-						"off: direct only; auto: direct first, WARP on rate limit; on: always WARP.",
-					].join("\n"),
-					"info",
-				);
-
-				// Entering the menu: is WARP answering? If not, launch the
-				// installed binary; only when no binary exists is the download
-				// offered (yes/no). Nothing is downloaded at Pi startup.
-				await ensureWarpWithPrompt(ctx);
-
-				// Menú rápido: cambiar el modo sin tener que escribirlo completo.
-				// Usa ctx.ui.select (opciones seleccionables) cuando Pi lo expone,
-				// igual que /gentle:yolo; si no, cae a confirmaciones encadenadas.
-				const modes = ["on", "auto", "off"] as const;
-				const modeLabel: Record<string, string> = {
-					on: "siempre WARP",
-					auto: "directo primero, WARP ante rate limit",
-					off: "solo directo",
-				};
-				let chosen: string | undefined;
-
-				if (ctx.hasUI && typeof ctx.ui.select === "function") {
-					const selected = await ctx.ui.select(
-						`🚀 Gentle WARP 🔥 — modo actual: ${current}`,
-						modes.map((m) => `${m} — ${modeLabel[m]}`),
-					);
-					// ctx.ui.select devuelve el string completo de la opción
-					// (p. ej. "on — siempre WARP"); extraer solo el modo puro.
-					chosen = selected ? String(selected).split(" ")[0] : undefined;
-					if (!WARP_MODES.includes(chosen)) chosen = undefined;
-				} else if (ctx.hasUI) {
-					if (
-						await ctx.ui.confirm(
-							"pi-free-bridge",
-							`Modo actual: ${current}.\n\n¿Querés cambiarlo?\n1) on — siempre WARP\n2) auto — directo primero, WARP ante rate limit\n3) off — solo directo`,
-						)
-					) {
-						if (current !== "on") {
-							chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "on" (WARP siempre)?`)) ? "on" : undefined;
-						}
-						if (!chosen && current !== "auto") {
-							chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "auto" (directo primero, WARP ante rate limit)?`)) ? "auto" : undefined;
-						}
-						if (!chosen && current !== "off") {
-							chosen = (await ctx.ui.confirm("pi-free-bridge", `¿Cambiar a "off" (solo directo)?`)) ? "off" : undefined;
-						}
-					}
-				}
-
-				if (!chosen) {
-					ctx.ui.notify("Sin cambios en el modo WARP.", "info");
-					return;
-				}
-
-				if (normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE)) {
-					ctx.ui.notify(
-						`PI_FREE_BRIDGE_WARP_MODE is set: it beats the config. Unset it to use ${chosen}.`,
-						"warning",
-					);
-					return;
-				}
-
-				writeBridgeConfig({ warpEnabled: chosen });
-				ctx.ui.notify(
-					`WARP mode set to ${chosen} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
-					"info",
-				);
-				return;
-			}
-			if (normalizeWarpMode(process.env.PI_FREE_BRIDGE_WARP_MODE)) {
-				ctx.ui.notify(
-					`PI_FREE_BRIDGE_WARP_MODE is set: it beats the config. Unset it to use ${next}.`,
+					`Not switching to on: WARP is not up. Set it again when warp-minimal answers on ${warpTarget.healthUrl}.`,
 					"warning",
 				);
 				return;
 			}
-			// bun-upgrades S4: a non-off mode needs warp-minimal alive. The
-			// guided download only runs after an explicit yes.
-			if (next !== "off" && !(await ensureWarpWithPrompt(ctx))) {
-				if (next === "on") {
-					// `on` is WARP-only; switching without a working WARP would
-					// fail every request until WARP comes up.
-					ctx.ui.notify(
-						`Not switching to on: WARP is not up. Set it again when warp-minimal answers on ${resolveWarpTarget().healthUrl}.`,
-						"warning",
-					);
-					return;
-				}
-			}
+		}
 
-			writeBridgeConfig({ warpEnabled: next });
+		writeBridgeConfig({ warpEnabled: chosen });
+		// relay-warp-hot-reload: no relay restart. The relay re-reads the config
+		// file on every request, so the new mode applies on the next request with
+		// the same process (pid survives the switch).
+		ctx.ui.notify(
+			`WARP mode set to ${chosen} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
+			"info",
+		);
+	}
 
-			// relay-warp-hot-reload: no relay restart. The relay re-reads the
-			// config file on every request, so the new mode applies on the next
-			// request with the same process (pid survives the switch).
+	/** Menu item 5: report the wire mode and switch it. */
+	async function promptWireMode(ctx: MenuCtx): Promise<void> {
+		const current = resolveWireMode();
+		const envOverride = normalizeWireMode(process.env.RELAY_WIRE_MODE);
+		const header = `pi-free-bridge wire: ${current} (config)${envOverride ? ` — env override wins: ${envOverride}` : ""}`;
+		if (!(ctx.hasUI && typeof ctx.ui.select === "function")) {
 			ctx.ui.notify(
-				`WARP mode set to ${next} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
+				`${header}\nv1: content-type, user-agent, authorization, x-opencode-session, x-opencode-session-id\nv2: the five above, plus x-session-affinity, X-Session-Id, x-opencode-client`,
 				"info",
 			);
-		},
-	});
+			return;
+		}
+		const selected = await ctx.ui.select(`🔌 Gentle wire 🪢 — modo actual: ${current}`, [
+			"v1 — los cinco headers de siempre (por defecto)",
+			"v2 — agrega x-session-affinity, X-Session-Id, x-opencode-client",
+		]);
+		if (selected === undefined) return;
+		const chosen = normalizeWireMode(String(selected).slice(0, 2));
+		if (!chosen) return;
+		writeBridgeConfig({ wireMode: chosen });
+		ctx.ui.notify(`pi-free-bridge: wire mode set to ${chosen} in ${BRIDGE_CONFIG_PATH}`, "info");
+	}
 
-	pi.registerCommand("free-bridge-wire", {
-		description: "Show or set the upstream wire mode: v1 (five headers, default) | v2 (adds the affinity set)",
-		handler: async (args: string, ctx) => {
-			const requested = normalizeWireMode(args);
-			if (args.trim() && !requested) {
-				ctx.ui.notify(`Unknown wire mode: ${args.trim()} — expected v1 or v2; nothing was changed`, "warning");
+	/** Menu item 1: install or update the relay binary.
+	 *  The guided download (S4-S6) is wired in the second slice of this
+	 *  feature; until then this reports the runtime the relay uses. */
+	async function installOrUpdateRelay(ctx: MenuCtx): Promise<void> {
+		const bun = resolveBunPath();
+		ctx.ui.notify(
+			[
+				"pi-free-bridge: instalar / actualizar relay",
+				`  bun:    ${bun ?? "no encontrado"}`,
+				`  relay:  ${describeRelay()}`,
+				`  health: ${relayHealthUrl(RELAY_PORT)}`,
+				"",
+				"  La descarga del binario todavía no está cableada en esta rama.",
+				"  Hasta entonces el relay se ejecuta con Bun desde relay.mjs.",
+			].join("\n"),
+			"warning",
+		);
+	}
+
+	/** Ask which menu entry to run. `select` when Pi exposes it, otherwise a
+	 *  numbered confirmation chain, so the menu still works without it. */
+	async function pickMenuItem(ctx: MenuCtx, labels: readonly string[]): Promise<number | undefined> {
+		if (ctx.hasUI && typeof ctx.ui.select === "function") {
+			const selected = await ctx.ui.select("🌉 pi-free-bridge", [...labels]);
+			if (selected === undefined || selected === null) return undefined;
+			const index = labels.indexOf(String(selected));
+			return index === -1 ? undefined : index;
+		}
+		if (!ctx.hasUI) return undefined;
+		for (const [index, label] of labels.entries()) {
+			if (await ctx.ui.confirm("pi-free-bridge", `¿${label}?`)) return index;
+		}
+		return undefined;
+	}
+
+	/** The one flat menu behind `/free-bridge`. Toggles show the current state
+	 *  in their label so choosing one is never a guess. */
+	async function runMenu(ctx: MenuCtx): Promise<void> {
+		const warpNow = resolveWarpMode();
+		const wireNow = resolveWireMode();
+		const labels = MENU_ITEMS.map((item, index) => {
+			if (index === MENU_WARP) return `${item} — ahora: ${warpNow}`;
+			if (index === MENU_WIRE) return `${item} — ahora: ${wireNow}`;
+			return item;
+		});
+
+		const index = await pickMenuItem(ctx, labels);
+		if (index === undefined) return;
+
+		switch (index) {
+			case MENU_INSTALL:
+				await installOrUpdateRelay(ctx);
 				return;
-			}
-			if (requested) {
-				writeBridgeConfig({ wireMode: requested });
-				ctx.ui.notify(`pi-free-bridge: wire mode set to ${requested} in ${BRIDGE_CONFIG_PATH}`, "info");
+			case MENU_STATUS:
+				await showRelayStatus(ctx);
 				return;
-			}
-			const current = resolveWireMode();
-			const envOverride = normalizeWireMode(process.env.RELAY_WIRE_MODE);
-			const header = `pi-free-bridge wire: ${current} (config)${envOverride ? ` — env override wins: ${envOverride}` : ""}`;
-			if (!(ctx.hasUI && typeof ctx.ui.select === "function")) {
-				ctx.ui.notify(
-					`${header}\nv1: content-type, user-agent, authorization, x-opencode-session, x-opencode-session-id\nv2: the five above, plus x-session-affinity, X-Session-Id, x-opencode-client`,
-					"info",
-				);
+			case MENU_WARP:
+				await promptWarpMode(ctx);
 				return;
-			}
-			const selected = await ctx.ui.select(`🔌 Gentle wire 🪢 — modo actual: ${current}`, [
-				"v1 — los cinco headers de siempre (por defecto)",
-				"v2 — agrega x-session-affinity, X-Session-Id, x-opencode-client",
-			]);
-			if (selected === undefined) return;
-			const chosen = normalizeWireMode(String(selected).slice(0, 2));
-			if (!chosen) return;
-			writeBridgeConfig({ wireMode: chosen });
-			ctx.ui.notify(`pi-free-bridge: wire mode set to ${chosen} in ${BRIDGE_CONFIG_PATH}`, "info");
+			case MENU_RECYCLE:
+				await runWarpRecycle(ctx);
+				return;
+			case MENU_WIRE:
+				await promptWireMode(ctx);
+				return;
+			case MENU_MODELS:
+				showFreeModels(ctx);
+				return;
+			case MENU_REFRESH:
+				await refreshLiveModels(ctx);
+				return;
+			default:
+				return;
+		}
+	}
+
+	pi.registerCommand("free-bridge", {
+		description: "Open the pi-free-bridge menu: relay, WARP, wire mode, models, session",
+		// No arguments on purpose: the owner rejected argument forms, so there is
+		// nothing here for autocomplete to hint at.
+		handler: async (_args: string, ctx) => {
+			await runMenu(ctx as MenuCtx);
 		},
 	});
 
@@ -2232,114 +2395,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Rotate the WARP exit right now — manual recovery when a 429 keeps killing turns",
 		handler: async (_args: string, ctx) => {
-			const before = await fetchRelayHealth(RELAY_PORT);
-			if (!before) {
-				ctx.ui.notify(
-					`pi-free-bridge: the relay does not answer on ${relayHealthUrl(RELAY_PORT)} — nothing to rotate.`,
-					"error",
-				);
-				return;
-			}
-
-			const lines = [
-				"pi-free-bridge warp recycle",
-				`  relay:   ${relayHealthUrl(RELAY_PORT)}`,
-				`  mode:    ${before.warpMode ?? "unknown"}${
-					before.warpModeSource ? ` (from ${before.warpModeSource})` : ""
-				}`,
-				`  before:  streak ${before.warp429Streak ?? 0}, ${before.warpRecycles ?? 0} recycle(s), last egress ${
-					before.lastEgress ?? "none"
-				}`,
-			];
-
-			if ((before.warpMode ?? "off") === "off") {
-				lines.push(
-					"",
-					"  warp is off, so the 429 came from the direct egress: rotating WARP",
-					"  cannot fix it. Run /free-bridge-warp auto (or on) first.",
-				);
-				ctx.ui.notify(lines.join("\n"), "error");
-				return;
-			}
-
-			const outcome = await requestWarpRecycle(RELAY_PORT);
-
-			if (outcome.kind === "absent") {
-				lines.push("", "  FAILED — the relay did not accept the request.");
-				ctx.ui.notify(lines.join("\n"), "error");
-				return;
-			}
-
-			if (outcome.kind === "timeout") {
-				lines.push(
-					"",
-					"  no answer in 25s. A rotation can wait up to two minutes for responses",
-					"  still being delivered over the tunnel, and it rotates on its own when that",
-					"  wait ends. Re-run this command to read the result.",
-					"",
-					"  Heads up: if this session talks through the bridge, the rotation replaces",
-					"  the exit under your own answer. Best run from a session that does not.",
-				);
-				ctx.ui.notify(lines.join("\n"), "info");
-				return;
-			}
-
-			const body = outcome.body;
-			if (outcome.status === 404) {
-				// The route is part of the relay build, not of the extension: a 404
-				// means an older relay is answering, and calling that a refusal would
-				// send the reader looking for a step that does not exist.
-				lines.push(
-					"",
-					`  the relay on port ${RELAY_PORT} has no /warp/recycle route: it is still`,
-					"  running an older build. Restart Pi so the extension spawns the new one,",
-					"  then run this command again.",
-				);
-				ctx.ui.notify(lines.join("\n"), "error");
-				return;
-			}
-
-			// One line per step, never an aggregate verdict: the sweep is the answer
-			// (which exit it drained, what the proxy said, what the pool looks like
-			// afterwards), and a single "rotated" would hide exactly the two-exit
-			// case where one swap is the whole recovery.
-			const steps = body.steps ?? [];
-			lines.push("  steps:");
-			if (steps.length === 0) {
-				lines.push("    (the relay reported no step)");
-			}
-			for (const [index, step] of steps.entries()) {
-				const action = step.action === "swap" ? `swap ${step.exit ?? "an unnamed exit"}` : "recycle";
-				const usable =
-					typeof step.usable === "number" ? `${step.usable} usable exit(s)` : "usable count unknown";
-				lines.push(`    ${index + 1}. ${action} — ${step.outcome ?? "unknown"}, ${usable}`);
-			}
-			lines.push(
-				"",
-				`  result:  ${body.ok ? "recovered" : `stopped (${body.reason ?? "unknown"})`}`,
-				`  after:   ${body.warpRecycles ?? before.warpRecycles ?? 0} recycle(s), streak ${
-					body.warp429Streak ?? 0
-				}`,
-			);
-
-			if (!body.ok) {
-				lines.push(
-					"",
-					"  in_flight      another rotation is running right now — look again shortly.",
-					"  no_proxy       the relay has no WARP proxy configured.",
-					"  not_confirmed  the proxy took the POST but never showed a new exit.",
-					"  no_standby     the proxy has no standby exit — the pool is one exit thin.",
-					"  unavailable    the proxy has no /swap route (older build) — only a recycle is left.",
-					"  cooldown       an exit is parked for 30 minutes by the proxy; the recycle clears it.",
-				);
-			}
-
-			lines.push(
-				"",
-				"  The sweep is also what runs by itself on the next request after a warp 429;",
-				"  this command is for when it did not, or when you do not want to spend a turn.",
-			);
-			ctx.ui.notify(lines.join("\n"), body.ok ? "info" : "error");
+			await runWarpRecycle(ctx as MenuCtx);
 		},
 	});
 
