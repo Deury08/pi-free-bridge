@@ -2235,6 +2235,85 @@ export async function forward(req, res, pathname, config) {
 	}
 }
 
+/** Upstream prices are nested (`cost.text.<kind>.price`), unlike the flat shape
+ *  the old OpenCode cache file used. Reading only flat numbers classifies every
+ *  vendor model as paid, which would mean zero free models out of 86. */
+export function catalogPrice(meta, kind) {
+	const cost = (meta && meta.cost) || {};
+	const text = cost.text || {};
+	const node = text[kind];
+	if (node && typeof node.price === "number") return node.price;
+	if (typeof cost[kind] === "number") return cost[kind];
+	return undefined;
+}
+
+/** The free tier of an upstream `/models` payload, flattened to the shape the
+ *  extension publishes.
+ *
+ *  A model whose price cannot be read is SKIPPED, never assumed free: an
+ *  unreadable price is not a zero price, and guessing would advertise as free
+ *  something that can spend the user's quota. Exported for tests. */
+export function freeCatalog(payload) {
+	const listed = (payload && (payload.data ?? payload.models)) || [];
+	const models = [];
+	const skipped = [];
+	for (const entry of listed) {
+		if (!entry || typeof entry !== "object") continue;
+		const id = entry.id;
+		if (typeof id !== "string" || id.length === 0) continue;
+
+		const input = catalogPrice(entry, "input");
+		const output = catalogPrice(entry, "output");
+		if (input === undefined || output === undefined || input !== 0 || output !== 0) {
+			skipped.push(id);
+			continue;
+		}
+
+		const limit = entry.limit || {};
+		const modalities = entry.modalities || {};
+		const capabilities = entry.capabilities || {};
+		models.push({
+			id,
+			name: typeof entry.name === "string" && entry.name ? entry.name : id,
+			family: entry.family,
+			reasoning: Boolean(capabilities.reasoning && capabilities.reasoning.supported),
+			limit: { context: limit.context, output: limit.output },
+			input: modalities.input || ["text"],
+		});
+	}
+	models.sort((a, b) => a.id.localeCompare(b.id));
+	return { models, skipped };
+}
+
+/** Ask the vendor for its catalog and answer with the free tier — or with a
+ *  READABLE failure. An unreachable vendor, a 429 or a dead tunnel must never
+ *  look like "this service has no free models": those are different facts and
+ *  the extension renders them differently. */
+export async function relayCatalog(config) {
+	const url = toUpstreamUrl(config.upstream, "/models");
+	try {
+		const response = await fetch(url, { method: "GET", headers: egressHeaders(config) });
+		if (!response.ok) {
+			return {
+				ok: false,
+				service: SERVICE,
+				source: url,
+				status: response.status,
+				reason: `${url} -> HTTP ${response.status}`,
+			};
+		}
+		const { models, skipped } = freeCatalog(await response.json());
+		return { ok: true, service: SERVICE, source: url, models, skipped: skipped.length };
+	} catch (err) {
+		return {
+			ok: false,
+			service: SERVICE,
+			source: url,
+			reason: `${url} unreachable: ${err && err.message ? err.message : String(err)}`,
+		};
+	}
+}
+
 export async function handle(req, res, config) {
 	// Hot reload (relay-warp-hot-reload): one cheap config re-read per request
 	// drives both /health and /v1.
@@ -2295,6 +2374,18 @@ export async function handle(req, res, config) {
 
 	if (req.method === "POST" && pathname.startsWith("/v1/")) {
 		await forward(req, res, pathname, config);
+		return;
+	}
+
+	// The extension's only door to the vendor catalog. It goes through the relay
+	// because the relay is what carries the wire headers and the egress; a second
+	// direct path from the extension would be a second door to the same vendor.
+	if (req.method === "GET" && pathname === "/models") {
+		const catalog = await relayCatalog(config);
+		// 502, not 200-with-empty-list: a vendor that failed and a vendor that
+		// genuinely offers nothing free are different answers to different
+		// questions, and collapsing them would make the extension lie.
+		sendJson(res, catalog.ok ? 200 : 502, catalog);
 		return;
 	}
 

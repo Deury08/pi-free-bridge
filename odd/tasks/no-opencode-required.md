@@ -13,6 +13,16 @@ S2. Stop sourcing the catalog from OpenCode. The provider must implement
 `refreshModels` and take its list from the relay. "No embedded list, no
 hardcoded fallback, no registry read for the catalog."
 
+S2 amended (owner decision, L11): the catalog must come THROUGH THE RELAY, not
+from a direct call by the extension. The relay serves `GET /models`; the
+extension fetches `http://127.0.0.1:<port>/models`. "One door to the vendor, not
+two." The relay owns the vendor contract (headers, egress, session id); the
+extension owns the exclusion list and the published shape.
+
+S2b. A catalog that could not be read is not an empty catalog. Upstream failure
+(429, offline, dead tunnel) surfaces as a readable state — relay `502 {ok:false,
+reason}` — and must never render as "the service has no free models".
+
 S3. Registration is live: after a successful relay install, call
 `registerProvider` again with the real models. No Pi restart required.
 
@@ -125,6 +135,24 @@ exits 0. Earlier green build reports in this project were the exit status of a
 piped tail, not of bun.
 
 ## Slice boundaries
+
+- `L11` (measurement, not assumption): the direct call written in `427accd` was
+  tested WITHOUT WARP before assuming it was broken — 3 consecutive requests to
+  `opencode.ai/inference/v1/models` with the extension's exact headers returned
+  HTTP 200 in 0.5-2.7s, 86 models, 12 free, **no 429**. So the direct call worked
+  at measurement time, and moving the catalog onto the relay is architectural
+  coherence (one door, one place for the vendor contract), NOT a fix for an
+  observed failure. Recorded because the opposite was assumed by the requester
+  and the honest answer is the boring one.
+- `L12` (failure semantics, verified live): with a dead upstream
+  (`RELAY_UPSTREAM=https://upstream.invalid/v1`) `GET /models` answers
+  `502 {"ok":false,"reason":"... unreachable: getaddrinfo ENOTFOUND ..."}` while
+  `/health` on the same relay still answers `ok:true`. With a real upstream the
+  same route answers `200 {"ok":true,"models":[12],"skipped":74}`.
+- `L13` (operational note): the relay exits 0 when stdin closes, by design, so
+  an orphaned relay dies with its parent. Running it by hand for a check needs
+  its stdin held open (`tail -f /dev/null | bun relay.mjs`), otherwise it looks
+  like a crash.
 
 The tooling reports this branch past the ~400 authored line review unit (~580
 lines, 4 commits). It was split on purpose: each slice is a different failure,

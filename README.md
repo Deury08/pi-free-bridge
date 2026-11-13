@@ -494,11 +494,23 @@ notes.
 
 #### De dónde salen los modelos
 
-Del **servicio**, no de tu disco. La extensión le pide el catálogo a
-`opencode.ai/inference/v1/models` y se queda con los modelos cuyo precio es
-cero: hoy son **12**. No lee ningún archivo de caché de OpenCode, y eso importa
-porque ese archivo sólo existe en una máquina que ya tiene OpenCode instalado
-—justo lo contrario de la máquina para la que sirve este puente—.
+Del **servicio**, pero pasando por el **relay**. La extensión le pide el
+catálogo al relay (que corre en `127.0.0.1`), y el relay es el único que habla
+con `opencode.ai/inference/v1/models`: es quien tiene los headers del servicio
+en el formato que el servicio espera, el túnel y la sesión. La extensión se
+queda con los modelos cuyo precio es cero: hoy son **12**. No lee ningún archivo
+de caché de OpenCode, y eso importa porque ese archivo sólo existe en una
+máquina que ya tiene OpenCode instalado —justo lo contrario de la máquina para
+la que sirve este puente—.
+
+Una sola puerta hacia el servicio, no dos: si mañana el servicio cambia sus
+headers, se arregla en el relay y no hay que perseguir copias.
+
+Y una distinción que el menú respeta: si el catálogo **no se pudo leer**
+(servicio caído, 429, túnel abajo) la extensión lo dice así, con el motivo. Eso
+no es lo mismo que «el servicio no ofrece modelos gratis», que es una respuesta
+válida y distinta. Confundirlas te mandaría a buscar un modelo que falta cuando
+el problema real es que nadie pudo preguntar.
 
 De ahí salen dos cosas que vas a notar:
 

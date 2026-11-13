@@ -1124,83 +1124,61 @@ function isFree(meta: Record<string, unknown>): boolean {
 	return declared.length > 0 && declared.every((v) => v === 0);
 }
 
-/** Upstream prices are nested (`cost.text.<kind>.price`), unlike the flattened
- *  shape the OpenCode cache file used. Reading only flat numbers classifies
- *  every upstream model as paid — that is the whole reason this adapter exists:
- *  with the old reader the live catalog yields 0 free models, not 12.
- *
- *  Exported because it is the one rule that decides what the picker shows. */
-export function upstreamPrice(meta: Record<string, unknown>, kind: "input" | "output"): number | undefined {
-	const cost = (meta.cost ?? {}) as Record<string, any>;
-	const text = (cost.text ?? {}) as Record<string, any>;
-	const node = text[kind];
-	if (node && typeof node.price === "number") return node.price;
-	// Flat fallback: older payloads and the cache file wrote plain numbers.
-	if (typeof cost[kind] === "number") return cost[kind];
-	return undefined;
-}
+/** What a catalog answer means. `unavailable` carries a reason when the reply
+ *  is a failure; an empty list with no `unavailable` means the vendor genuinely
+ *  offers nothing free. Those are different facts and the UI renders them
+ *  differently, so they must never collapse into one. */
+export type CatalogResult = {
+	models: RegistryModel[];
+	source: string;
+	skipped: string[];
+	unavailable?: string;
+};
 
-/** Turn one upstream `/models` entry into the flat shape `buildPiModels` reads.
- *  Returns undefined for anything this bridge will not offer: a paid model, an
- *  excluded id, or an entry too malformed to price honestly. Refusing is the
- *  point — a model whose cost cannot be read must not be advertised as free. */
-export function normalizeUpstreamModel(entry: unknown): RegistryModel | undefined {
-	if (!entry || typeof entry !== "object") return undefined;
-	const meta = entry as Record<string, any>;
-	const id = meta.id;
-	if (typeof id !== "string" || id.length === 0 || EXCLUDED_MODELS.has(id)) return undefined;
-
-	const input = upstreamPrice(meta, "input");
-	const output = upstreamPrice(meta, "output");
-	if (input === undefined || output === undefined) return undefined;
-	if (input !== 0 || output !== 0) return undefined;
-
-	const limit = (meta.limit ?? {}) as Record<string, unknown>;
-	const modalities = (meta.modalities ?? {}) as Record<string, unknown>;
-	const capabilities = (meta.capabilities ?? {}) as Record<string, any>;
-	return {
-		id,
-		name: typeof meta.name === "string" && meta.name ? meta.name : id,
-		meta: {
-			name: meta.name,
-			family: meta.family,
-			reasoning: Boolean(capabilities.reasoning?.supported),
-			limit: { context: limit.context, output: limit.output },
-			cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-			modalities: { input: modalities.input ?? ["text"] },
-		},
-	};
-}
-
-/** The free catalog, read from the service itself. No OpenCode cache file and
- *  no embedded list: the machines that most need this bridge are the ones with
- *  nothing installed, and they were exactly the machines that got zero models. */
-export async function fetchUpstreamCatalog(
-	signal?: AbortSignal,
-): Promise<{ models: RegistryModel[]; source: string; skipped: string[] }> {
-	const url = `${UPSTREAM_URL}/models`;
-	try {
-		const res = await fetch(url, {
-			headers: { "user-agent": USER_AGENT, authorization: `Bearer ${API_KEY}` },
-			signal,
+/** Pure: turn a relay `/models` answer into the catalog this bridge publishes.
+ *  Exported so the failure-versus-empty distinction is testable without a
+ *  relay or a network. */
+export function parseRelayCatalog(status: number, body: any): CatalogResult {
+	const source = "relay /models";
+	if (status < 200 || status >= 300 || !body || body.ok !== true) {
+		const reason = body && body.reason ? body.reason : `relay /models -> HTTP ${status}`;
+		return { models: [], source, skipped: [], unavailable: String(reason) };
+	}
+	const models: RegistryModel[] = [];
+	for (const entry of (body.models ?? []) as any[]) {
+		if (!entry || typeof entry.id !== "string" || EXCLUDED_MODELS.has(entry.id)) continue;
+		models.push({
+			id: entry.id,
+			name: typeof entry.name === "string" && entry.name ? entry.name : entry.id,
+			meta: {
+				name: entry.name,
+				family: entry.family,
+				reasoning: Boolean(entry.reasoning),
+				limit: entry.limit ?? {},
+				cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+				modalities: { input: entry.input ?? ["text"] },
+			},
 		});
-		if (!res.ok) return { models: [], source: `${url} -> HTTP ${res.status}`, skipped: [] };
-		const payload = (await res.json()) as { data?: unknown[]; models?: unknown[] };
-		const models: RegistryModel[] = [];
-		const skipped: string[] = [];
-		for (const entry of payload.data ?? payload.models ?? []) {
-			const model = normalizeUpstreamModel(entry);
-			if (model) {
-				models.push(model);
-				continue;
-			}
-			const id = entry && typeof entry === "object" ? (entry as { id?: unknown }).id : undefined;
-			if (typeof id === "string") skipped.push(id);
-		}
-		models.sort((a, b) => a.id.localeCompare(b.id));
-		return { models, source: url, skipped };
+	}
+	return { models, source, skipped: [] };
+}
+
+/** The catalog, through the relay. One door to the vendor: the relay is what
+ *  carries the wire headers, the egress and the session. The extension never
+ *  calls the vendor itself. */
+export async function fetchRelayCatalog(signal?: AbortSignal): Promise<CatalogResult> {
+	const url = `http://127.0.0.1:${RELAY_PORT}/models`;
+	try {
+		const res = await fetch(url, { signal });
+		const body = await res.json().catch(() => undefined);
+		return parseRelayCatalog(res.status, body);
 	} catch (err) {
-		return { models: [], source: `${url} unreachable: ${(err as Error).message}`, skipped: [] };
+		return {
+			models: [],
+			source: url,
+			skipped: [],
+			unavailable: `${url} unreachable: ${(err as Error).message}`,
+		};
 	}
 }
 
@@ -2364,7 +2342,7 @@ export default async function (pi: ExtensionAPI) {
 			// service instead of a snapshot taken at startup. No embedded list
 			// and no fallback: an unreachable catalog reports empty.
 			refreshModels: async ({ signal }: { signal?: AbortSignal }) =>
-				buildPiModels((await fetchUpstreamCatalog(signal)).models) as never,
+				buildPiModels((await fetchRelayCatalog(signal)).models) as never,
 			streamSimple: gateStreamSimple,
 		});
 	}
@@ -2377,7 +2355,7 @@ export default async function (pi: ExtensionAPI) {
 	const discovered =
 		process.env.PI_FREE_BRIDGE_SKIP_CATALOG === "1"
 			? { models: [] as RegistryModel[], source: "catalog fetch skipped", skipped: [] as string[] }
-			: await fetchUpstreamCatalog(AbortSignal.timeout(4000));
+			: await fetchRelayCatalog(AbortSignal.timeout(4000));
 
 	if (process.env.PI_FREE_BRIDGE_DRY_RUN === "1") {
 		printDryRun(discovered, session, live);
@@ -2389,10 +2367,15 @@ export default async function (pi: ExtensionAPI) {
 	// is most needed on a machine where nothing is set up yet, and that is
 	// exactly the machine that used to lose it to an early return here.
 	if (discovered.models.length === 0) {
+		// A catalog that could not be read is not a vendor without free models.
+		// Reporting them the same way would send someone hunting for a missing
+		// model when the real problem is an unreachable relay.
 		console.error(
-			`pi-free-bridge: no free models yet (${discovered.source}); ` +
-				"the provider stays unregistered until a catalog is available. " +
-				"Run /free-bridge to install the relay.",
+			discovered.unavailable
+				? `pi-free-bridge: model catalog unavailable — ${discovered.unavailable}. ` +
+						"The provider stays unregistered until the relay can answer. Run /free-bridge."
+				: `pi-free-bridge: the catalog answered with no free models (${discovered.source}). ` +
+						"The provider stays unregistered. Run /free-bridge for details.",
 		);
 	} else {
 		publishCatalog(discovered.models);
@@ -2621,11 +2604,13 @@ export default async function (pi: ExtensionAPI) {
 	async function refreshLiveModels(ctx: MenuCtx): Promise<void> {
 		ctx.ui.notify("Refreshing the free-model catalog from the service…", "info");
 		try {
-			const catalog = await fetchUpstreamCatalog(AbortSignal.timeout(8000));
+			const catalog = await fetchRelayCatalog(AbortSignal.timeout(8000));
 			if (catalog.models.length === 0) {
 				ctx.ui.notify(
-					`The service advertised no free models (${catalog.source}); keeping the current list`,
-					"warning",
+					catalog.unavailable
+						? `Catalog unavailable: ${catalog.unavailable}. Keeping the current list.`
+						: `The service answered with no free models (${catalog.source}). Keeping the current list.`,
+					catalog.unavailable ? "error" : "warning",
 				);
 				return;
 			}
@@ -2772,12 +2757,14 @@ export default async function (pi: ExtensionAPI) {
 
 		// S3: a relay that just started is a catalog the picker may never have
 		// seen. Publish it now — registration is live, so there is no restart.
-		const catalog = await fetchUpstreamCatalog(AbortSignal.timeout(8000));
+		const catalog = await fetchRelayCatalog(AbortSignal.timeout(8000));
 		if (catalog.models.length === 0) {
 			ctx.ui.notify(
-				`Relay instalado, pero el catálogo no respondió (${catalog.source}). ` +
-					"El ítem «Modelos» lo reintenta sin reiniciar nada.",
-				"warning",
+				catalog.unavailable
+					? `Relay instalado, pero el catálogo no está disponible: ${catalog.unavailable}. ` +
+							"El ítem «Modelos» lo reintenta sin reiniciar nada."
+					: `Relay instalado. El servicio respondió sin modelos gratis (${catalog.source}).`,
+				catalog.unavailable ? "error" : "warning",
 			);
 			return;
 		}

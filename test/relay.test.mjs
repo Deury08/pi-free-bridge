@@ -25,7 +25,10 @@ import test from "node:test";
 
 import {
 	basicAuthFor,
+	catalogPrice,
 	classifyGate429,
+	freeCatalog,
+	relayCatalog,
 	ensureEnvBlock,
 	forwardedHeaders,
 	ensureGateTools,
@@ -4007,58 +4010,20 @@ test("recycle is hidden without a WARP binary and shown with one", () => {
 	assert.equal(visibleMenuIndices({ relayReady: true, warpReady: true }).includes(MENU_RECYCLE), true);
 });
 
-test("upstreamPrice: reads the nested service shape and the older flat one", () => {
-	// The live service nests prices under cost.text.<kind>.price. Reading only
-	// flat numbers classified every model as paid — zero free models out of 86.
-	const { upstreamPrice } = releaseMod;
-	assert.equal(upstreamPrice({ cost: { text: { input: { price: 0 }, output: { price: 0 } } } }, "input"), 0);
-	assert.equal(upstreamPrice({ cost: { text: { input: { price: 3 }, output: { price: 15 } } } }, "output"), 15);
-	assert.equal(upstreamPrice({ cost: { input: 0, output: 0 } }, "input"), 0, "flat fallback");
-	assert.equal(upstreamPrice({}, "input"), undefined);
-	assert.equal(upstreamPrice({ cost: { text: {} } }, "output"), undefined);
-});
-
-test("normalizeUpstreamModel: keeps the free ones, refuses paid and unpriced", () => {
-	const { normalizeUpstreamModel } = releaseMod;
-	const free = normalizeUpstreamModel({
-		id: "longcat-2.5-free",
-		name: "LongCat 2.5 Free",
-		family: "longcat",
-		cost: { text: { input: { price: 0 }, output: { price: 0 } } },
-		limit: { context: 1000000, output: 32000 },
-		modalities: { input: ["text"] },
-		capabilities: { reasoning: { supported: true } },
-	});
-	assert.equal(free.id, "longcat-2.5-free");
-	assert.equal(free.meta.limit.context, 1000000, "a 1M context must survive the adapter");
-	assert.equal(free.meta.limit.output, 32000);
-	assert.deepEqual(free.meta.cost, { input: 0, output: 0, cache_read: 0, cache_write: 0 });
-	assert.equal(free.meta.reasoning, true);
-	assert.deepEqual(free.meta.modalities.input, ["text"]);
-
-	// Anything that cannot be proven free is refused, not defaulted to free.
-	assert.equal(
-		normalizeUpstreamModel({ id: "paid", cost: { text: { input: { price: 3 }, output: { price: 15 } } } }),
-		undefined,
-		"a paid model must never be offered",
-	);
-	assert.equal(normalizeUpstreamModel({ id: "unpriced" }), undefined, "no price is not the same as free");
-	assert.equal(normalizeUpstreamModel({ cost: { input: 0, output: 0 } }), undefined, "an entry with no id");
-	assert.equal(normalizeUpstreamModel(null), undefined);
-});
-
-test("the provider is published from the service catalog with refreshModels wired", () => {
-	// S2/S3: the catalog arrives from the service and registration is live, so
-	// the same call path serves startup, the menu refresh and the post-install
-	// republish. The fetch is stubbed: this asserts wiring, not the network.
+test("the provider is published from the relay catalog with refreshModels wired", () => {
+	// S2 as amended: the extension asks the RELAY, never the vendor. A vendor
+	// payload ({data:[...]}) must not be understood here any more — that is what
+	// "one door" means. Exclusions still apply on this side.
 	const home = mkdtempSync(join(tmpdir(), "pfb-catalog-"));
 	const marker = "@@PUBLISHED@@";
 	const script = `
-		const payload = { data: [
-			{ id: "a-free", name: "A Free", cost: { text: { input: { price: 0 }, output: { price: 0 } } }, limit: { context: 1000, output: 100 } },
-			{ id: "b-paid", cost: { text: { input: { price: 1 }, output: { price: 2 } } } },
+		const relayBody = { ok: true, models: [
+			{ id: "a-free", name: "A Free", limit: { context: 1000, output: 100 }, input: ["text"] },
+			{ id: "jev-1.13-free", name: "Excluded on this side", limit: {}, input: ["text"] },
 		] };
-		globalThis.fetch = async () => ({ ok: true, json: async () => payload });
+		const vendorBody = { data: [ { id: "a-free", cost: { text: { input: { price: 0 }, output: { price: 0 } } } } ] };
+		const kind = process.env.PFB_PAYLOAD;
+		globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => (kind === "vendor" ? vendorBody : relayBody) });
 		const { default: factory } = await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});
 		const providers = [];
 		await factory({
@@ -4070,19 +4035,49 @@ test("the provider is published from the service catalog with refreshModels wire
 			ui: { notify() {} },
 		});
 		const config = providers[0] && providers[0].config;
+		// The live republish path: this is the same call the post-install
+		// republish and the menu refresh use, so exercising it here covers S3
+		// without stubbing a binary download.
+		const refreshed = config && config.refreshModels ? await config.refreshModels({ signal: undefined }) : undefined;
 		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify({
-			count: config ? config.models.length : -1,
 			ids: config ? config.models.map((m) => m.id) : [],
 			hasRefresh: typeof (config && config.refreshModels) === "function",
+			refreshedIds: Array.isArray(refreshed) ? refreshed.map((m) => m.id) : null,
 		}));
 	`;
-	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
-		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "" },
-		encoding: "utf-8",
-	});
-	const published = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+	const run = (payloadKind) => {
+		const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+			env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "", PFB_PAYLOAD: payloadKind },
+			encoding: "utf-8",
+		});
+		return JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+	};
 
-	assert.deepEqual(published.ids, ["a-free"], "only the free model is published");
-	assert.equal(published.count, 1);
-	assert.equal(published.hasRefresh, true, "Pi refreshes the catalog through refreshModels");
+	const relay = run("relay");
+	assert.deepEqual(relay.ids, ["a-free"], "the excluded id is filtered on this side");
+	assert.equal(relay.hasRefresh, true, "Pi refreshes the catalog through refreshModels");
+	assert.deepEqual(relay.refreshedIds, ["a-free"], "a live refresh republishes through the relay");
+
+	const vendor = run("vendor");
+	assert.deepEqual(vendor.ids, [], "a vendor payload is not read here: one door to the vendor");
+});
+
+test("parseRelayCatalog: a failed catalog is not an empty catalog", () => {
+	// The distinction the menu depends on: "the vendor said 429" and "the vendor
+	// offers nothing free" are different facts and must not render the same.
+	const genuinelyEmpty = releaseMod.parseRelayCatalog(200, { ok: true, models: [] });
+	assert.deepEqual(genuinelyEmpty.models, []);
+	assert.equal(genuinelyEmpty.unavailable, undefined);
+
+	const failed = releaseMod.parseRelayCatalog(502, { ok: false, reason: "https://x/models -> HTTP 429" });
+	assert.equal(failed.models.length, 0);
+	assert.match(failed.unavailable, /429/, "a vendor failure must say so, not look empty");
+
+	const free = releaseMod.parseRelayCatalog(200, {
+		ok: true,
+		models: [{ id: "a-free", name: "A", limit: { context: 1000 }, input: ["text"] }],
+	});
+	assert.deepEqual(free.models.map((m) => m.id), ["a-free"]);
+	assert.equal(free.models[0].meta.limit.context, 1000);
+	assert.deepEqual(free.models[0].meta.cost, { input: 0, output: 0, cache_read: 0, cache_write: 0 });
 });
