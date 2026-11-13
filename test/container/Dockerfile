@@ -1,5 +1,7 @@
 # A deliberately empty machine: no Bun, no Node, no OpenCode, no config.
-# If the relay needs any of them, this image proves it.
+# If the relay needs any of them, this image proves it. It runs ONLY the relay
+# binary and never Pi: Pi is a Node app and needs Node, which is why the Pi
+# checks live in a different container that has Node installed on purpose.
 FROM debian:stable-slim
 
 RUN apt-get update \

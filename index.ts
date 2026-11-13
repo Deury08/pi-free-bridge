@@ -28,15 +28,6 @@ const API = "openai-completions" as const;
  *  "public" keeps credentials out of the repo and out of auth.json. */
 const API_KEY = "public";
 
-/** User-agent must contain "opencode/" or the gate answers 403 (HANDOFF §4.2).
- *  The Pi path uses the relay's copy; this one stays for the registry refresh. */
-const USER_AGENT = "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
-
-const REGISTRY_PATHS = [
-	join(homedir(), ".cache", "opencode", "models.json"),
-	join(homedir(), ".config", "opencode", "models.json"),
-];
-
 /** Optional user config: `{ "sessionId": "ses_…", "liveIds": ["…"] }`. */
 export const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
 
@@ -47,29 +38,6 @@ const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 /** The scope entry the bridge needs. A glob, not literal ids: the bridge
  *  registers its models at runtime, so literal ids hide anything new. */
 const SCOPE_PATTERN = `${PROVIDER}/*`;
-
-/** Free ids the surface actually advertised on 2026-10-25.
- *
- *  Registration stays offline and deterministic: intersecting the registry with
- *  `GET /inference/v1/models` on every launch would put a network round-trip on
- *  the startup path. Refresh the snapshot with the "Refresh session" menu item, which
- *  fetches the live list and persists it to BRIDGE_CONFIG_PATH.
- *
- *  This list is what a **fresh install** registers before the user runs
- *  that menu item, so a stale entry here is a permanently broken model
- *  in someone else's picker. `longcat-2.5-preview-free` and
- *  `minimax-m3.1-flash-free` were dropped on 2026-10-25 because the surface no
- *  longer advertises them; `flint-40b-free` was added. */
-const SNAPSHOT_LIVE_FREE_IDS = [
-	"beam-free",
-	"big-pickle",
-	"deepseek-v4.1-flash-free",
-	"flint-40b-free",
-	"glm-5.3-flash-free",
-	"mimo-v2.6-flash-free",
-	"nemotron-3.5-lightning-free",
-	"nemotron-3.5-super-vl-free",
-];
 
 /** Models the surface advertises but cannot serve over chat/completions:
  *  400 ModelProtocolUnsupported on /inference/v1, 403 on /messages (HANDOFF D5). */
@@ -446,14 +414,6 @@ function resolveSessionId(): { sessionId?: string; source: string } {
 	if (harvested) return harvested;
 
 	return { source: "none" };
-}
-
-function resolveLiveIds(): { liveIds: Set<string>; source: string } {
-	const fromConfig = readBridgeConfig().liveIds;
-	if (Array.isArray(fromConfig) && fromConfig.length > 0) {
-		return { liveIds: new Set(fromConfig), source: BRIDGE_CONFIG_PATH };
-	}
-	return { liveIds: new Set(SNAPSHOT_LIVE_FREE_IDS), source: "built-in snapshot (2026-10-14)" };
 }
 
 /** WARP egress modes (bun-upgrades S5). */
@@ -1108,71 +1068,67 @@ type RegistryModel = {
 	meta: Record<string, unknown>;
 };
 
-function resolveRegistryPath(): string | undefined {
-	return REGISTRY_PATHS.find((p) => existsSync(p));
-}
+/** What a catalog answer means. `unavailable` carries a reason when the reply
+ *  is a failure; an empty list with no `unavailable` means the vendor genuinely
+ *  offers nothing free. Those are different facts and the UI renders them
+ *  differently, so they must never collapse into one. */
+export type CatalogResult = {
+	models: RegistryModel[];
+	source: string;
+	/** How many models the relay refused as not free. The extension no longer
+	 *  classifies prices itself, so this is reported, never recomputed. */
+	skippedCount?: number;
+	unavailable?: string;
+};
 
-/** A model is free when every cost field it actually declares is zero.
- *
- *  The registry omits `cache_write` on most free models, so testing all four
- *  fields with `=== 0` classifies 36 of 39 free models as paid (HANDOFF §4.4). */
-function isFree(meta: Record<string, unknown>): boolean {
-	const cost = (meta.cost ?? {}) as Record<string, unknown>;
-	const declared = Object.values(cost).filter(
-		(v): v is number => typeof v === "number" && Number.isFinite(v),
-	);
-	return declared.length > 0 && declared.every((v) => v === 0);
-}
-
-function discoverFreeModels(liveIds: Set<string>): { models: RegistryModel[]; source: string; skipped: string[] } {
-	const path = resolveRegistryPath();
-	if (!path) return { models: [], source: "registry not found", skipped: [] };
-
-	let data: Record<string, any>;
-	try {
-		data = JSON.parse(readFileSync(path, "utf-8"));
-	} catch (err) {
-		return { models: [], source: `registry unreadable: ${(err as Error).message}`, skipped: [] };
+/** Pure: turn a relay `/models` answer into the catalog this bridge publishes.
+ *  Exported so the failure-versus-empty distinction is testable without a
+ *  relay or a network. */
+export function parseRelayCatalog(status: number, body: any): CatalogResult {
+	const source = "relay /models";
+	if (status < 200 || status >= 300 || !body || body.ok !== true) {
+		const reason = body && body.reason ? body.reason : `relay /models -> HTTP ${status}`;
+		return { models: [], source, unavailable: String(reason) };
 	}
-
-	const registryModels = data?.opencode?.models;
-	if (!registryModels || typeof registryModels !== "object") {
-		return { models: [], source: `registry has no "opencode.models": ${path}`, skipped: [] };
-	}
-
 	const models: RegistryModel[] = [];
-	const skipped: string[] = [];
-	for (const [id, meta] of Object.entries<Record<string, unknown>>(registryModels)) {
-		if (!meta || typeof meta !== "object") continue;
-		if (EXCLUDED_MODELS.has(id)) {
-			skipped.push(id);
-			continue;
-		}
-		if (!isFree(meta)) continue;
-		// Free in the registry but not advertised by the surface: registering it
-		// would put a permanently broken entry in the picker.
-		if (!liveIds.has(id)) {
-			skipped.push(id);
-			continue;
-		}
-		models.push({ id, name: (meta.name as string) || id, meta });
+	for (const entry of (body.models ?? []) as any[]) {
+		if (!entry || typeof entry.id !== "string" || EXCLUDED_MODELS.has(entry.id)) continue;
+		models.push({
+			id: entry.id,
+			name: typeof entry.name === "string" && entry.name ? entry.name : entry.id,
+			meta: {
+				name: entry.name,
+				family: entry.family,
+				reasoning: Boolean(entry.reasoning),
+				limit: entry.limit ?? {},
+				cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+				modalities: { input: entry.input ?? ["text"] },
+			},
+		});
 	}
-
-	models.sort((a, b) => a.id.localeCompare(b.id));
-	return { models, source: path, skipped };
+	return {
+		models,
+		source,
+		skippedCount: typeof body.skipped === "number" ? body.skipped : undefined,
+	};
 }
 
-/** Ask the surface which models it advertises, then keep the free ones. */
-async function fetchLiveFreeIds(registryFree: Set<string>): Promise<string[]> {
-	const res = await fetch(`${UPSTREAM_URL}/models`, {
-		headers: { "user-agent": USER_AGENT, authorization: `Bearer ${API_KEY}` },
-	});
-	if (!res.ok) throw new Error(`${UPSTREAM_URL}/models -> ${res.status}`);
-	const payload = (await res.json()) as { data?: { id?: string }[] } | { models?: { id?: string }[] };
-	const listed = payload.data ?? payload.models ?? [];
-	return listed
-		.map((m) => (typeof m === "string" ? m : m?.id))
-		.filter((id): id is string => typeof id === "string" && registryFree.has(id));
+/** The catalog, through the relay. One door to the vendor: the relay is what
+ *  carries the wire headers, the egress and the session. The extension never
+ *  calls the vendor itself. */
+export async function fetchRelayCatalog(signal?: AbortSignal): Promise<CatalogResult> {
+	const url = `http://127.0.0.1:${RELAY_PORT}/models`;
+	try {
+		const res = await fetch(url, { signal });
+		const body = await res.json().catch(() => undefined);
+		return parseRelayCatalog(res.status, body);
+	} catch (err) {
+		return {
+			models: [],
+			source: url,
+			unavailable: `${url} unreachable: ${(err as Error).message}`,
+		};
+	}
 }
 
 function buildPiModels(raw: RegistryModel[]) {
@@ -2193,13 +2149,12 @@ async function ensureWarpWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 function printDryRun(
-	discovered: { models: RegistryModel[]; source: string; skipped: string[] },
+	discovered: CatalogResult,
 	session: { sessionId?: string; source: string },
-	live: { liveIds: Set<string>; source: string },
 ): void {
 	const lines = [
 		"pi-free-bridge dry run",
-		`  registry:    ${discovered.source}`,
+		`  catalog:     ${discovered.source}`,
 		`  upstream:    ${UPSTREAM_URL}`,
 		`  relay:       ${RELAY_URL} (port ${RELAY_PORT})`,
 		`  bun:         ${resolveBunPath() ?? "MISSING"}`,
@@ -2209,12 +2164,17 @@ function printDryRun(
 				? `${session.sessionId} (from ${session.source})`
 				: "harvested by the relay from the OpenCode store"
 		}`,
-		`  live ids:    ${live.source}`,
 		`  excluded:    ${[...EXCLUDED_MODELS].join(", ")}`,
+		// The relay is the side that knows which models it refused and why, so
+		// this reports its count instead of printing an always-empty list again.
+		`  skipped:     ${
+			discovered.skippedCount === undefined
+				? "unknown (the catalog did not report a count)"
+				: `${discovered.skippedCount} (not free, per the relay)`
+		}`,
+		`  unavailable: ${discovered.unavailable ?? "no"}`,
 		`  models (${discovered.models.length}):`,
 		...discovered.models.map((m) => `    - ${m.id}`),
-		`  skipped (${discovered.skipped.length}):`,
-		...discovered.skipped.map((m) => `    - ${m}`),
 	];
 	console.log(lines.join("\n"));
 }
@@ -2223,44 +2183,82 @@ function printDryRun(
 // Registration
 // ---------------------------------------------------------------------------
 
-export default function (pi: ExtensionAPI) {
+/** The seven menu entries, in the order the owner dictated. Never reorder. */
+export const MENU_ITEMS = [
+	"Instalar / actualizar relay",
+	"Estado del relay",
+	"WARP: on / off",
+	"Reciclar WARP",
+	"Cable: v1 / v2",
+	"Modelos",
+	"Refrescar sesión",
+] as const;
+
+/** Named menu indices, so the dispatch never depends on a bare number. */
+export const MENU_INSTALL = 0;
+export const MENU_STATUS = 1;
+export const MENU_WARP = 2;
+export const MENU_RECYCLE = 3;
+export const MENU_WIRE = 4;
+export const MENU_MODELS = 5;
+export const MENU_REFRESH = 6;
+
+/** Which items this machine can actually use, in the dictated order.
+ *
+ *  Progressive disclosure, not decoration: an item that can only fail is a
+ *  trap. Nothing installed means installing is the only real action, so that
+ *  is the entire menu. Recycling an exit needs a WARP binary to route through.
+ *
+ *  Exported so the gating is testable without a Pi runtime: this is the rule
+ *  that used to be unexpressible, because the early return removed the menu
+ *  before any of it could run. */
+export function visibleMenuIndices(state: { relayReady: boolean; warpReady: boolean }): number[] {
+	const visible: number[] = [];
+	for (let index = 0; index < MENU_ITEMS.length; index++) {
+		if (index !== MENU_INSTALL && !state.relayReady) continue;
+		if (index === MENU_RECYCLE && !state.warpReady) continue;
+		visible.push(index);
+	}
+	return visible;
+}
+
+export default async function (pi: ExtensionAPI) {
 	const g = globalThis as Record<symbol, unknown>;
 	if (g[REG_KEY]) return;
 
+	/** Register or re-register the provider from a catalog. Registration after
+	 *  initial loading takes effect immediately (docs/custom-provider.md:122),
+	 *  so publishing a fresh list never asks the user to restart Pi.
+	 *
+	 *  One body for the three callers — startup, the menu refresh and the
+	 *  post-install republish — because three copies would eventually disagree
+	 *  about `refreshModels` or the streaming handler. */
+	function publishCatalog(models: RegistryModel[]): void {
+		pi.registerProvider(PROVIDER, {
+			apiKey: API_KEY,
+			api: API,
+			baseUrl: RELAY_URL,
+			authHeader: true,
+			models: buildPiModels(models),
+			// Pi calls this on every model refresh, so the picker follows the
+			// service instead of a snapshot taken at startup. No embedded list
+			// and no fallback: an unreachable catalog reports empty.
+			refreshModels: async ({ signal }: { signal?: AbortSignal }) =>
+				buildPiModels((await fetchRelayCatalog(signal)).models) as never,
+			streamSimple: gateStreamSimple,
+		});
+	}
+
 	const session = resolveSessionId();
-	const live = resolveLiveIds();
-	const discovered = discoverFreeModels(live.liveIds);
 
-	if (process.env.PI_FREE_BRIDGE_DRY_RUN === "1") {
-		printDryRun(discovered, session, live);
-	}
-
-	if (discovered.models.length === 0) {
-		// Fail closed: registering an empty model list would silently blank the
-		// provider instead of surfacing a readable diagnostic.
-		console.error(
-			`pi-free-bridge: no free models discovered (${discovered.source}); ` +
-				"provider not registered.",
-		);
-		return;
-	}
-
-	pi.registerProvider(PROVIDER, {
-		apiKey: API_KEY,
-		api: API,
-		baseUrl: RELAY_URL,
-		authHeader: true,
-		models: buildPiModels(discovered.models),
-		streamSimple: gateStreamSimple,
-	});
-
-	g[REG_KEY] = true;
-
-	// Start the relay early so the first request does not pay the spawn cost.
-	// A failure is reported once and retried by gateStreamSimple on the first
-	// real request; it must never take Pi down at startup.
+	// The relay first, then its catalog: the extension no longer has a door of
+	// its own to the service, so asking for models before the relay exists is
+	// asking a process that is not running. Starting it here also keeps the
+	// original intent (the first real request never pays the spawn cost).
+	// A failure is reported once and retried on the first real request; it must
+	// never take Pi down at startup.
 	if (process.env.PI_FREE_BRIDGE_DRY_RUN !== "1") {
-		void ensureRelay({
+		await ensureRelay({
 			port: RELAY_PORT,
 			sessionId: session.sessionId,
 			sessionSource: session.source,
@@ -2270,6 +2268,40 @@ export default function (pi: ExtensionAPI) {
 			console.error(`pi-free-bridge: relay not ready — ${(err as Error).message}`);
 		});
 	}
+
+	// The catalog comes from the relay, never from the OpenCode cache file: that
+	// file only exists on a machine that already has OpenCode, which is the
+	// opposite of the machine this bridge is for.
+	const discovered =
+		process.env.PI_FREE_BRIDGE_SKIP_CATALOG === "1"
+			? { models: [] as RegistryModel[], source: "catalog fetch skipped" }
+			: await fetchRelayCatalog(AbortSignal.timeout(4000));
+
+	if (process.env.PI_FREE_BRIDGE_DRY_RUN === "1") {
+		printDryRun(discovered, session);
+	}
+
+	// Zero models is NOT a failure any more. The provider is only registered
+	// when it has a catalog to publish — registering an empty list would blank
+	// the provider — but the commands below must register either way. The menu
+	// is most needed on a machine where nothing is set up yet, and that is
+	// exactly the machine that used to lose it to an early return here.
+	if (discovered.models.length === 0) {
+		// A catalog that could not be read is not a vendor without free models.
+		// Reporting them the same way would send someone hunting for a missing
+		// model when the real problem is an unreachable relay.
+		console.error(
+			discovered.unavailable
+				? `pi-free-bridge: model catalog unavailable — ${discovered.unavailable}. ` +
+						"The provider stays unregistered until the relay can answer. Run /free-bridge."
+				: `pi-free-bridge: the catalog answered with no free models (${discovered.source}). ` +
+						"The provider stays unregistered. Run /free-bridge for details.",
+		);
+	} else {
+		publishCatalog(discovered.models);
+	}
+
+	g[REG_KEY] = true;
 
 	// Keep the picker able to see the models this bridge just registered. Silent
 	// when the scope is already healthy; this is a repair, not a notification.
@@ -2300,25 +2332,21 @@ export default function (pi: ExtensionAPI) {
 	// every registered command, aliases included, costs a completion entry.
 	// -----------------------------------------------------------------------
 
-	/** The seven menu entries, in the order the owner dictated. Never reorder. */
-	const MENU_ITEMS = [
-		"Instalar / actualizar relay",
-		"Estado del relay",
-		"WARP: on / off",
-		"Reciclar WARP",
-		"Cable: v1 / v2",
-		"Modelos",
-		"Refrescar sesión",
-	] as const;
+	/** Is the relay runnable on this machine: an installed binary, or Bun to
+	 *  run the script. This is what decides whether the menu can offer anything
+	 *  beyond installing. */
+	function relayReady(): boolean {
+		const configured = readBridgeConfig().relayBin?.trim();
+		if (configured && existsSync(configured)) return true;
+		return resolveBunPath() !== undefined;
+	}
 
-	/** Named menu indices, so the dispatch never depends on a bare number. */
-	const MENU_INSTALL = 0;
-	const MENU_STATUS = 1;
-	const MENU_WARP = 2;
-	const MENU_RECYCLE = 3;
-	const MENU_WIRE = 4;
-	const MENU_MODELS = 5;
-	const MENU_REFRESH = 6;
+	/** Is a WARP binary available? Recycling an exit without one is a menu
+	 *  entry that can only fail, so it is hidden. */
+	function warpReady(): boolean {
+		const bin = resolveWarpBin();
+		return bin !== undefined && existsSync(bin);
+	}
 
 	/** ctx shape the menu needs: notify/confirm always, select when Pi offers it. */
 	type MenuCtx = WarpPromptContext & {
@@ -2476,33 +2504,24 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(lines.join("\n"), "info");
 	}
 
-	/** Menu item 7: re-fetch the live free-model list and re-register the provider. */
+	/** Menu item 7: re-fetch the catalog from the service and re-register.
+	 *  Registration is live (docs/custom-provider.md:122), so no Pi restart. */
 	async function refreshLiveModels(ctx: MenuCtx): Promise<void> {
-		ctx.ui.notify("Refreshing the live free-model list…", "info");
+		ctx.ui.notify("Refreshing the free-model catalog from the service…", "info");
 		try {
-			const registryFree = new Set<string>();
-			for (const [id, meta] of Object.entries<Record<string, unknown>>(
-				JSON.parse(readFileSync(resolveRegistryPath()!, "utf-8"))?.opencode?.models ?? {},
-			)) {
-				if (isFree(meta) && !EXCLUDED_MODELS.has(id)) registryFree.add(id);
-			}
-			const liveIds = await fetchLiveFreeIds(registryFree);
-			if (liveIds.length === 0) {
-				ctx.ui.notify("The surface advertised no free models; keeping the current list", "warning");
+			const catalog = await fetchRelayCatalog(AbortSignal.timeout(8000));
+			if (catalog.models.length === 0) {
+				ctx.ui.notify(
+					catalog.unavailable
+						? `Catalog unavailable: ${catalog.unavailable}. Keeping the current list.`
+						: `The service answered with no free models (${catalog.source}). Keeping the current list.`,
+					catalog.unavailable ? "error" : "warning",
+				);
 				return;
 			}
-			writeBridgeConfig({ liveIds });
-			const refreshed = discoverFreeModels(new Set(liveIds));
-			pi.registerProvider(PROVIDER, {
-				apiKey: API_KEY,
-				api: API,
-				baseUrl: RELAY_URL,
-				authHeader: true,
-				models: buildPiModels(refreshed.models),
-				streamSimple: gateStreamSimple,
-			});
+			publishCatalog(catalog.models);
 			ctx.ui.notify(
-				`${PROVIDER} now registers ${refreshed.models.length} free models: ${refreshed.models.map((m) => m.id).join(", ")}`,
+				`${PROVIDER} now registers ${catalog.models.length} free models: ${catalog.models.map((m) => m.id).join(", ")}`,
 				"info",
 			);
 		} catch (err) {
@@ -2638,7 +2657,28 @@ export default function (pi: ExtensionAPI) {
 	 *  This is also the only path that ever downloads one: nothing is fetched at
 	 *  Pi startup, and an existing Bun keeps being used until the user asks. */
 	async function installOrUpdateRelay(ctx: MenuCtx): Promise<void> {
-		await runRelayInstallWithPrompt(ctx);
+		const installed = await runRelayInstallWithPrompt(ctx);
+		if (!installed) return;
+
+		// S3: a relay that just started is a catalog the picker may never have
+		// seen. Publish it now — registration is live, so there is no restart.
+		const catalog = await fetchRelayCatalog(AbortSignal.timeout(8000));
+		if (catalog.models.length === 0) {
+			ctx.ui.notify(
+				catalog.unavailable
+					? `Relay instalado, pero el catálogo no está disponible: ${catalog.unavailable}. ` +
+							"El ítem «Modelos» lo reintenta sin reiniciar nada."
+					: `Relay instalado. El servicio respondió sin modelos gratis (${catalog.source}).`,
+				catalog.unavailable ? "error" : "warning",
+			);
+			return;
+		}
+		publishCatalog(catalog.models);
+		ctx.ui.notify(
+			`${PROVIDER}: ${catalog.models.length} modelos gratis registrados en vivo. ` +
+				"No hace falta reiniciar Pi.",
+			"info",
+		);
 	}
 
 	/** Ask which menu entry to run. `select` when Pi exposes it, otherwise a
@@ -2662,14 +2702,20 @@ export default function (pi: ExtensionAPI) {
 	async function runMenu(ctx: MenuCtx): Promise<void> {
 		const warpNow = resolveWarpMode();
 		const wireNow = resolveWireMode();
-		const labels = MENU_ITEMS.map((item, index) => {
+
+		// `visible` maps a picked row back to its real menu index, so hiding an
+		// item never shifts the dispatch.
+		const visible = visibleMenuIndices({ relayReady: relayReady(), warpReady: warpReady() });
+		const labels = visible.map((index) => {
+			const item = MENU_ITEMS[index];
 			if (index === MENU_WARP) return `${item} — ahora: ${warpNow}`;
 			if (index === MENU_WIRE) return `${item} — ahora: ${wireNow}`;
 			return item;
 		});
 
-		const index = await pickMenuItem(ctx, labels);
-		if (index === undefined) return;
+		const picked = await pickMenuItem(ctx, labels);
+		if (picked === undefined) return;
+		const index = visible[picked];
 
 		switch (index) {
 			case MENU_INSTALL:

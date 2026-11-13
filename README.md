@@ -6,6 +6,30 @@ Registra **únicamente** el tier gratuito anónimo de OpenCode bajo el provider 
 **`oc-sdk-zen`** e inyecta el contrato del gate desde un relay local ejecutado por
 Bun, así que sobrevive a `pi update` y no depende de ningún puente de terceros.
 
+## Instalación rápida
+
+```bash
+gentle-shell install pi-free-bridge
+```
+
+Reiniciá Pi una vez y escribí `/free-bridge` para abrir el menú.
+
+**No hace falta Bun ni tener OpenCode instalado.** El relay es un ejecutable por
+sistema operativo que la extensión descarga cuando se lo pedís desde el menú,
+después de confirmar: nada se baja al abrir Pi. Windows, Linux y macOS, en x64
+y ARM. Pi sí necesita Node, como cualquier extensión de Pi.
+
+Después de instalado, todo se maneja desde un solo comando:
+
+| Comando | Para qué |
+| --- | --- |
+| `/free-bridge` | El menú: instalar el relay, WARP, cable, modelos |
+| `/free-bridge-warp-recycle` | Reciclar la salida cuando algo se traba |
+| `/free-bridge-doctor` | Diagnóstico, para pegar en un issue |
+
+La guía paso a paso con capturas sigue abajo, para quien prefiera ir viendo
+cada pantalla.
+
 ## Instalar
 
 Siete pasos, todos desde el terminal. Las capturas son de una instalación real
@@ -438,13 +462,20 @@ Una lista plana, sin submenús, en este orden:
 | 3 | WARP: on / off | Muestra el modo actual y lo cambia. Los modos son `off`, `auto` y `on`; sin `warp-minimal` arriba, ofrece instalarlo |
 | 4 | Reciclar WARP | Lo mismo que `/free-bridge-warp-recycle` |
 | 5 | Cable: v1 / v2 | Muestra el modo actual y lo cambia |
-| 6 | Modelos | Lista los modelos gratis efectivamente registrados y de dónde salió el registry |
-| 7 | Refrescar sesión | Re-pide la lista de modelos gratis, la persiste y re-registra el provider |
+| 6 | Modelos | Lista los modelos gratis efectivamente registrados y de dónde salieron: hoy, el catálogo del servicio |
+| 7 | Refrescar sesión | Vuelve a pedir el catálogo gratis al servicio y re-registra el provider **en vivo**, sin reiniciar Pi |
 
 Los ítems 3 y 5 muestran el estado actual en la etiqueta antes de que elijas,
 así el toggle nunca es una adivinanza. Si una variable de entorno fija el valor
 (`PI_FREE_BRIDGE_WARP_MODE`, `RELAY_WIRE_MODE`), el menú te lo dice en vez de
 fingir que lo cambió.
+
+**El menú muestra sólo lo que podés usar.** No es una lista fija de siete: en
+una máquina recién instalada, sin relay y sin WARP, el menú es un solo ítem
+—«Instalar / actualizar relay»— porque los demás sólo podrían fallar. Cuando el
+relay ya corre aparecen los otros seis, y «Reciclar WARP» se suma recién cuando
+hay un binario de WARP al cual pedirle la rotación. La lista se arma en cada
+entrada al menú, así que si instalás algo, la próxima vez está ahí.
 
 #### Qué pasó con los comandos que ya no están
 
@@ -461,6 +492,38 @@ El relay tampoco exige Bun: si no hay Bun ni binario, `/free-bridge` →
 descarga nada al arrancar Pi**, y si Bun ya está se sigue usando sin que lo
 notes.
 
+#### De dónde salen los modelos
+
+Del **servicio**, pero pasando por el **relay**. La extensión le pide el
+catálogo al relay (que corre en `127.0.0.1`), y el relay es el único que habla
+con `opencode.ai/inference/v1/models`: es quien tiene los headers del servicio
+en el formato que el servicio espera, el túnel y la sesión. La extensión se
+queda con los modelos cuyo precio es cero: hoy son **12**. No lee ningún archivo
+de caché de OpenCode, y eso importa porque ese archivo sólo existe en una
+máquina que ya tiene OpenCode instalado —justo lo contrario de la máquina para
+la que sirve este puente—.
+
+Una sola puerta hacia el servicio, no dos: si mañana el servicio cambia sus
+headers, se arregla en el relay y no hay que perseguir copias.
+
+Y una distinción que el menú respeta: si el catálogo **no se pudo leer**
+(servicio caído, 429, túnel abajo) la extensión lo dice así, con el motivo. Eso
+no es lo mismo que «el servicio no ofrece modelos gratis», que es una respuesta
+válida y distinta. Confundirlas te mandaría a buscar un modelo que falta cuando
+el problema real es que nadie pudo preguntar.
+
+De ahí salen dos cosas que vas a notar:
+
+- **No hace falta tener OpenCode abierto, ni instalado, ni haberlo corrido
+  nunca.** Los modelos aparecen igual.
+- **Nada de reiniciar Pi.** Al terminar de instalar el relay, la extensión
+  publica el catálogo en el acto, y Pi lo toma sin relanzar nada. Lo mismo vale
+  para «Refrescar sesión».
+
+Un modelo sin precio legible **no** se ofrece. Un precio que no se puede leer
+no es un precio cero, y adivinar ahí significaría anunciarte como gratis algo
+que te puede costar cuota.
+
 Una aclaración honesta sobre el checksum: el `SHA256SUMS` prueba que lo que
 bajaste llegó intacto y es exactamente el archivo que se publicó, **no** que
 quien lo publicó fuera confiable.
@@ -471,7 +534,7 @@ quien lo publicó fuera confiable.
 |---|---|---|
 | `node repro.mjs [model-id]` | Dispara un request crudo contra el gate; espera `200 SSE-CHUNK (PASS)`. Sin argumento sondea `mimo-v2.6-flash-free` | sí |
 | `node test/smoke.mjs` | Aserciona el registro contra el registry real: provider id, el set exacto de modelos gratis, cero fugas de modelos excluidos o pagados, y que cada modelo apunte al relay local | no |
-| `PI_FREE_BRIDGE_DRY_RUN=1 pi …` | Imprime origen del registry, superficie, api key, session id + origen, modelos aceptados y descartados, y sigue normal | no |
+| `PI_FREE_BRIDGE_DRY_RUN=1 pi …` | Imprime origen del catálogo, superficie, api key, session id + origen, modelos aceptados y descartados, y sigue normal | no |
 | `pi -p --no-session --model oc-sdk-zen/<id> "Reply with exactly: OK"` | Sondeo end-to-end de un modelo a través de Pi | sí |
 | `pi list` | Muestra los paquetes instalados (el nuestro aparece como `..\..\pi-free-bridge`) | no |
 | `pi --list-models` | Muestra qué va a ofrecer el picker | no |

@@ -7,6 +7,7 @@
 // helpers are exported and covered here under plain Node: importing the module
 // must not start a server.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -24,7 +25,10 @@ import test from "node:test";
 
 import {
 	basicAuthFor,
+	catalogPrice,
 	classifyGate429,
+	freeCatalog,
+	relayCatalog,
 	ensureEnvBlock,
 	forwardedHeaders,
 	ensureGateTools,
@@ -3893,6 +3897,8 @@ test("relayBinaryFilename: keeps the version in the name so rollback is the prev
 });
 
 test("the extension registers exactly three commands, no aliases, no argument form", async () => {
+	// The catalog fetch is skipped so this test never depends on the network.
+	process.env.PI_FREE_BRIDGE_SKIP_CATALOG = "1";
 	// S1: the whole point of the change is the autocomplete list, so the list
 	// itself is what gets asserted — not a grep of the source.
 	const registered = [];
@@ -3930,4 +3936,155 @@ test("the extension registers exactly three commands, no aliases, no argument fo
 			`${gone} must not be registered`,
 		);
 	}
+});
+
+// ---------------------------------------------------------------------------
+// No OpenCode required (spec odd/tasks/no-opencode-required.md, S1 and S5).
+//
+// The defect a real container test found: on a machine with no OpenCode the
+// extension loaded but registered nothing, because model discovery found no
+// registry and the factory returned before the registrations. The menu was
+// missing exactly where it was most needed.
+//
+// The registry-reading discovery path is gone (it is the relay's job now), so
+// this case is kept as the regression that must not come back: an empty or
+// missing catalog may cost the provider, never the commands.
+// ---------------------------------------------------------------------------
+
+test("commands register even when model discovery finds nothing at all", () => {
+	// The existing registration test above only passes because this developer
+	// machine HAS an OpenCode registry. Here HOME points at an empty directory,
+	// so discovery is guaranteed to yield zero, and a child process is used
+	// because the factory guards double registration on globalThis.
+	const home = mkdtempSync(join(tmpdir(), "pfb-no-opencode-"));
+	const indexPath = new URL("../index.ts", import.meta.url).href;
+	const marker = "@@REGISTERED@@";
+	const script = `
+		const { default: factory } = await import(${JSON.stringify(indexPath)});
+		const registered = [];
+		await factory({
+			registerCommand: (name) => registered.push(name),
+			registerProvider: () => {},
+			registerTool: () => {},
+			on: () => {},
+			config: {},
+			ui: { notify() {} },
+		});
+		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify(registered));
+	`;
+	// DRY_RUN keeps the child from spawning a relay; its output is skipped by
+	// reading from the marker instead of parsing the whole stream.
+	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "1" },
+		encoding: "utf-8",
+	});
+	const registered = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+
+	assert.deepEqual(
+		registered,
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
+		"zero models must not cost the user the menu",
+	);
+});
+
+test("the menu shows only the install item when nothing is installed", () => {
+	const { visibleMenuIndices, MENU_INSTALL, MENU_ITEMS } = releaseMod;
+	assert.equal(MENU_ITEMS.length, 7);
+
+	assert.deepEqual(
+		visibleMenuIndices({ relayReady: false, warpReady: false }),
+		[MENU_INSTALL],
+		"relay not installed: installing is the only real action",
+	);
+	assert.deepEqual(
+		visibleMenuIndices({ relayReady: true, warpReady: false }),
+		[0, 1, 2, 4, 5, 6],
+		"everything except recycle once the relay runs",
+	);
+	assert.deepEqual(visibleMenuIndices({ relayReady: true, warpReady: true }), [0, 1, 2, 3, 4, 5, 6]);
+});
+
+test("recycle is hidden without a WARP binary and shown with one", () => {
+	const { visibleMenuIndices, MENU_RECYCLE } = releaseMod;
+	assert.equal(
+		visibleMenuIndices({ relayReady: true, warpReady: false }).includes(MENU_RECYCLE),
+		false,
+		"rotating an exit with no WARP binary can only fail",
+	);
+	assert.equal(visibleMenuIndices({ relayReady: true, warpReady: true }).includes(MENU_RECYCLE), true);
+});
+
+test("the provider is published from the relay catalog with refreshModels wired", () => {
+	// S2 as amended: the extension asks the RELAY, never the vendor. A vendor
+	// payload ({data:[...]}) must not be understood here any more — that is what
+	// "one door" means. Exclusions still apply on this side.
+	const home = mkdtempSync(join(tmpdir(), "pfb-catalog-"));
+	const marker = "@@PUBLISHED@@";
+	const script = `
+		const relayBody = { ok: true, models: [
+			{ id: "a-free", name: "A Free", limit: { context: 1000, output: 100 }, input: ["text"] },
+			{ id: "jev-1.13-free", name: "Excluded on this side", limit: {}, input: ["text"] },
+		] };
+		const vendorBody = { data: [ { id: "a-free", cost: { text: { input: { price: 0 }, output: { price: 0 } } } } ] };
+		const kind = process.env.PFB_PAYLOAD;
+		globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => (kind === "vendor" ? vendorBody : relayBody) });
+		const { default: factory } = await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});
+		const providers = [];
+		await factory({
+			registerCommand: () => {},
+			registerProvider: (name, config) => providers.push({ name, config }),
+			registerTool: () => {},
+			on: () => {},
+			config: {},
+			ui: { notify() {} },
+		});
+		const config = providers[0] && providers[0].config;
+		// The live republish path: this is the same call the post-install
+		// republish and the menu refresh use, so exercising it here covers S3
+		// without stubbing a binary download.
+		const refreshed = config && config.refreshModels ? await config.refreshModels({ signal: undefined }) : undefined;
+		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify({
+			ids: config ? config.models.map((m) => m.id) : [],
+			hasRefresh: typeof (config && config.refreshModels) === "function",
+			refreshedIds: Array.isArray(refreshed) ? refreshed.map((m) => m.id) : null,
+		}));
+	`;
+	const run = (payloadKind) => {
+		const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+			env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "", PFB_PAYLOAD: payloadKind },
+			encoding: "utf-8",
+		});
+		return JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+	};
+
+	const relay = run("relay");
+	assert.deepEqual(relay.ids, ["a-free"], "the excluded id is filtered on this side");
+	assert.equal(relay.hasRefresh, true, "Pi refreshes the catalog through refreshModels");
+	assert.deepEqual(relay.refreshedIds, ["a-free"], "a live refresh republishes through the relay");
+
+	const vendor = run("vendor");
+	assert.deepEqual(vendor.ids, [], "a vendor payload is not read here: one door to the vendor");
+});
+
+test("parseRelayCatalog: a failed catalog is not an empty catalog", () => {
+	// The distinction the menu depends on: "the vendor said 429" and "the vendor
+	// offers nothing free" are different facts and must not render the same.
+	const genuinelyEmpty = releaseMod.parseRelayCatalog(200, { ok: true, models: [], skipped: 74 });
+	assert.deepEqual(genuinelyEmpty.models, []);
+	assert.equal(genuinelyEmpty.unavailable, undefined);
+	// The relay is the side that knows how many it refused; the dry run reports
+	// that number instead of recomputing a list this side no longer builds.
+	assert.equal(genuinelyEmpty.skippedCount, 74);
+
+	const failed = releaseMod.parseRelayCatalog(502, { ok: false, reason: "https://x/models -> HTTP 429" });
+	assert.equal(failed.models.length, 0);
+	assert.match(failed.unavailable, /429/, "a vendor failure must say so, not look empty");
+
+	const free = releaseMod.parseRelayCatalog(200, {
+		ok: true,
+		models: [{ id: "a-free", name: "A", limit: { context: 1000 }, input: ["text"] }],
+	});
+	assert.deepEqual(free.models.map((m) => m.id), ["a-free"]);
+	assert.equal(free.models[0].meta.limit.context, 1000);
+	assert.deepEqual(free.models[0].meta.cost, { input: 0, output: 0, cache_read: 0, cache_write: 0 });
 });
