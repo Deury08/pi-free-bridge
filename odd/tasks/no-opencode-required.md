@@ -64,6 +64,7 @@ agreed order."
 | T3 | S1, S5 tests | inline | done — commit `1e8a0f4` |
 | T4 | S2 | inline | done — commit `11036b8` |
 | T5 | S3 | inline | done — commit `c29327d` |
+| T6 | S2 amended, S2b | inline | done — commit `bdcc1e7` |
 
 ## Log
 
@@ -164,6 +165,12 @@ and someone verifying one should not have to hold the others in their head.
   registry read. This is the slice carrying the pricing-shape trap.
 - `ee93ad1` — S3. Live publish after install, plus collapsing three copies of
   the provider registration into one `publishCatalog(models)`.
+- `bdcc1e7` — S2 amended + S2b: the relay serves `GET /models`, the extension
+  stops talking to the vendor, and a failed catalog stops looking like an empty
+  one. Verifiable alone: curl the relay route with and without a reachable
+  upstream and compare `200 {ok:true}` against `502 {ok:false,reason}`. About 250
+  changed lines; ~751 accumulated on the branch, which is why this slice is
+  recorded here rather than folded into `427accd`.
 - `8e9e448` (peer-authored) and the README edits in this doc's branch — the
   claims that the extension needs no OpenCode and no Bun. They are true only
   because of the three commits above, so they must land with them and never on
