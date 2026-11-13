@@ -34,7 +34,7 @@ volvé a correr el paso 1.
 
 ### 3. Activar WARP
 
-Dentro de Pi escribí `/free-bridge-warp` (con el `/` aparece el autocompletado;
+Dentro de Pi escribí `/free-bridge` y elegí «WARP: on / off» (con el `/` aparece el autocompletado;
 Enter lo selecciona).
 
 ![Autocompletado del comando free-bridge-warp](<Imagenes/Activando%20Warp.png>)
@@ -173,7 +173,7 @@ dos lados** (bun-upgrades S2):
 Precedencia en el arranque del relay: override del usuario
 (`PI_FREE_BRIDGE_SESSION_ID` / `config.sessionId` / `RELAY_SESSION`) > id
 cosechado por Pi (`RELAY_SESSION_PI`) > cosecha local del relay. El origen
-quedará visibible en `/health` (`sessionSource`) y `/free-bridge-session`:
+quedará visibible en `/health` (`sessionSource`) y en «Estado del relay» del menú:
 `env`, `config`, `pi-harvest`, `opencode.db` o `session-diff`.
 
 ## Egress WARP (`off` / `auto` / `on`)
@@ -196,8 +196,8 @@ Regla invariante: **no hay failover a mitad de stream.** Si la conexión muere
 después del primer byte, el stream termina tal como está — reintentarlo
 corrompería la respuesta SSE.
 
-**Modo del cable (v1 / v2):** `/free-bridge-wire` sin argumentos abre un selector
-con las dos versiones y marca cuál está activa; `/free-bridge-wire v1|v2` la fija.
+**Modo del cable (v1 / v2):** el ítem «Cable: v1 / v2» del menú abre un selector
+con las dos versiones y marca cuál está activa, igual que el comando directo que ya no existe.
 Se guarda como `wireMode` en el mismo config y el relay lo relee en cada request,
 igual que el warp: no hay que reiniciar ni reiniciar Pi. Por defecto es `v1`, los
 cinco headers que ya manda toda instalación; `v2` agrega `x-session-affinity`,
@@ -208,7 +208,7 @@ existe para hacer.
 
 **Hot reload:** el relay relee `warpEnabled` del config en **cada request**
 (la extension se lo pasa por `RELAY_CONFIG_PATH`), así que cambiar el modo con
-`/free-bridge-warp off|auto|on` no reinicia ni mata el relay: el pid sobrevive y
+Cambiar el modo WARP no reinicia ni mata el relay: el pid sobrevive y
 el cambio aplica en el próximo request. Si el archivo está malformado o ilegible,
 el relay conserva el último modo conocido y avisa una sola vez por stderr, sin
 tirar ningún request. La excepción es `PI_FREE_BRIDGE_WARP_MODE`: si existe, pinna
@@ -387,7 +387,7 @@ publicita:
 `nemotron-3.5-lightning-free`, `nemotron-3.5-super-vl-free`
 
 Ese es el snapshot que el paquete trae para arrancar offline; el set real cambia
-con el tiempo (hoy la superficie publica otro conjunto). `/free-bridge-refresh` lo
+con el tiempo (hoy la superficie publica otro conjunto). «Refrescar sesión» lo
 re-pide y lo persiste, que es la forma de actualizarlo sin tocar código.
 
 Dos trampas del filtro, ambas medidas, ambas que conviene tener presentes:
@@ -400,7 +400,7 @@ Dos trampas del filtro, ambas medidas, ambas que conviene tener presentes:
   lista publicitada.
 
 La lista publicitada es un snapshot fechado en `index.ts` para que el arranque
-quede offline y determinístico; `/free-bridge-refresh` la re-pide, la persiste en
+quede offline y determinístico; «Refrescar sesión» la re-pide, la persiste en
 `~/.pi/agent/pi-free-bridge.json` y re-registra el provider.
 
 Excluidos a propósito:
@@ -417,16 +417,53 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 
 ### Dentro de una sesión de Pi (slash commands)
 
+Sólo quedan **tres comandos registrados**. Todo lo demás vive en un menú,
+porque cada comando registrado ocupa una línea del autocompletado — y los
+alias también aparecen ahí, así que no son una salida.
+
 | Comando | Qué hace | Cuándo usarlo |
 |---|---|---|
-| `/free-bridge-models` | Lista los modelos efectivamente registrados y de dónde salió el registry | El picker se ve mal, o querés confirmar el filtro |
-| `/free-bridge-session` | Muestra el session id que el relay está mandando y su origen (`env`, `config`, `opencode.db` o `session-diff`) | Si los requests empiezan a fallar — mirá el id antes de tocar código |
-| `/free-bridge-session ses_…` | Cambia el session id de esta sesión **y lo persiste** en `~/.pi/agent/pi-free-bridge.json` | El gate responde `403` porque el id quedó viejo |
-| `/free-bridge-refresh` | Pide `GET /inference/v1/models`, lo cruza con los gratis del registry, persiste el resultado y re-registra el provider | OpenCode agregó o sacó un modelo gratis |
-| `/free-bridge-warp` | Muestra el modo de salida WARP (`off` por defecto), el endpoint efectivo y el último egress usado | Diagnóstico de red o grandes rate limits |
-| `/free-bridge-warp off\|auto\|on` | Cambia y persiste el modo: `off` directo; `auto` directo primero, WARP ante rate limit; `on` siempre WARP. **Hot reload:** sin reiniciar el relay — aplica en el próximo request | Requiere `warp-minimal` en `127.0.0.1:8789` para modos no-`off`. Si no está y no hay ruta configurada, Pi **te pregunta** y ofrece descargar e instalar la release oficial (checksum verificado) |
-| `/free-bridge-warp bin <ruta>` | Configura la ruta del binario `warp-minimal` (queda en `warpBin` de la config) | Cuando ya lo tenés compilado o descargado y preferís apuntarlo a mano |
-| `/free-bridge-warp-recycle` | Recupera el egress WARP ahora, por el paso más barato primero: lee el pool y hace recycle si sólo una salida puede servir o si alguna está parkeada en el cool-down de 30 minutos del proxy; si no, hace un swap apuntado de la salida en uso y vuelve a leer el pool después de cada swap aceptado, parando cuando queda una sola sirviendo. Nunca arranca un swap que dejaría el pool sin salidas, porque el drain retiene esa salida hasta 120 s. Espera a que no haya respuestas entregándose por el túnel e informa cada paso, no un veredicto | Cuando un `429` te mató el turno y la rotación automática no llegó (o no querés gastar un turno para que llegue). **No lo corras desde una sesión que esté usando el bridge**: el swap cambia el exit debajo de tu propia respuesta |
+| `/free-bridge` | Abre el menú. **No toma argumentos** | Siempre que quieras hacer algo: es la puerta de entrada |
+| `/free-bridge-warp-recycle` | Recupera el egress WARP ahora, por el paso más barato primero: lee el pool y hace recycle si sólo una salida puede servir o si alguna está parkeada en el cool-down de 30 minutos del proxy; si no, hace un swap apuntado de la salida en uso y vuelve a leer el pool después de cada swap aceptado, parando cuando queda una sola sirviendo. Nunca arranca un swap que dejaría el pool sin salidas, porque el drain retiene esa salida hasta 120 s. Espera a que no haya respuestas entregándose por el túnel e informa cada paso, no un veredicto. Es el mismo cuerpo que el ítem «Reciclar WARP» del menú | Cuando un `429` te mató el turno y la rotación automática no llegó. Está directo justamente para eso: en una incidencia no querés navegar un menú. **No lo corras desde una sesión que esté usando el bridge**: el swap cambia el exit debajo de tu propia respuesta |
+| `/free-bridge-doctor` | Diagnostica y repara por qué faltan los modelos en el picker. No está en el menú: es un comando de diagnóstico, no una acción de uso diario | Falta un modelo en el picker |
+
+#### El menú de `/free-bridge`
+
+Una lista plana, sin submenús, en este orden:
+
+| # | Ítem | Qué hace |
+|---|---|---|
+| 1 | Instalar / actualizar relay | Baja el binario del relay para tu sistema, verifica el `SHA256SUMS` publicado, lo instala y reinicia el relay. **Pregunta antes** y avisa que reinicia el relay; si el binario nuevo no responde `/health`, vuelve al binario anterior |
+| 2 | Estado del relay | URL, proceso, `/health`, session id y su origen, modelos, WARP, cable y Bun |
+| 3 | WARP: on / off | Muestra el modo actual y lo cambia. Los modos son `off`, `auto` y `on`; sin `warp-minimal` arriba, ofrece instalarlo |
+| 4 | Reciclar WARP | Lo mismo que `/free-bridge-warp-recycle` |
+| 5 | Cable: v1 / v2 | Muestra el modo actual y lo cambia |
+| 6 | Modelos | Lista los modelos gratis efectivamente registrados y de dónde salió el registry |
+| 7 | Refrescar sesión | Re-pide la lista de modelos gratis, la persiste y re-registra el provider |
+
+Los ítems 3 y 5 muestran el estado actual en la etiqueta antes de que elijas,
+así el toggle nunca es una adivinanza. Si una variable de entorno fija el valor
+(`PI_FREE_BRIDGE_WARP_MODE`, `RELAY_WIRE_MODE`), el menú te lo dice en vez de
+fingir que lo cambió.
+
+#### Qué pasó con los comandos que ya no están
+
+`/free-bridge-session`, `/free-bridge-refresh`, `/free-bridge-models`,
+`/free-bridge-warp` y `/free-bridge-wire` **ya no se registran**. Su
+funcionalidad sigue completa detrás del menú: el estado y el session id en
+«Estado del relay», la lista en «Modelos», el refresh en «Refrescar sesión», y
+WARP y cable en sus propios ítems. Cambiar el session id a mano dejó de ser un
+comando: el relay lo resuelve solo y «Estado del relay» te dice cuál está
+usando y de dónde salió.
+
+El relay tampoco exige Bun: si no hay Bun ni binario, `/free-bridge` →
+«Instalar / actualizar relay» te ofrece el binario de tu sistema. **Nunca se
+descarga nada al arrancar Pi**, y si Bun ya está se sigue usando sin que lo
+notes.
+
+Una aclaración honesta sobre el checksum: el `SHA256SUMS` prueba que lo que
+bajaste llegó intacto y es exactamente el archivo que se publicó, **no** que
+quien lo publicó fuera confiable.
 
 ### Terminal (fuera de Pi)
 
@@ -500,7 +537,7 @@ que ya tiene otras entradas, borrás esos modelos del picker.
 ```
 
 `oc-sdk-zen/*` cubre todos los modelos del momento y también los que agregue
-`/free-bridge-refresh`. Con ids literales (`oc-sdk-zen/deepseek-v4.1-flash-free`, …) todo
+«Refrescar sesión». Con ids literales (`oc-sdk-zen/deepseek-v4.1-flash-free`, …) todo
 modelo nuevo queda invisible hasta que edites la lista a mano, y es fácil olvidarse de
 alguno: el síntoma es "falta un modelo en el picker" sin ningún error que lo explique.
 
@@ -545,8 +582,8 @@ pi -p --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 
 | Síntoma | Primer movimiento |
 |---|---|
-| Los modelos gratis devuelven `403` de golpe | `node repro.mjs`. Pasa → problema de session id: `/free-bridge-session`. Falla → el gate se movió de nuevo: re-derivarlo y actualizar `HANDOFF.md` §4 + `index.ts` |
-| Falta un modelo en el picker | `/free-bridge-doctor` — repara el scope y dice por qué. Solo si `oc-sdk-zen/*` ya figura ahí: reiniciá Pi, después `/free-bridge-refresh`, y por último `/free-bridge-models` |
+| Los modelos gratis devuelven `403` de golpe | `node repro.mjs`. Pasa → problema de session id: mirá «Estado del relay» en `/free-bridge`. Falla → el gate se movió de nuevo: re-derivarlo y actualizar `HANDOFF.md` §4 + `index.ts` |
+| Falta un modelo en el picker | `/free-bridge-doctor` — repara el scope y dice por qué. Solo si `oc-sdk-zen/*` ya figura ahí: reiniciá Pi, después «Refrescar sesión», y por último «Modelos» en el menú |
 | Entradas rotas o inesperadas en el picker | `node test/smoke.mjs` |
 | Cambiaste el filtro o la receta de headers | `node test/smoke.mjs` (offline), después `node repro.mjs` (live) |
 | Un modelo falla end-to-end pero el gate está sano | `pi -p --no-session --model oc-sdk-zen/<id> "Reply with exactly: OK"` para aislar ese modelo |
@@ -643,12 +680,14 @@ El paso 6 es el que hace que una máquina **sin OpenCode instalado** arranque el
 relay en vez de fallar. Antes el relay se negaba a arrancar con una línea
 pidiendo correr OpenCode; ahora genera el id y sigue.
 
-Para forzar otro id:
+Para ver el id efectivo y su origen:
 
 ```
-/free-bridge-session                       # ver el id efectivo y su origen
-/free-bridge-session ses_abc123…           # usar uno nuevo y persistirlo
+/free-bridge                       # «Estado del relay»
 ```
+
+Ya no hay comando para forzar un id a mano: el relay lo resuelve solo, y
+`sessionId` en el JSON de abajo sigue mandando si lo escribís vos.
 
 El id forzado se persiste en `~/.pi/agent/pi-free-bridge.json`:
 
@@ -737,3 +776,111 @@ bien, casi siempre venció el session id, no el puente.
 ## Licencia
 
 MIT — ver [`LICENSE`](LICENSE).
+
+---
+
+## Relay standalone: sin Bun y sin OpenCode
+
+El relay puede correr solo, como un único ejecutable. **No hace falta instalar
+Bun, Node, ni OpenCode**, ni la extensión de Pi: el ejecutable trae el runtime
+adentro, genera su propio session id y trae los modelos adentro.
+
+### 1. Descargá el archivo de tu sistema
+
+En la página de **Releases** de este repositorio:
+
+| Tu sistema | Archivo |
+| --- | --- |
+| Windows 64 bits | `relay-windows-x64.exe` |
+| Linux 64 bits | `relay-linux-x64` |
+| Linux ARM (Raspberry, servidores ARM) | `relay-linux-arm64` |
+| macOS con Intel | `relay-darwin-x64` |
+| macOS con Apple Silicon (M1 o posterior) | `relay-darwin-arm64` |
+
+Si no sabés qué Mac tenés: menú Apple → *Acerca de esta Mac*. Si dice "Chip
+Apple M…" es ARM; si dice "Procesador Intel" es el otro.
+
+### 2. Corrélo
+
+**Windows** — abrí PowerShell en la carpeta donde lo bajaste:
+
+```powershell
+Unblock-File .\relay-windows-x64.exe
+.\relay-windows-x64.exe
+```
+
+`Unblock-File` evita el aviso de "Windows protegió tu PC" con archivos bajados
+de internet. Si aun así aparece, *Más información → Ejecutar de todas formas*.
+
+**macOS** — abrí Terminal en la carpeta donde lo bajaste:
+
+```bash
+chmod +x relay-darwin-arm64
+./relay-darwin-arm64
+```
+
+Si macOS lo bloquea por no estar firmado, dos caminos: clic derecho sobre el
+archivo → *Abrir* → *Abrir*, o quitarle la cuarentena:
+
+```bash
+xattr -d com.apple.quarantine relay-darwin-arm64
+```
+
+**Linux**:
+
+```bash
+chmod +x relay-linux-x64
+./relay-linux-x64
+```
+
+### 3. Comprobá que está vivo
+
+En otra terminal:
+
+```bash
+curl http://127.0.0.1:8788/health
+```
+
+Tiene que devolver un JSON con `"ok":true`. Para cortarlo, `Ctrl+C` en la
+terminal donde corre.
+
+### Opciones
+
+Todo tiene un valor por defecto: sin configurar nada, el relay escucha en el
+puerto 8788 y apunta al upstream de OpenCode.
+
+| Variable | Para qué | Por defecto |
+| --- | --- | --- |
+| `PORT` | Puerto donde escucha | `8788` |
+| `RELAY_UPSTREAM` | URL del upstream | `https://opencode.ai/inference/v1` |
+| `RELAY_WARP_MODE` | `off` / `auto` / `on` (usa el proxy WARP) | `off` |
+| `RELAY_WARP_PROXY` | URL del proxy WARP | `http://127.0.0.1:8789` |
+| `RELAY_WIRE_MODE` | `v1` / `v2` (set de headers) | `v1` |
+| `RELAY_API_KEY` | Credencial enviada al upstream | `public` |
+| `RELAY_STDIN_LIFETIME` | `off` mantiene el relay vivo aunque se cierre la entrada estándar (servicios, contenedores, `nohup`) | activo |
+
+Ejemplo, en Linux o macOS:
+
+```bash
+PORT=9000 RELAY_WARP_MODE=on ./relay-linux-x64
+```
+
+En PowerShell:
+
+```powershell
+$env:PORT=9000; $env:RELAY_WARP_MODE="on"; .\relay-windows-x64.exe
+```
+
+> Sin proxy WARP la IP local queda expuesta al límite diario del free tier. Si
+> el relay responde 429, `RELAY_WARP_MODE=on` cambia la salida.
+
+**Si lo vas a correr como servicio**, en un contenedor o con `nohup`, agregá
+`RELAY_STDIN_LIFETIME=off`. Sin eso el relay se apaga solo cuando se cierra su
+entrada estándar: esa es la conducta que usa la extensión para no dejar procesos
+huérfanos cuando Pi se cae, y en un binario suelto juega en contra.
+
+### Lo que este ejecutable NO hace
+
+No registra los modelos en el selector de Pi: eso lo hace la extensión. El
+binario es el relay solo — sirve para correr el puente aparte, en otra máquina,
+o adentro de un contenedor.

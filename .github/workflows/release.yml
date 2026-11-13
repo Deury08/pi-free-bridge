@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-windows-x64
+            asset: relay-windows-x64.exe
+          - target: bun-linux-x64
+            asset: relay-linux-x64
+          - target: bun-linux-arm64
+            asset: relay-linux-arm64
+          - target: bun-darwin-x64
+            asset: relay-darwin-x64
+          - target: bun-darwin-arm64
+            asset: relay-darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Compile
+        run: bun build --compile --target=${{ matrix.target }} relay.mjs --outfile dist/${{ matrix.asset }}
+
+      - name: Smoke test
+        if: matrix.target == 'bun-linux-x64'
+        run: |
+          set -euo pipefail
+          chmod +x dist/relay-linux-x64
+          PORT=8899 RELAY_WARP_MODE=off RELAY_STDIN_LIFETIME=off ./dist/relay-linux-x64 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -sf --max-time 2 http://127.0.0.1:8899/health -o /tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          grep -q '"service"' /tmp/health.json
+          grep -q '"wireMode"' /tmp/health.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A downloaded binary that will be executed needs something to compare
+      # against. Without this file a consumer can only trust the transport.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

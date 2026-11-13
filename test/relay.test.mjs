@@ -3774,3 +3774,160 @@ test("refreshWireMode: rereads the file per call, an env override pins it", asyn
 	refreshWireMode(pinned);
 	assert.equal(pinned.wireMode, "v1", "the env override pins the mode");
 });
+
+// ---------------------------------------------------------------------------
+// Relay release download path (spec odd/tasks/relay-download.md, S6-S7).
+//
+// These decide whether a downloaded binary is allowed to run, so they are
+// covered under plain Node the same way the relay helpers are: `index.ts`
+// exports them for exactly this reason.
+// ---------------------------------------------------------------------------
+
+const releaseMod = await import("../index.ts");
+const { createHash } = await import("node:crypto");
+
+// The real published SHA256SUMS for release v0.4.0 (run 43328430977), copied
+// verbatim so the parser is measured against the file it will actually read.
+const REAL_SHA256SUMS = [
+	"88ec4e7f095a32bfccf0a1ec62b038eaa843b191075f0f7fc76b558ac8ed5665  relay-darwin-arm64",
+	"04571e67cd8ff5389db429336b8965eeb1940d0de78328fb353b2eeeeeb06041  relay-darwin-x64",
+	"714c133e8fb073e154d69eedd8f2bbbb99aedaf8fc25048b8ef82a273063af47  relay-linux-arm64",
+	"c395a478000374e42467e51153deaad009aaeb62bac46e1f9f0a7243d3db1d1e  relay-linux-x64",
+	"6c77cab7bc1ef69215b164cc42ed448eaeea20eeb48bbe221e45a112f2aaeedf  relay-windows-x64.exe",
+].join("\n");
+
+test("relayAssetName: maps every published platform/arch pair to its real asset name", () => {
+	const cases = [
+		["win32", "x64", "relay-windows-x64.exe"],
+		["linux", "x64", "relay-linux-x64"],
+		["linux", "arm64", "relay-linux-arm64"],
+		["darwin", "x64", "relay-darwin-x64"],
+		["darwin", "arm64", "relay-darwin-arm64"],
+	];
+	for (const [platform, arch, expected] of cases) {
+		assert.equal(releaseMod.relayAssetName(platform, arch), expected, `${platform}/${arch}`);
+	}
+});
+
+test("relayAssetName: an unpublished pair fails loudly instead of guessing", () => {
+	assert.throws(
+		() => releaseMod.relayAssetName("freebsd", "x64"),
+		/no relay binary is published for freebsd\/x64/,
+	);
+	assert.throws(() => releaseMod.relayAssetName("linux", "ia32"), /linux\/ia32/);
+	assert.throws(() => releaseMod.relayAssetName("win32", "arm64"), /win32\/arm64/);
+});
+
+test("parseChecksums: reads the real published file, CRLF and the binary marker", () => {
+	const parsed = releaseMod.parseChecksums(REAL_SHA256SUMS);
+	assert.equal(parsed.errors.length, 0, parsed.errors.join("; "));
+	assert.equal(parsed.entries.size, 5);
+	assert.equal(
+		parsed.entries.get("relay-linux-x64"),
+		"c395a478000374e42467e51153deaad009aaeb62bac46e1f9f0a7243d3db1d1e",
+	);
+
+	// A Windows checkout can hand the manifest back with CRLF endings, and
+	// `sha256sum --binary` writes `hash *name` instead of `hash  name`.
+	const crlf = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789 *relay-linux-x64\r\n\r\n";
+	const windows = releaseMod.parseChecksums(crlf);
+	assert.equal(windows.errors.length, 0, windows.errors.join("; "));
+	assert.equal(
+		windows.entries.get("relay-linux-x64"),
+		"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+	);
+
+	// A truncated digest is not a checksum, and must not silently vanish.
+	const broken = releaseMod.parseChecksums("deadbeef  relay-linux-x64");
+	assert.equal(broken.entries.size, 0);
+	assert.equal(broken.errors.length, 1);
+	assert.match(broken.errors[0], /not a sha256 entry/);
+});
+
+test("verifyRelayChecksum: refuses a download whose digest does not match", () => {
+	const verdict = releaseMod.verifyRelayChecksum({
+		assetName: "relay-linux-x64",
+		bytes: Buffer.from("not the published binary"),
+		checksums: REAL_SHA256SUMS,
+	});
+	assert.equal(verdict.ok, false, "a mismatch must never be accepted");
+	assert.equal(verdict.reason, "mismatch");
+	assert.equal(verdict.expected, "c395a478000374e42467e51153deaad009aaeb62bac46e1f9f0a7243d3db1d1e");
+	assert.match(verdict.actual, /^[0-9a-f]{64}$/);
+	assert.notEqual(verdict.actual, verdict.expected);
+	assert.match(verdict.message, /checksum mismatch/);
+	assert.equal(verdict.expected === verdict.actual, false);
+});
+
+test("verifyRelayChecksum: accepts a matching download and refuses an unlisted asset", () => {
+	const bytes = Buffer.from("a binary that arrived intact");
+	const digest = createHash("sha256").update(bytes).digest("hex");
+	const manifest = `${digest}  relay-linux-x64`;
+
+	const accepted = releaseMod.verifyRelayChecksum({
+		assetName: "relay-linux-x64",
+		bytes,
+		checksums: manifest,
+	});
+	assert.equal(accepted.ok, true);
+	assert.equal(accepted.actual, digest);
+
+	// An asset the manifest does not list cannot be verified, so it must not run.
+	const unlisted = releaseMod.verifyRelayChecksum({
+		assetName: "relay-darwin-arm64",
+		bytes,
+		checksums: manifest,
+	});
+	assert.equal(unlisted.ok, false);
+	assert.equal(unlisted.reason, "not-listed");
+	assert.match(unlisted.message, /not listed in the published SHA256SUMS/);
+});
+
+test("relayBinaryFilename: keeps the version in the name so rollback is the previous file", () => {
+	const first = releaseMod.relayBinaryFilename("relay-linux-x64", "v0.4.0");
+	const next = releaseMod.relayBinaryFilename("relay-linux-x64", "v0.5.0");
+	assert.equal(first, "relay-linux-x64.v0.4.0");
+	assert.notEqual(first, next, "an update must not overwrite the running binary");
+	assert.equal(releaseMod.relayBinaryFilename("relay-windows-x64.exe", "v0.4.0"), "relay-windows-x64.exe.v0.4.0");
+	assert.throws(() => releaseMod.relayBinaryFilename("relay-linux-x64", ""), /release tag is required/);
+});
+
+test("the extension registers exactly three commands, no aliases, no argument form", async () => {
+	// S1: the whole point of the change is the autocomplete list, so the list
+	// itself is what gets asserted — not a grep of the source.
+	const registered = [];
+	const pi = {
+		registerCommand: (name, options) => registered.push({ name, options }),
+		registerProvider: () => {},
+		registerTool: () => {},
+		on: () => {},
+		config: {},
+		ui: { notify() {} },
+	};
+	await releaseMod.default(pi);
+
+	assert.deepEqual(
+		registered.map((entry) => entry.name),
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
+	);
+
+	const menu = registered.find((entry) => entry.name === "free-bridge");
+	assert.equal(menu.options.args, undefined, "the menu takes no arguments");
+	assert.equal(menu.options.argumentHint, undefined, "the menu advertises no argument hint");
+	assert.equal(menu.options.aliases, undefined, "aliases would still appear in autocomplete");
+
+	// The removed commands must be gone as registrations, not merely hidden.
+	for (const gone of [
+		"free-bridge-session",
+		"free-bridge-refresh",
+		"free-bridge-models",
+		"free-bridge-warp",
+		"free-bridge-wire",
+	]) {
+		assert.equal(
+			registered.some((entry) => entry.name === gone),
+			false,
+			`${gone} must not be registered`,
+		);
+	}
+});

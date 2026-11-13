@@ -2363,11 +2363,15 @@ async function startServer() {
 		process.stdout.write(`pi-free-bridge relay listening on http://127.0.0.1:${port}/v1\n`);
 
 		// The parent keeps this pipe open; its death closes it and takes the relay
-		// with it, so a crashed Pi never leaves an orphan (S26).
-		process.stdin.resume();
-		process.stdin.on("end", () => process.exit(0));
-		process.stdin.on("close", () => process.exit(0));
-		process.stdin.on("error", () => process.exit(0));
+		// with it, so a crashed Pi never leaves an orphan (S26). A standalone run
+		// has no parent, so `RELAY_STDIN_LIFETIME=off` detaches the lifetime: the
+		// binary then keeps serving after stdin closes, as it does in a service.
+		if (process.env.RELAY_STDIN_LIFETIME !== "off") {
+			process.stdin.resume();
+			process.stdin.on("end", () => process.exit(0));
+			process.stdin.on("close", () => process.exit(0));
+			process.stdin.on("error", () => process.exit(0));
+		}
 	});
 }
 
