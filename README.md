@@ -457,8 +457,8 @@ Una lista plana, sin submenús, en este orden:
 
 | # | Ítem | Qué hace |
 |---|---|---|
-| 1 | Instalar / actualizar relay | Baja el binario del relay para tu sistema, verifica el `SHA256SUMS` publicado, lo instala y reinicia el relay. **Pregunta antes** y avisa que reinicia el relay; si el binario nuevo no responde `/health`, vuelve al binario anterior |
-| 2 | Estado del relay | URL, proceso, `/health`, session id y su origen, modelos, WARP, cable y Bun |
+| 1 | Instalar / actualizar relay | Baja el binario del relay para tu sistema, verifica el `SHA256SUMS` publicado, lo instala y reinicia el relay. **Pregunta antes** y avisa que reinicia el relay. Guarda el binario que corría como `.prev`: si el nuevo no responde `/health`, te pregunta si esperar o volver, y si no contestás vuelve solo al anterior. Una versión que falla se borra y queda anotada en `failed.log` |
+| 2 | Estado del relay | URL, proceso, versión, `/health`, session id y su origen, modelos, WARP, cable y Bun |
 | 3 | WARP: on / off | Muestra el modo actual y lo cambia. Los modos son `off`, `auto` y `on`; sin `warp-minimal` arriba, ofrece instalarlo |
 | 4 | Reciclar WARP | Lo mismo que `/free-bridge-warp-recycle` |
 | 5 | Cable: v1 / v2 | Muestra el modo actual y lo cambia |
@@ -469,6 +469,34 @@ Los ítems 3 y 5 muestran el estado actual en la etiqueta antes de que elijas,
 así el toggle nunca es una adivinanza. Si una variable de entorno fija el valor
 (`PI_FREE_BRIDGE_WARP_MODE`, `RELAY_WIRE_MODE`), el menú te lo dice en vez de
 fingir que lo cambió.
+
+#### Dos nombres, no uno por versión
+
+En `~/.pi/agent/pi-free-bridge/bin/` hay como mucho dos binarios:
+
+```
+relay-linux-x64        el que corre
+relay-linux-x64.prev   el que corría antes, sólo para volver
+```
+
+La versión ya no está en el nombre del archivo (antes era
+`relay-linux-x64.v0.4.0`, y «volver atrás» era adivinar cuál de los viejos
+servía). Ahora hay una regla que se sostiene sola: **lo que se llama `current`
+respondió `/health` al menos una vez, y `.prev` también**. Una versión que falla
+se borra, nunca se conserva — así `.prev` siempre es una compilación que ya
+sabemos que arranca.
+
+Si nunca hubo un `.prev` (primera instalación) no hay a qué volver: la
+extensión lo dice y no deja nada instalado, a medias. El binario que falló se
+borra, pero el episodio queda en `bin/failed.log`, con la versión y el motivo:
+borrar la evidencia junto con el binario dejaría un fallo sin historia.
+
+**La versión del relay se puede preguntar.** `/health` publica `version`, y el
+relay que corre lo dice aunque no lo hayas instalado vos (`bun relay.mjs`, un
+binario viejo en el PATH, un archivo copiado). Si es más viejo que el que esta
+extensión necesita, el mensaje lo dice con nombre y apellido —«el relay que
+corre es X, esta extensión necesita Y»— en vez de mostrarte un 404 pelado de una
+ruta que ese relay no tiene.
 
 **El menú muestra sólo lo que podés usar.** No es una lista fija de siete: en
 una máquina recién instalada, sin relay y sin WARP, el menú es un solo ítem
