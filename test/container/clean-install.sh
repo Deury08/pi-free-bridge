@@ -4,6 +4,10 @@
 #
 # This asserts the product claim, not the implementation: after this passes, the
 # release really is installable on an empty machine.
+#
+# Scope: this image runs the relay and nothing else. It never runs Pi, so the
+# "no Node" assertion here is about the relay and says nothing about Pi, which
+# needs Node. The Pi-side checks belong to a container that has Node.
 set -euo pipefail
 
 VERSION="${RELAY_VERSION:-v0.4.0}"
