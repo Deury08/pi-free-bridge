@@ -95,3 +95,34 @@ GitHub, so the review covers the only part of the change with no runtime proof.
 L11 (note for whoever resumes): a `v*` tag publishes a public GitHub Release on
 Deury08/pi-free-bridge. Creating the tag is a separate publishing decision and
 has not been taken.
+
+## Menu design (agreed with the owner, implemented on `feat/relay-download`)
+
+The owner wants fewer entries in Pi's command autocomplete. Seven commands become
+three; everything else lives in one flat menu.
+
+Registered commands:
+- `/free-bridge` — opens the menu, takes no arguments
+- `/free-bridge-warp-recycle` — direct, for incidents, also a menu item
+- `/free-bridge-doctor` — direct only, not in the menu
+
+Menu order, exactly as the owner specified:
+1. Instalar / actualizar relay
+2. Estado del relay
+3. WARP: on / off
+4. Reciclar WARP
+5. Cable: v1 / v2
+6. Modelos
+7. Refrescar sesión
+
+Rules: flat, no nested submenus. Items that toggle (WARP, Cable) show current
+state and switch on select. Recycle and its command call one shared
+`runWarpRecycle(ctx)`; duplicating the logic is not acceptable.
+
+Removed from registration: `free-bridge-session`, `free-bridge-refresh`,
+`free-bridge-models`, `free-bridge-warp`, `free-bridge-wire`,
+`free-bridge-doctor` stays as a command but leaves the menu.
+
+Deliberate trade-off, recorded so it is not re-litigated: `/free-bridge recycle`
+by argument is rejected — the owner wants the menu only, no arguments. Recycling
+during an incident therefore costs the direct command (kept for exactly that).

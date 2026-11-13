@@ -138,3 +138,13 @@ L5 (implementation decisions, slice 2):
 - Runtime proof for S1: the extension's default export was driven with a stub
   `pi` and registered exactly `free-bridge`, `free-bridge-warp-recycle`,
   `free-bridge-doctor`. That assertion is committed as a test.
+
+L6 (approved deviation, do not re-litigate): S4 says to ask yes/no "when the
+relay must start and neither a binary nor Bun is available". The relay is
+started lazily on the first request, where `ensureRelay` has no `ctx`, so a
+prompt at that point is not architected — there is no UI to ask through.
+The owner approved this shape: the download prompt lives in menu item 1
+(`Instalar / actualizar relay`), which is the only place a binary is ever
+fetched, and the start failure message names that menu item instead of a
+removed command. Changing it would mean changing when the relay runtime is
+resolved, which is a separate decision.
