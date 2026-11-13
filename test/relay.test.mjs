@@ -7,6 +7,7 @@
 // helpers are exported and covered here under plain Node: importing the module
 // must not start a server.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -3930,4 +3931,76 @@ test("the extension registers exactly three commands, no aliases, no argument fo
 			`${gone} must not be registered`,
 		);
 	}
+});
+
+// ---------------------------------------------------------------------------
+// No OpenCode required (spec odd/tasks/no-opencode-required.md, S1 and S5).
+//
+// The defect a real container test found: on a machine with no OpenCode the
+// extension loaded but registered nothing, because discoverFreeModels found no
+// registry and the factory returned before the registrations. The menu was
+// missing exactly where it was most needed.
+// ---------------------------------------------------------------------------
+
+test("commands register even when model discovery finds nothing at all", () => {
+	// The existing registration test above only passes because this developer
+	// machine HAS an OpenCode registry. Here HOME points at an empty directory,
+	// so discovery is guaranteed to yield zero, and a child process is used
+	// because the factory guards double registration on globalThis.
+	const home = mkdtempSync(join(tmpdir(), "pfb-no-opencode-"));
+	const indexPath = new URL("../index.ts", import.meta.url).href;
+	const marker = "@@REGISTERED@@";
+	const script = `
+		const { default: factory } = await import(${JSON.stringify(indexPath)});
+		const registered = [];
+		await factory({
+			registerCommand: (name) => registered.push(name),
+			registerProvider: () => {},
+			registerTool: () => {},
+			on: () => {},
+			config: {},
+			ui: { notify() {} },
+		});
+		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify(registered));
+	`;
+	// DRY_RUN keeps the child from spawning a relay; its output is skipped by
+	// reading from the marker instead of parsing the whole stream.
+	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1" },
+		encoding: "utf-8",
+	});
+	const registered = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+
+	assert.deepEqual(
+		registered,
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
+		"zero models must not cost the user the menu",
+	);
+});
+
+test("the menu shows only the install item when nothing is installed", () => {
+	const { visibleMenuIndices, MENU_INSTALL, MENU_ITEMS } = releaseMod;
+	assert.equal(MENU_ITEMS.length, 7);
+
+	assert.deepEqual(
+		visibleMenuIndices({ relayReady: false, warpReady: false }),
+		[MENU_INSTALL],
+		"relay not installed: installing is the only real action",
+	);
+	assert.deepEqual(
+		visibleMenuIndices({ relayReady: true, warpReady: false }),
+		[0, 1, 2, 4, 5, 6],
+		"everything except recycle once the relay runs",
+	);
+	assert.deepEqual(visibleMenuIndices({ relayReady: true, warpReady: true }), [0, 1, 2, 3, 4, 5, 6]);
+});
+
+test("recycle is hidden without a WARP binary and shown with one", () => {
+	const { visibleMenuIndices, MENU_RECYCLE } = releaseMod;
+	assert.equal(
+		visibleMenuIndices({ relayReady: true, warpReady: false }).includes(MENU_RECYCLE),
+		false,
+		"rotating an exit with no WARP binary can only fail",
+	);
+	assert.equal(visibleMenuIndices({ relayReady: true, warpReady: true }).includes(MENU_RECYCLE), true);
 });

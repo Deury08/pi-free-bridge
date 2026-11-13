@@ -2223,6 +2223,45 @@ function printDryRun(
 // Registration
 // ---------------------------------------------------------------------------
 
+/** The seven menu entries, in the order the owner dictated. Never reorder. */
+export const MENU_ITEMS = [
+	"Instalar / actualizar relay",
+	"Estado del relay",
+	"WARP: on / off",
+	"Reciclar WARP",
+	"Cable: v1 / v2",
+	"Modelos",
+	"Refrescar sesión",
+] as const;
+
+/** Named menu indices, so the dispatch never depends on a bare number. */
+export const MENU_INSTALL = 0;
+export const MENU_STATUS = 1;
+export const MENU_WARP = 2;
+export const MENU_RECYCLE = 3;
+export const MENU_WIRE = 4;
+export const MENU_MODELS = 5;
+export const MENU_REFRESH = 6;
+
+/** Which items this machine can actually use, in the dictated order.
+ *
+ *  Progressive disclosure, not decoration: an item that can only fail is a
+ *  trap. Nothing installed means installing is the only real action, so that
+ *  is the entire menu. Recycling an exit needs a WARP binary to route through.
+ *
+ *  Exported so the gating is testable without a Pi runtime: this is the rule
+ *  that used to be unexpressible, because the early return removed the menu
+ *  before any of it could run. */
+export function visibleMenuIndices(state: { relayReady: boolean; warpReady: boolean }): number[] {
+	const visible: number[] = [];
+	for (let index = 0; index < MENU_ITEMS.length; index++) {
+		if (index !== MENU_INSTALL && !state.relayReady) continue;
+		if (index === MENU_RECYCLE && !state.warpReady) continue;
+		visible.push(index);
+	}
+	return visible;
+}
+
 export default function (pi: ExtensionAPI) {
 	const g = globalThis as Record<symbol, unknown>;
 	if (g[REG_KEY]) return;
@@ -2235,24 +2274,27 @@ export default function (pi: ExtensionAPI) {
 		printDryRun(discovered, session, live);
 	}
 
+	// Zero models is NOT a failure any more. The provider is only registered
+	// when it has a catalog to publish — registering an empty list would blank
+	// the provider — but the commands below must register either way. The menu
+	// is most needed on a machine where nothing is set up yet, and that is
+	// exactly the machine that used to lose it to an early return here.
 	if (discovered.models.length === 0) {
-		// Fail closed: registering an empty model list would silently blank the
-		// provider instead of surfacing a readable diagnostic.
 		console.error(
-			`pi-free-bridge: no free models discovered (${discovered.source}); ` +
-				"provider not registered.",
+			`pi-free-bridge: no free models yet (${discovered.source}); ` +
+				"the provider stays unregistered until a catalog is available. " +
+				"Run /free-bridge to install the relay.",
 		);
-		return;
+	} else {
+		pi.registerProvider(PROVIDER, {
+			apiKey: API_KEY,
+			api: API,
+			baseUrl: RELAY_URL,
+			authHeader: true,
+			models: buildPiModels(discovered.models),
+			streamSimple: gateStreamSimple,
+		});
 	}
-
-	pi.registerProvider(PROVIDER, {
-		apiKey: API_KEY,
-		api: API,
-		baseUrl: RELAY_URL,
-		authHeader: true,
-		models: buildPiModels(discovered.models),
-		streamSimple: gateStreamSimple,
-	});
 
 	g[REG_KEY] = true;
 
@@ -2300,25 +2342,21 @@ export default function (pi: ExtensionAPI) {
 	// every registered command, aliases included, costs a completion entry.
 	// -----------------------------------------------------------------------
 
-	/** The seven menu entries, in the order the owner dictated. Never reorder. */
-	const MENU_ITEMS = [
-		"Instalar / actualizar relay",
-		"Estado del relay",
-		"WARP: on / off",
-		"Reciclar WARP",
-		"Cable: v1 / v2",
-		"Modelos",
-		"Refrescar sesión",
-	] as const;
+	/** Is the relay runnable on this machine: an installed binary, or Bun to
+	 *  run the script. This is what decides whether the menu can offer anything
+	 *  beyond installing. */
+	function relayReady(): boolean {
+		const configured = readBridgeConfig().relayBin?.trim();
+		if (configured && existsSync(configured)) return true;
+		return resolveBunPath() !== undefined;
+	}
 
-	/** Named menu indices, so the dispatch never depends on a bare number. */
-	const MENU_INSTALL = 0;
-	const MENU_STATUS = 1;
-	const MENU_WARP = 2;
-	const MENU_RECYCLE = 3;
-	const MENU_WIRE = 4;
-	const MENU_MODELS = 5;
-	const MENU_REFRESH = 6;
+	/** Is a WARP binary available? Recycling an exit without one is a menu
+	 *  entry that can only fail, so it is hidden. */
+	function warpReady(): boolean {
+		const bin = resolveWarpBin();
+		return bin !== undefined && existsSync(bin);
+	}
 
 	/** ctx shape the menu needs: notify/confirm always, select when Pi offers it. */
 	type MenuCtx = WarpPromptContext & {
@@ -2662,14 +2700,20 @@ export default function (pi: ExtensionAPI) {
 	async function runMenu(ctx: MenuCtx): Promise<void> {
 		const warpNow = resolveWarpMode();
 		const wireNow = resolveWireMode();
-		const labels = MENU_ITEMS.map((item, index) => {
+
+		// `visible` maps a picked row back to its real menu index, so hiding an
+		// item never shifts the dispatch.
+		const visible = visibleMenuIndices({ relayReady: relayReady(), warpReady: warpReady() });
+		const labels = visible.map((index) => {
+			const item = MENU_ITEMS[index];
 			if (index === MENU_WARP) return `${item} — ahora: ${warpNow}`;
 			if (index === MENU_WIRE) return `${item} — ahora: ${wireNow}`;
 			return item;
 		});
 
-		const index = await pickMenuItem(ctx, labels);
-		if (index === undefined) return;
+		const picked = await pickMenuItem(ctx, labels);
+		if (picked === undefined) return;
+		const index = visible[picked];
 
 		switch (index) {
 			case MENU_INSTALL:
