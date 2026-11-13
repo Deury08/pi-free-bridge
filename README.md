@@ -3,21 +3,46 @@
 Puente [OpenCode](https://opencode.ai) solo-modelos-gratis para [Pi](https://github.com/earendil-works/pi-coding-agent).
 
 Registra **únicamente** el tier gratuito anónimo de OpenCode bajo el provider id
-**`oc-sdk-zen`** e inyecta el contrato del gate desde un relay local ejecutado por
-Bun, así que sobrevive a `pi update` y no depende de ningún puente de terceros.
+**`oc-sdk-zen`** e inyecta el contrato del gate desde un relay local, así que
+sobrevive a `pi update` y no depende de ningún puente de terceros.
+
+El relay es un ejecutable por sistema operativo que la extensión descarga de la
+release cuando se lo pedís. Bun no hace falta en ningún caso: sólo se usa si
+todavía no bajaste el binario.
 
 ## Instalación rápida
 
+Dos caminos para el mismo paquete. El especificador `npm:` es obligatorio.
+
 ```bash
-gentle-shell install pi-free-bridge
+# comando para gentle-shell
+gentle-shell install npm:pi-free-bridge
 ```
+
+```bash
+# comando para pi
+pi install npm:pi-free-bridge
+```
+
+> ⚠️ **Actualizar no es lo mismo que instalar.** `pi install npm:pi-free-bridge`
+> **no** te sube de versión si ya lo tenés instalado: Pi graba
+> `"pi-free-bridge": "^0.5.0"` en su `package.json`, y el caret en `0.x` sólo
+> mueve parches, así que `0.6.0` queda afuera. Para actualizar, pedí la versión
+> explícita:
+>
+> ```bash
+> pi install npm:pi-free-bridge@0.6.0
+> ```
+>
+> Una instalación nueva, sin lockfile, resuelve `latest` sin problema.
 
 Reiniciá Pi una vez y escribí `/free-bridge` para abrir el menú.
 
 **No hace falta Bun ni tener OpenCode instalado.** El relay es un ejecutable por
 sistema operativo que la extensión descarga cuando se lo pedís desde el menú,
-después de confirmar: nada se baja al abrir Pi. Windows, Linux y macOS, en x64
-y ARM. Pi sí necesita Node, como cualquier extensión de Pi.
+después de confirmar: nada se baja al abrir Pi. Hay build para Windows x64, para
+Linux x64 y ARM, y para macOS Intel y Apple Silicon. Pi sí necesita Node, como
+cualquier extensión de Pi.
 
 Después de instalado, todo se maneja desde un solo comando:
 
@@ -32,10 +57,11 @@ cada pantalla.
 
 ## Instalar
 
-Siete pasos, todos desde el terminal. Las capturas son de una instalación real
-en Windows: si tu pantalla se parece a la de la foto, vas bien.
+Ocho pasos: dos de terminal, el resto desde la sesión de Pi. Las capturas son de
+una instalación real en Windows; en Linux y macOS cambian los diálogos del
+sistema, no los pasos.
 
-Los pasos 3 a 5 son solo para WARP. Si no lo querés, los podés saltear: el puente
+Los pasos 5 y 6 son solo para WARP. Si no lo querés, los podés saltear: el puente
 funciona igual contra tu IP directa.
 
 ### 1. Instalar la extensión
@@ -43,35 +69,60 @@ funciona igual contra tu IP directa.
 Escribí el comando en el terminal y dale Enter:
 
 ```bash
-gentle-shell install git:github.com/Deury08/pi-free-bridge
+gentle-shell install npm:pi-free-bridge
 ```
 
-![Escribiendo el comando de instalación](<Imagenes/Comando ParaInstalar.png>)
+o, si instalás directo con Pi:
+
+```bash
+pi install npm:pi-free-bridge
+```
+
+![Escribiendo el comando de instalación](Imagenes/01-escribiendo-el-comando-de-instalacion.png)
 
 ### 2. Confirmar que quedó instalada
 
-El comando clona el repo y termina con `Installed
-git:github.com/Deury08/pi-free-bridge` en verde. Si no ves esa línea, no sigas:
-volvé a correr el paso 1.
+El comando resuelve el paquete desde npm y termina avisando que quedó instalado.
+No clona ningún repo: si no ves esa confirmación, no sigas, volvé a correr el
+paso 1.
 
-![Salida del comando con la línea Installed](<Imagenes/Instalado.png>)
+![Salida del comando después de instalar](Imagenes/02-comando-ejecutado.png)
 
-### 3. Activar WARP
+### 3. Abrir el menú
 
-Dentro de Pi escribí `/free-bridge` y elegí «WARP: on / off» (con el `/` aparece el autocompletado;
-Enter lo selecciona).
+Dentro de Pi escribí `/free-bridge`. Con el `/` aparece el autocompletado; Enter
+abre el menú.
 
-![Autocompletado del comando free-bridge-warp](<Imagenes/Activando%20Warp.png>)
+![El menú de /free-bridge](Imagenes/03-abriendo-el-menu-de-configuracion.png)
 
-### 4. Aceptar la descarga de `warp-minimal`
+En una máquina recién instalada el menú muestra **un solo ítem**, «Instalar /
+actualizar relay», porque los demás solo podrían fallar. Los otros seis aparecen
+cuando el relay ya corre, y «Reciclar WARP» se suma recién cuando hay un binario
+de WARP al cual pedirle la rotación.
 
-Si no tenés WARP corriendo ni el binario instalado, Pi te lo pregunta antes de
-bajar nada: te muestra la versión, el tamaño, de dónde lo baja y dónde lo
-instala. Elegí **`Yes`** y verifica el checksum solo.
+### 4. Instalar el relay
 
-![Diálogo de confirmación de descarga de warp-minimal](<Imagenes/Instalando%20Warp.png>)
+Elegí «Instalar / actualizar relay». Antes de bajar nada te muestra la versión,
+el tamaño, de dónde lo baja y dónde lo instala, y te avisa que **detiene el relay
+que esté corriendo —lo haya arrancado esta extensión o vos—**. Elegí `Yes`: el
+`SHA256SUMS` publicado se verifica solo y, si no coincide, no se reemplaza nada.
 
-### 5. Elegir el modo
+![Seleccionando Instalar / actualizar relay](Imagenes/04-seleccionando-instalar-actualizar-relay.png)
+
+![Confirmación de la descarga del binario del relay](Imagenes/05-aceptando-la-descarga-del-binario-del-relay.png)
+
+### 5. Activar WARP (opcional)
+
+Con el relay instalado ya aparecen los demás ítems. Si querés salir por WARP, abrí
+«WARP: on / off». Si no tenés WARP corriendo ni el binario instalado, Pi te lo
+pregunta antes de bajar nada: versión, tamaño, origen y destino. Elegí **`Yes`** y
+el checksum se verifica solo contra el `checksums.txt` del release.
+
+![Encendiendo WARP desde el menú](Imagenes/06-encendiendo-warp.png)
+
+![Confirmación de la descarga de warp-minimal](Imagenes/07-confirmando-la-descarga-de-warp.png)
+
+### 6. Elegir el modo de WARP
 
 - **`auto`** — primero tu IP directa y WARP solo ante rate limit. Es el modo
   recomendado para empezar.
@@ -80,30 +131,26 @@ instala. Elegí **`Yes`** y verifica el checksum solo.
 
 El cambio aplica en el próximo request, sin reiniciar nada.
 
-![Menú con los tres modos de WARP](<Imagenes/Configurando%20Warp.png>)
+![Modo de WARP configurado en el menú](Imagenes/08-configuracion-de-warp.png)
 
-### 6. Elegir un modelo gratis
+### 7. Elegir un modelo gratis
 
 `/model` abre el picker. Los del tier gratuito terminan en `-free` y vienen del
-provider `oc-sdk-zen`; en la captura están agrupados bajo `[oc-sdk-zen]` junto a
-los de `nvidia`. El panel de la derecha tiene que decir `pi-free-bridge · ready`.
+provider `oc-sdk-zen`. El panel de la derecha tiene que decir
+`pi-free-bridge · ready`.
 
-![Picker con los modelos gratuitos del provider oc-sdk-zen](<Imagenes/Modelos%20Disponibles.png>)
-
-### 7. Usarlo
+### 8. Usarlo
 
 Escribí cualquier cosa y mirá el pie: `ctx` sube, el costo queda en **`$0.000`**.
 Eso es el tier gratuito funcionando a través del relay.
 
-![Conversación respondiendo con costo $0.000](<Imagenes/Usando%20Modelos.png>)
-
 ### Alternativa: desde el repo clonado
 
 Si ya tenés el repo en disco, la instalación es la misma que cualquier
-extensión local:
+extensión local, con la ruta al directorio del paquete:
 
 ```bash
-pi install C:\Users\Polanco\pi-free-bridge
+pi install ./pi-free-bridge   # en PowerShell: pi install .\pi-free-bridge
 pi list
 pi -p --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 ```
@@ -111,34 +158,44 @@ pi -p --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 Reemplaza al puente de terceros `pi-opencode-bridge`; **no corran los dos en paralelo**.
 Sacalo con `pi remove npm:pi-opencode-bridge`.
 
-## El relay de Bun (requisito)
+## Cómo arranca el relay
 
 El gate de `/inference/v1` ahora inspecciona el fingerprint TLS del cliente y
 solo acepta clientes que se parezcan a Bun. Pi 1.2.0 corre sobre Node, así que
 ningún request que salga desde Pi puede pasar el gate, sin importar los headers
 ni el cuerpo. Por eso la extensión ya no llama a OpenCode: levanta un relay
-local ejecutado por Bun y apunta el provider a `http://127.0.0.1:<puerto>/v1`.
+local y apunta el provider a `http://127.0.0.1:<puerto>/v1`.
 
 ```
-Pi (Node) → http://127.0.0.1:<puerto>/v1/chat/completions → relay (Bun) → upstream
+Pi (Node) → http://127.0.0.1:<puerto>/v1/chat/completions → relay → upstream
 ```
+
+El relay es un binario compilado por sistema operativo, con su runtime adentro:
+no necesita tener Bun instalado. Bun es el camino de respaldo cuando todavía no
+hay binario.
 
 El relay es el único proceso que abre la conexión TLS contra OpenCode. Ahí viven
 los headers del gate, el session id, el bloque `<env>` con `Working directory:`
 y las tools `read`/`bash`. La respuesta vuelve byte por byte, sin parsear y sin
 reescribir ningún chunk.
 
-### Bun es obligatorio
+### Qué ejecutable elige la extensión
 
-La extensión resuelve el ejecutable en este orden:
+En este orden, y se queda con el primero que sirva:
 
-1. `PI_FREE_BRIDGE_BUN` (ruta explícita al binario)
-2. `bun` en `PATH` (en Windows, `bun.exe`)
-3. `~/.bun/bin/bun.exe`
+1. `~/.pi/agent/pi-free-bridge.json` → `relayBin`, si apunta a un binario que
+existe y cuyo nombre no lleva versión (un `relayBin` viejo con la versión pegada
+se migra solo al nombre canónico)
+2. el binario canónico de tu sistema en `~/.pi/agent/pi-free-bridge/bin/`:
+`relay-windows-x64.exe`, `relay-linux-x64`, `relay-linux-arm64`,
+`relay-darwin-x64` o `relay-darwin-arm64`
+3. Bun, si todavía no hay binario: `PI_FREE_BRIDGE_BUN`, después `bun` en `PATH`
+(en Windows, `bun.exe`), después `~/.bun/bin/bun.exe`
 
-Si no encuentra ninguno, `/free-bridge-doctor` muestra `bun: MISSING` y el
-primer request falla con un error que indica cómo instalarlo. Instalación:
-<https://bun.sh>.
+Si no encuentra ninguno de los tres, el primer request falla y el error dice qué
+hacer: instalar el relay desde el menú, instalar Bun (<https://bun.sh>) o
+apuntarlo con `PI_FREE_BRIDGE_BUN`. `/free-bridge-doctor` muestra la línea
+`bun:` con la ruta resuelta o `MISSING`.
 
 ### Puerto
 
@@ -149,7 +206,8 @@ devuelve el session id efectivo y de dónde salió:
 {"service":"pi-free-bridge-relay","ok":true,"sessionId":"ses_…","sessionSource":"opencode.db"}
 ```
 
-`sessionSource` es `env`, `config`, `opencode.db` o `session-diff`. El puerto se
+`sessionSource` dice de dónde salió: `env`, `config`, `pi-harvest`, `service`,
+`opencode.db`, `session-diff` o `generated`. El puerto se
 puede cambiar con:
 
 1. `PI_FREE_BRIDGE_RELAY_PORT`
@@ -179,8 +237,9 @@ curl http://127.0.0.1:8788/health        # relay vivo
 pi -p --no-session --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 ```
 
-Dentro de Pi, `/free-bridge-doctor` informa la ruta de Bun, el puerto, si el
-relay está `running`, `reused` o `not started`, y la URL upstream.
+Dentro de Pi, `/free-bridge-doctor` informa la ruta de Bun (o `MISSING`, cuando
+el relay corre desde el binario), el puerto, si el relay está `running`,
+`reused` o `not started`, el upstream y el session id con su origen.
 
 ## Cosecha de session id (híbrida)
 
@@ -192,13 +251,14 @@ dos lados** (bun-upgrades S2):
   `node:sqlite`, y si falla el archivo más reciente de
   `storage/session_diff/ses_*.json` — y se lo pasa al relay en
   `RELAY_SESSION_PI`. Esto funciona con Pi y OpenCode en máquinas separadas.
-- **El relay (Bun)** cosecha de su propio store cuando nadie le pasa un id.
+- **El relay** cosecha de su propio store cuando nadie le pasa un id.
 
 Precedencia en el arranque del relay: override del usuario
 (`PI_FREE_BRIDGE_SESSION_ID` / `config.sessionId` / `RELAY_SESSION`) > id
 cosechado por Pi (`RELAY_SESSION_PI`) > cosecha local del relay. El origen
-quedará visibible en `/health` (`sessionSource`) y en «Estado del relay» del menú:
-`env`, `config`, `pi-harvest`, `opencode.db` o `session-diff`.
+quedará visible en `/health` (`sessionSource`) y en «Estado del relay» del menú:
+`env`, `config`, `pi-harvest`, `service`, `opencode.db`, `session-diff` o
+`generated`.
 
 ## Egress WARP (`off` / `auto` / `on`)
 
@@ -401,31 +461,23 @@ resuelta cambia respecto de la que tenía al nacer.
 
 ## Qué registra
 
-Nueve modelos, descubiertos desde el registry de OpenCode
-(`~/.cache/opencode/models.json`, clave `"opencode"`), filtrados a entradas cuyo
-cada campo de costo declarado es cero **y** que la superficie efectivamente
-publicita:
+Los modelos gratis que el servicio publica **en ese momento**. La extensión no
+trae una lista adentro ni la saca de un archivo local: le pide el catálogo al
+relay (`/models`), y el relay se lo pide a la superficie del servicio.
 
-`beam-free`, `big-pickle`, `deepseek-v4.1-flash-free`, `glm-5.3-flash-free`,
-`longcat-2.5-preview-free`, `mimo-v2.6-flash-free`, `minimax-m3.1-flash-free`,
-`nemotron-3.5-lightning-free`, `nemotron-3.5-super-vl-free`
+El filtro es sobre el precio **declarado**: un modelo entra si su costo de
+entrada y de salida son cero, y se descarta si el precio **no se puede leer**.
+Un precio ilegible no es un precio cero, y adivinar ahí significaría anunciarte
+como gratis algo que te puede costar cuota.
 
-Ese es el snapshot que el paquete trae para arrancar offline; el set real cambia
-con el tiempo (hoy la superficie publica otro conjunto). «Refrescar sesión» lo
-re-pide y lo persiste, que es la forma de actualizarlo sin tocar código.
+Dos detalles del filtro, ambos medidos, que conviene tener presentes:
 
-Dos trampas del filtro, ambas medidas, ambas que conviene tener presentes:
-
-- `cost.cache_write` **no existe** en la mayoría de los modelos gratis, así que
-  testear los cuatro campos con `=== 0` clasifica como pagados a 36 de los 39
-  modelos gratis del registry. El filtro usa cada campo *declarado*.
-- 32 de esos 39 ya no los publicita `/inference/v1/models`. Registrarlos dejaría
-  entradas permanentemente rotas en el picker, así que el set se interseca con la
-  lista publicitada.
-
-La lista publicitada es un snapshot fechado en `index.ts` para que el arranque
-quede offline y determinístico; «Refrescar sesión» la re-pide, la persiste en
-`~/.pi/agent/pi-free-bridge.json` y re-registra el provider.
+- El precio del upstream viene anidado (`cost.text.<input|output>.price`), no
+  plano como en el archivo de caché viejo de OpenCode: leer sólo números planos
+  clasifica como pagado a todo el catálogo del vendor.
+- El relay informa cuántos modelos descartó (`skipped`). Ese número no es un
+  veredicto: «no se pudo leer el catálogo» y «el servicio no ofrece modelos
+  gratis» son respuestas distintas y el menú las muestra distinto.
 
 Excluidos a propósito:
 
@@ -472,19 +524,19 @@ fingir que lo cambió.
 
 #### Dos nombres, no uno por versión
 
-En `~/.pi/agent/pi-free-bridge/bin/` hay como mucho dos binarios:
+En `~/.pi/agent/pi-free-bridge/bin/` hay como mucho dos binarios (en Windows, los
+mismos nombres terminando en `.exe`):
 
 ```
 relay-linux-x64        el que corre
 relay-linux-x64.prev   el que corría antes, sólo para volver
 ```
 
-La versión ya no está en el nombre del archivo (antes era
-`relay-linux-x64.v0.4.0`, y «volver atrás» era adivinar cuál de los viejos
-servía). Ahora hay una regla que se sostiene sola: **lo que se llama `current`
-respondió `/health` al menos una vez, y `.prev` también**. Una versión que falla
-se borra, nunca se conserva — así `.prev` siempre es una compilación que ya
-sabemos que arranca.
+La versión no está en el nombre del archivo (antes sí, y «volver atrás» era
+adivinar cuál de los viejos servía). Ahora hay una regla que se sostiene sola:
+**lo que se llama `current` respondió `/health` al menos una vez, y `.prev`
+también**. Una versión que falla se borra, nunca se conserva — así `.prev`
+siempre es una compilación que ya sabemos que arranca.
 
 Si nunca hubo un `.prev` (primera instalación) no hay a qué volver: la
 extensión lo dice y no deja nada instalado, a medias. El binario que falló se
@@ -567,12 +619,12 @@ quien lo publicó fuera confiable.
 | Comando | Qué hace | Requiere red |
 |---|---|---|
 | `node repro.mjs [model-id]` | Dispara un request crudo contra el gate; espera `200 SSE-CHUNK (PASS)`. Sin argumento sondea `mimo-v2.6-flash-free` | sí |
-| `node test/smoke.mjs` | Aserciona el registro contra el registry real: provider id, el set exacto de modelos gratis, cero fugas de modelos excluidos o pagados, y que cada modelo apunte al relay local | no |
-| `PI_FREE_BRIDGE_DRY_RUN=1 pi …` | Imprime origen del catálogo, superficie, api key, session id + origen, modelos aceptados y descartados, y sigue normal | no |
+| `node test/smoke.mjs` | Aserciona el registro contra el registry real: provider id, un subconjunto obligatorio de modelos gratis presente, cero fugas de modelos excluidos o pagados, y que cada modelo apunte al relay local | no |
+| `PI_FREE_BRIDGE_DRY_RUN=1 pi …` | Imprime origen del catálogo, superficie, api key, session id + origen, modelos aceptados y descartados, y sigue normal (en PowerShell: `$env:PI_FREE_BRIDGE_DRY_RUN=1; pi …`) | no |
 | `pi -p --no-session --model oc-sdk-zen/<id> "Reply with exactly: OK"` | Sondeo end-to-end de un modelo a través de Pi | sí |
-| `pi list` | Muestra los paquetes instalados (el nuestro aparece como `..\..\pi-free-bridge`) | no |
+| `pi list` | Muestra los paquetes instalados (el nuestro aparece con su ruta de instalación) | no |
 | `pi --list-models` | Muestra qué va a ofrecer el picker | no |
-| `pi install C:\Users\Polanco\pi-free-bridge` | Reinstala el paquete (hace falta de nuevo si `pi update` lo pisa) | no |
+| `pi install npm:pi-free-bridge` | Reinstala el paquete (hace falta de nuevo si `pi update` lo pisa) | no |
 | `pi remove npm:pi-opencode-bridge` | Saca el puente de terceros — ya ejecutado; nunca corran los dos | no |
 
 ### Entradas de configuración
@@ -590,7 +642,6 @@ quien lo publicó fuera confiable.
 | `PI_FREE_BRIDGE_WARP_PROXY` | URL del proxy WARP (por defecto `http://127.0.0.1:8789`) |
 | `PI_FREE_BRIDGE_WARP_BIN` | Ruta al binario `warp-minimal` (precedencia sobre `warpBin` en config) |
 | `~/.pi/agent/pi-free-bridge.json` → `warpBin` | Ruta al binario; si no hay ninguna y no responde, Pi ofrece descargar e instalar la release oficial (te lo pregunta antes) |
-| `~/.pi/agent/pi-free-bridge.json` → `liveIds` | Sobreescribe el snapshot de modelos publicitados |
 | `~/.pi/agent/pi-free-bridge.json` → `relayPort` | Puerto del relay (por defecto `8788`) |
 | `PI_FREE_BRIDGE_RELAY_PORT` | Pisa el puerto del relay |
 | `PI_FREE_BRIDGE_BUN` | Ruta explícita al ejecutable de Bun |
@@ -601,7 +652,6 @@ Forma del archivo de config:
 ```json
 {
   "sessionId": "ses_…",
-  "liveIds": ["big-pickle", "…"],
   "relayPort": 8788,
   "warpEnabled": "off"
 }
@@ -684,7 +734,7 @@ pi -p --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 | Entradas rotas o inesperadas en el picker | `node test/smoke.mjs` |
 | Cambiaste el filtro o la receta de headers | `node test/smoke.mjs` (offline), después `node repro.mjs` (live) |
 | Un modelo falla end-to-end pero el gate está sano | `pi -p --no-session --model oc-sdk-zen/<id> "Reply with exactly: OK"` para aislar ese modelo |
-| El paquete desaparece después de `pi update` | `pi list`, y después `pi install C:\Users\Polanco\pi-free-bridge` |
+| El paquete desaparece después de `pi update` | `pi list`, y después `pi install npm:pi-free-bridge` |
 
 ## El contrato del gate
 
@@ -695,7 +745,7 @@ evidencia.
 
 **Superficie:** `https://opencode.ai/inference/v1/chat/completions`
 (`/zen/v1` responde 403 duro a todo cliente que no sea el oficial). Pi no habla
-con esta superficie: habla con el relay, que reenvía acá desde Bun.
+con esta superficie: habla con el relay, que reenvía acá con su propio runtime.
 
 **Headers** — se requieren cinco, ni uno más (los fija el relay):
 
@@ -790,8 +840,7 @@ El id forzado se persiste en `~/.pi/agent/pi-free-bridge.json`:
 
 ```json
 {
-  "sessionId": "ses_…",
-  "liveIds": ["big-pickle", "…"]
+  "sessionId": "ses_…"
 }
 ```
 
@@ -865,22 +914,23 @@ bien, casi siempre venció el session id, no el puente.
 
 - El provider id `oc-sdk-zen` es load-bearing: `settings.json`,
   `~/.pi/gentle-ai/profiles.json` y `subagents.json` lo referencian.
-- El registry se lee en cada arranque, así que un modelo gratis nuevo aparece
-  sin actualizar el paquete; las bajas también se propagan. Nada se escribe
-  de vuelta en ese archivo.
+- El catálogo se pide al relay en cada arranque y en cada «Refrescar sesión»,
+  así que un modelo gratis nuevo aparece sin actualizar el paquete; las bajas
+  también se propagan. Nada se escribe de vuelta en ningún archivo de OpenCode.
 - No se guardan credenciales: el puente se autentica con la literal `public`.
-
-## Licencia
-
-MIT — ver [`LICENSE`](LICENSE).
 
 ---
 
-## Relay standalone: sin Bun y sin OpenCode
+## Apéndice: el relay suelto, sin la extensión
 
-El relay puede correr solo, como un único ejecutable. **No hace falta instalar
-Bun, Node, ni OpenCode**, ni la extensión de Pi: el ejecutable trae el runtime
-adentro, genera su propio session id y trae los modelos adentro.
+Esto **no instala el puente**: el binario no registra modelos en el selector de Pi
+ni crea el menú. Sirve para correr el relay aparte, en otra máquina o adentro de
+un contenedor, cuando querés el túnel sin la extensión. Si lo que buscás es el
+puente completo, la instalación es la de arriba (`npm:pi-free-bridge`).
+
+El relay corre solo, como un único ejecutable: **no hay que instalar nada más**
+—ni Bun, ni OpenCode, ni Pi—. Trae su runtime adentro y genera su propio session
+id cuando no encuentra uno.
 
 ### 1. Descargá el archivo de tu sistema
 
@@ -981,3 +1031,7 @@ huérfanos cuando Pi se cae, y en un binario suelto juega en contra.
 No registra los modelos en el selector de Pi: eso lo hace la extensión. El
 binario es el relay solo — sirve para correr el puente aparte, en otra máquina,
 o adentro de un contenedor.
+
+## Licencia
+
+MIT — ver [`LICENSE`](LICENSE).
