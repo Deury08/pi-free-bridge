@@ -1924,17 +1924,41 @@ export type SwapResult = {
  *  user put there is never touched — a cleanup step that deletes by wildcard is
  *  how a tool eats something it did not create. */
 function purgeVersionedLeftovers(dir: string, name: string): void {
+	for (const leftover of versionedLeftovers(dir, name)) rmSync(leftover, { force: true });
+}
+
+/** The version-in-filename scheme's leftovers, newest version first.
+ *
+ *  Matched narrowly — `<name>.` followed by an optional `v` and a digit — so this
+ *  can never touch a file the tool did not create. `failed.log`, `.prev`, `.tmp`
+ *  and the active binary are excluded by shape, not by allow-list. */
+function versionedLeftovers(dir: string, name: string): string[] {
 	let entries: string[];
 	try {
 		entries = readdirSync(dir);
 	} catch {
-		return;
+		return [];
 	}
+	const found: { path: string; parts: number[] }[] = [];
 	for (const entry of entries) {
-		if (entry === name || entry === `${name}.prev` || entry === `${name}.tmp`) continue;
 		if (!entry.startsWith(`${name}.`)) continue;
-		rmSync(join(dir, entry), { force: true });
+		const suffix = entry.slice(name.length + 1);
+		if (!/^v?\d[0-9A-Za-z._-]*$/.test(suffix)) continue;
+		const parts = suffix
+			.replace(/^v/, "")
+			.split(".")
+			.map((piece) => Number.parseInt(piece, 10));
+		if (parts.some((piece) => Number.isNaN(piece))) continue;
+		found.push({ path: join(dir, entry), parts });
 	}
+	found.sort((left, right) => {
+		for (let i = 0; i < Math.max(left.parts.length, right.parts.length); i += 1) {
+			const diff = (right.parts[i] ?? 0) - (left.parts[i] ?? 0);
+			if (diff !== 0) return diff;
+		}
+		return right.path.localeCompare(left.path);
+	});
+	return found.map((entry) => entry.path);
 }
 
 /** One line per failure, capped: a log that grows forever is a log nobody reads.
@@ -1988,21 +2012,30 @@ export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
 		return { ok: false, rolledBack: false, reason: "no se pudo detener el relay que corre" };
 	}
 
-	// S3.4: keep whatever answered a moment ago as the rollback target.
+	// S3.4: keep one known-good binary as the rollback target, never a pile.
+	//
+	// Precedence, and why it is not simply "the newest file": the spare's whole
+	// job is to be the build that already answered /health, so the file the config
+	// names as running wins even when a higher number sits next to it — a newer
+	// build that was rolled back from is precisely the one we must not keep as the
+	// known-good spare. Only when nothing on disk tells us what ran do we fall back
+	// to the newest version.
+	const leftovers = versionedLeftovers(deps.dir, deps.name);
 	const incumbent = existsSync(current)
 		? current
 		: deps.previous && existsSync(deps.previous)
 			? deps.previous
 			: undefined;
+	const spare = incumbent ?? leftovers[0];
 	rmSync(previous, { force: true });
-	if (incumbent) renameSync(incumbent, previous);
+	if (spare) renameSync(spare, previous);
 	renameSync(deps.downloaded, current);
 	if (process.platform !== "win32") chmodSync(current, 0o755);
 
 	// S1: two names, not a cemetery. The scheme before this one left one file per
 	// release (`relay-linux-x64.v0.3.0`, `.v0.4.0`, ...) and nothing ever removed
-	// them. The one that was actually running became `.prev` above; every other
-	// versioned leftover is dead weight and goes now.
+	// them — 109 MB of binaries nobody will ever run again. Exactly one is adopted
+	// above; the rest go now.
 	purgeVersionedLeftovers(deps.dir, deps.name);
 
 	// S3.5

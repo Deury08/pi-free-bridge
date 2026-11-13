@@ -4357,3 +4357,78 @@ test("the install confirm says it STOPS the running relay, whoever started it (S
 	assert.match(source, /DETIENE el relay que está corriendo/);
 	assert.doesNotMatch(source, /Esto REINICIA el relay/);
 });
+
+test("swap: with nothing saying what ran, the newest leftover is adopted (S1)", async () => {
+	// No `current` and no config previous: the only evidence of order is the
+	// version in the filename, so the highest number becomes the spare.
+	const dir = swapFixture({
+		"relay-linux-x64.tmp": "NEW",
+		"relay-linux-x64.v0.3.0": "OLDEST",
+		"relay-linux-x64.v0.4.0": "NEWEST",
+		"relay-linux-x64.v0.4.1": "NEWER-STILL",
+	});
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => true,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, true, JSON.stringify(result));
+	assert.equal(readOr(dir, "relay-linux-x64"), "NEW");
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), "NEWER-STILL", "the highest version survives");
+	assert.deepEqual(readdirSync(dir).sort(), ["relay-linux-x64", "relay-linux-x64.prev"]);
+});
+
+test("swap: the known-good incumbent beats a higher number on disk (S1)", async () => {
+	// A newer file that sits next to a lower one the config says was running is a
+	// build somebody rolled back FROM. Keeping it as the spare would hand the next
+	// rollback a binary already known to fail.
+	const dir = swapFixture({
+		"relay-linux-x64.tmp": "NEW",
+		"relay-linux-x64.v0.3.0": "KNOWN-GOOD",
+		"relay-linux-x64.v0.4.0": "ROLLED-BACK-FROM",
+	});
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		previous: join(dir, "relay-linux-x64.v0.3.0"),
+		stopRelay: async () => true,
+		startRelay: async () => true,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, true, JSON.stringify(result));
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), "KNOWN-GOOD", "the build that answered /health is the spare");
+	assert.equal(readOr(dir, "relay-linux-x64.v0.4.0"), undefined, "the rolled-back build is deleted, not kept");
+	assert.deepEqual(readdirSync(dir).sort(), ["relay-linux-x64", "relay-linux-x64.prev"]);
+});
+
+test("swap: a file the tool did not create survives the purge (S1)", async () => {
+	// The purge matches by shape, so a human's notes in the same directory are not
+	// collateral damage. A cleanup that deletes by wildcard eats what it did not make.
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	writeFileSync(join(dir, "notes.txt"), "mine");
+	writeFileSync(join(dir, "relay-linux-x64.keep-me"), "mine too");
+
+	await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => true,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(readOr(dir, "notes.txt"), "mine");
+	assert.equal(readOr(dir, "relay-linux-x64.keep-me"), "mine too", "not a version, so not ours to delete");
+});

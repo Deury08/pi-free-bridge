@@ -181,3 +181,21 @@ Also removed: the two test assertions that named the deleted symbols
 (`isRelayVersionBelow`, `relayMismatchMessage`). Asserting the absence of a name
 is still coupling to it, and once the functions are gone the assertion tests
 nothing.
+
+L14 (S1 refined by the owner's answer): the spare is chosen by precedence, not by
+"newest file wins":
+
+1. The binary the config names as running — it already answered `/health`, which is
+   the invariant `.prev` exists to protect.
+2. Otherwise the newest version on disk, because nothing else tells us what ran.
+3. Everything else with a version-shaped name (`<name>.v0.4.0`, `<name>.0.5.1`) is
+   deleted.
+
+The case that forced the precedence: a `.v0.4.0` sitting next to a `.v0.3.0` the
+config points at is a build somebody rolled back FROM. Adopting the higher number
+would hand the next rollback a binary already known to fail — the opposite of what
+the spare is for.
+
+The match is by shape (`<name>.` + optional `v` + a digit), so `notes.txt` and
+`relay-linux-x64.keep-me` survive; a cleanup that deletes by wildcard eats what it
+did not create. Pinned by a test.
