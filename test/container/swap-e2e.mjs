@@ -5,8 +5,10 @@ import { spawn } from "node:child_process";
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const mod = await import(process.env.PFB_ENTRY ?? "/src/index.ts");
+const entry = process.argv[2] ?? process.env.PFB_ENTRY ?? fileURLToPath(new URL("../../index.ts", import.meta.url));
+const mod = await import(entry);
 const name = "relay-linux-x64";
 const dir = mkdtempSync(join(tmpdir(), "e2e-"));
 const current = join(dir, name);
