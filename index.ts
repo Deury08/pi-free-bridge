@@ -28,15 +28,6 @@ const API = "openai-completions" as const;
  *  "public" keeps credentials out of the repo and out of auth.json. */
 const API_KEY = "public";
 
-/** User-agent must contain "opencode/" or the gate answers 403 (HANDOFF §4.2).
- *  The Pi path uses the relay's copy; this one stays for the registry refresh. */
-const USER_AGENT = "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
-
-const REGISTRY_PATHS = [
-	join(homedir(), ".cache", "opencode", "models.json"),
-	join(homedir(), ".config", "opencode", "models.json"),
-];
-
 /** Optional user config: `{ "sessionId": "ses_…", "liveIds": ["…"] }`. */
 export const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
 
@@ -1108,22 +1099,6 @@ type RegistryModel = {
 	meta: Record<string, unknown>;
 };
 
-function resolveRegistryPath(): string | undefined {
-	return REGISTRY_PATHS.find((p) => existsSync(p));
-}
-
-/** A model is free when every cost field it actually declares is zero.
- *
- *  The registry omits `cache_write` on most free models, so testing all four
- *  fields with `=== 0` classifies 36 of 39 free models as paid (HANDOFF §4.4). */
-function isFree(meta: Record<string, unknown>): boolean {
-	const cost = (meta.cost ?? {}) as Record<string, unknown>;
-	const declared = Object.values(cost).filter(
-		(v): v is number => typeof v === "number" && Number.isFinite(v),
-	);
-	return declared.length > 0 && declared.every((v) => v === 0);
-}
-
 /** What a catalog answer means. `unavailable` carries a reason when the reply
  *  is a failure; an empty list with no `unavailable` means the vendor genuinely
  *  offers nothing free. Those are different facts and the UI renders them
@@ -1180,57 +1155,6 @@ export async function fetchRelayCatalog(signal?: AbortSignal): Promise<CatalogRe
 			unavailable: `${url} unreachable: ${(err as Error).message}`,
 		};
 	}
-}
-
-function discoverFreeModels(liveIds: Set<string>): { models: RegistryModel[]; source: string; skipped: string[] } {
-	const path = resolveRegistryPath();
-	if (!path) return { models: [], source: "registry not found", skipped: [] };
-
-	let data: Record<string, any>;
-	try {
-		data = JSON.parse(readFileSync(path, "utf-8"));
-	} catch (err) {
-		return { models: [], source: `registry unreadable: ${(err as Error).message}`, skipped: [] };
-	}
-
-	const registryModels = data?.opencode?.models;
-	if (!registryModels || typeof registryModels !== "object") {
-		return { models: [], source: `registry has no "opencode.models": ${path}`, skipped: [] };
-	}
-
-	const models: RegistryModel[] = [];
-	const skipped: string[] = [];
-	for (const [id, meta] of Object.entries<Record<string, unknown>>(registryModels)) {
-		if (!meta || typeof meta !== "object") continue;
-		if (EXCLUDED_MODELS.has(id)) {
-			skipped.push(id);
-			continue;
-		}
-		if (!isFree(meta)) continue;
-		// Free in the registry but not advertised by the surface: registering it
-		// would put a permanently broken entry in the picker.
-		if (!liveIds.has(id)) {
-			skipped.push(id);
-			continue;
-		}
-		models.push({ id, name: (meta.name as string) || id, meta });
-	}
-
-	models.sort((a, b) => a.id.localeCompare(b.id));
-	return { models, source: path, skipped };
-}
-
-/** Ask the surface which models it advertises, then keep the free ones. */
-async function fetchLiveFreeIds(registryFree: Set<string>): Promise<string[]> {
-	const res = await fetch(`${UPSTREAM_URL}/models`, {
-		headers: { "user-agent": USER_AGENT, authorization: `Bearer ${API_KEY}` },
-	});
-	if (!res.ok) throw new Error(`${UPSTREAM_URL}/models -> ${res.status}`);
-	const payload = (await res.json()) as { data?: { id?: string }[] } | { models?: { id?: string }[] };
-	const listed = payload.data ?? payload.models ?? [];
-	return listed
-		.map((m) => (typeof m === "string" ? m : m?.id))
-		.filter((id): id is string => typeof id === "string" && registryFree.has(id));
 }
 
 function buildPiModels(raw: RegistryModel[]) {

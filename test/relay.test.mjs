@@ -3942,9 +3942,13 @@ test("the extension registers exactly three commands, no aliases, no argument fo
 // No OpenCode required (spec odd/tasks/no-opencode-required.md, S1 and S5).
 //
 // The defect a real container test found: on a machine with no OpenCode the
-// extension loaded but registered nothing, because discoverFreeModels found no
+// extension loaded but registered nothing, because model discovery found no
 // registry and the factory returned before the registrations. The menu was
 // missing exactly where it was most needed.
+//
+// The registry-reading discovery path is gone (it is the relay's job now), so
+// this case is kept as the regression that must not come back: an empty or
+// missing catalog may cost the provider, never the commands.
 // ---------------------------------------------------------------------------
 
 test("commands register even when model discovery finds nothing at all", () => {
