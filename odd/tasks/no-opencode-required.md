@@ -193,3 +193,15 @@ and someone verifying one should not have to hold the others in their head.
   `USER_AGENT`): 76 lines out, no behaviour in. Verifiable alone: grep the
   extension for `models.json` and find nothing. `SNAPSHOT_LIVE_FREE_IDS` stays
   and only feeds the DRY_RUN printout, so it is no longer a catalog fallback.
+- `L16` (owner decision, dry run): `SNAPSHOT_LIVE_FREE_IDS` and `resolveLiveIds`
+  are gone. The snapshot was a hardcoded list of "free ids the surface
+  advertised on 2026-10-25" — no longer a catalog fallback, but exactly the kind
+  of thing a reader finds and concludes OpenCode is still required. The dry run
+  keeps its value: it still reports catalog source, upstream, relay, bun, api,
+  session id, exclusions, and the live model ids. What changed in its output is
+  only where the numbers come from: `skipped` is now the relay's count (74
+  today) instead of an always-empty list, `unavailable` shows the failure reason
+  or `no`, and the label `registry:` became `catalog:` because the registry is
+  no longer the source. Verified by running the factory under
+  `PI_FREE_BRIDGE_DRY_RUN=1` against a relay on 8897 (12 models, skipped 74,
+  unavailable no) and against a dead port (0 models, the ECONNREFUSED reason).

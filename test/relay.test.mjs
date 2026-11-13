@@ -4069,9 +4069,12 @@ test("the provider is published from the relay catalog with refreshModels wired"
 test("parseRelayCatalog: a failed catalog is not an empty catalog", () => {
 	// The distinction the menu depends on: "the vendor said 429" and "the vendor
 	// offers nothing free" are different facts and must not render the same.
-	const genuinelyEmpty = releaseMod.parseRelayCatalog(200, { ok: true, models: [] });
+	const genuinelyEmpty = releaseMod.parseRelayCatalog(200, { ok: true, models: [], skipped: 74 });
 	assert.deepEqual(genuinelyEmpty.models, []);
 	assert.equal(genuinelyEmpty.unavailable, undefined);
+	// The relay is the side that knows how many it refused; the dry run reports
+	// that number instead of recomputing a list this side no longer builds.
+	assert.equal(genuinelyEmpty.skippedCount, 74);
 
 	const failed = releaseMod.parseRelayCatalog(502, { ok: false, reason: "https://x/models -> HTTP 429" });
 	assert.equal(failed.models.length, 0);

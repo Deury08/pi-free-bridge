@@ -39,29 +39,6 @@ const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
  *  registers its models at runtime, so literal ids hide anything new. */
 const SCOPE_PATTERN = `${PROVIDER}/*`;
 
-/** Free ids the surface actually advertised on 2026-10-25.
- *
- *  Registration stays offline and deterministic: intersecting the registry with
- *  `GET /inference/v1/models` on every launch would put a network round-trip on
- *  the startup path. Refresh the snapshot with the "Refresh session" menu item, which
- *  fetches the live list and persists it to BRIDGE_CONFIG_PATH.
- *
- *  This list is what a **fresh install** registers before the user runs
- *  that menu item, so a stale entry here is a permanently broken model
- *  in someone else's picker. `longcat-2.5-preview-free` and
- *  `minimax-m3.1-flash-free` were dropped on 2026-10-25 because the surface no
- *  longer advertises them; `flint-40b-free` was added. */
-const SNAPSHOT_LIVE_FREE_IDS = [
-	"beam-free",
-	"big-pickle",
-	"deepseek-v4.1-flash-free",
-	"flint-40b-free",
-	"glm-5.3-flash-free",
-	"mimo-v2.6-flash-free",
-	"nemotron-3.5-lightning-free",
-	"nemotron-3.5-super-vl-free",
-];
-
 /** Models the surface advertises but cannot serve over chat/completions:
  *  400 ModelProtocolUnsupported on /inference/v1, 403 on /messages (HANDOFF D5). */
 const EXCLUDED_MODELS = new Set([
@@ -437,14 +414,6 @@ function resolveSessionId(): { sessionId?: string; source: string } {
 	if (harvested) return harvested;
 
 	return { source: "none" };
-}
-
-function resolveLiveIds(): { liveIds: Set<string>; source: string } {
-	const fromConfig = readBridgeConfig().liveIds;
-	if (Array.isArray(fromConfig) && fromConfig.length > 0) {
-		return { liveIds: new Set(fromConfig), source: BRIDGE_CONFIG_PATH };
-	}
-	return { liveIds: new Set(SNAPSHOT_LIVE_FREE_IDS), source: "built-in snapshot (2026-10-14)" };
 }
 
 /** WARP egress modes (bun-upgrades S5). */
@@ -1106,7 +1075,9 @@ type RegistryModel = {
 export type CatalogResult = {
 	models: RegistryModel[];
 	source: string;
-	skipped: string[];
+	/** How many models the relay refused as not free. The extension no longer
+	 *  classifies prices itself, so this is reported, never recomputed. */
+	skippedCount?: number;
 	unavailable?: string;
 };
 
@@ -1117,7 +1088,7 @@ export function parseRelayCatalog(status: number, body: any): CatalogResult {
 	const source = "relay /models";
 	if (status < 200 || status >= 300 || !body || body.ok !== true) {
 		const reason = body && body.reason ? body.reason : `relay /models -> HTTP ${status}`;
-		return { models: [], source, skipped: [], unavailable: String(reason) };
+		return { models: [], source, unavailable: String(reason) };
 	}
 	const models: RegistryModel[] = [];
 	for (const entry of (body.models ?? []) as any[]) {
@@ -1135,7 +1106,11 @@ export function parseRelayCatalog(status: number, body: any): CatalogResult {
 			},
 		});
 	}
-	return { models, source, skipped: [] };
+	return {
+		models,
+		source,
+		skippedCount: typeof body.skipped === "number" ? body.skipped : undefined,
+	};
 }
 
 /** The catalog, through the relay. One door to the vendor: the relay is what
@@ -1151,7 +1126,6 @@ export async function fetchRelayCatalog(signal?: AbortSignal): Promise<CatalogRe
 		return {
 			models: [],
 			source: url,
-			skipped: [],
 			unavailable: `${url} unreachable: ${(err as Error).message}`,
 		};
 	}
@@ -2175,13 +2149,12 @@ async function ensureWarpWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 function printDryRun(
-	discovered: { models: RegistryModel[]; source: string; skipped: string[] },
+	discovered: CatalogResult,
 	session: { sessionId?: string; source: string },
-	live: { liveIds: Set<string>; source: string },
 ): void {
 	const lines = [
 		"pi-free-bridge dry run",
-		`  registry:    ${discovered.source}`,
+		`  catalog:     ${discovered.source}`,
 		`  upstream:    ${UPSTREAM_URL}`,
 		`  relay:       ${RELAY_URL} (port ${RELAY_PORT})`,
 		`  bun:         ${resolveBunPath() ?? "MISSING"}`,
@@ -2191,12 +2164,17 @@ function printDryRun(
 				? `${session.sessionId} (from ${session.source})`
 				: "harvested by the relay from the OpenCode store"
 		}`,
-		`  live ids:    ${live.source}`,
 		`  excluded:    ${[...EXCLUDED_MODELS].join(", ")}`,
+		// The relay is the side that knows which models it refused and why, so
+		// this reports its count instead of printing an always-empty list again.
+		`  skipped:     ${
+			discovered.skippedCount === undefined
+				? "unknown (the catalog did not report a count)"
+				: `${discovered.skippedCount} (not free, per the relay)`
+		}`,
+		`  unavailable: ${discovered.unavailable ?? "no"}`,
 		`  models (${discovered.models.length}):`,
 		...discovered.models.map((m) => `    - ${m.id}`),
-		`  skipped (${discovered.skipped.length}):`,
-		...discovered.skipped.map((m) => `    - ${m}`),
 	];
 	console.log(lines.join("\n"));
 }
@@ -2272,7 +2250,6 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	const session = resolveSessionId();
-	const live = resolveLiveIds();
 
 	// The relay first, then its catalog: the extension no longer has a door of
 	// its own to the service, so asking for models before the relay exists is
@@ -2297,11 +2274,11 @@ export default async function (pi: ExtensionAPI) {
 	// opposite of the machine this bridge is for.
 	const discovered =
 		process.env.PI_FREE_BRIDGE_SKIP_CATALOG === "1"
-			? { models: [] as RegistryModel[], source: "catalog fetch skipped", skipped: [] as string[] }
+			? { models: [] as RegistryModel[], source: "catalog fetch skipped" }
 			: await fetchRelayCatalog(AbortSignal.timeout(4000));
 
 	if (process.env.PI_FREE_BRIDGE_DRY_RUN === "1") {
-		printDryRun(discovered, session, live);
+		printDryRun(discovered, session);
 	}
 
 	// Zero models is NOT a failure any more. The provider is only registered
