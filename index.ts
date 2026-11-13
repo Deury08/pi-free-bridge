@@ -2066,15 +2066,34 @@ export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
 	}
 
 	// S3.6-7: roll back, delete the binary that failed, keep the evidence.
+	//
+	// Order matters more than anything else in this function. The old sequence
+	// deleted `current` first and only then asked whether `.prev` existed, so a
+	// machine whose spare was missing ended up with NO relay binary at all: worse
+	// than an update that failed, because there is nothing left to run. So:
+	//   1. decide whether there is anything to restore;
+	//   2. move the failed binary aside to its own name — it can never be confused
+	//      with the restored file, because the restore lands on `current` after;
+	//   3. restore, then delete the failed copy.
+	// The only binary this function removes is one whose bytes already failed, and
+	// only after a known-good one is back in place.
 	const reason = `el relay ${deps.version} no respondió /health`;
-	const hadPrevious = existsSync(previous);
-	rmSync(current, { force: true });
 	appendFailedLog(logPath, `${now().toISOString()}\t${deps.version}\t${reason}`);
-	if (!hadPrevious) {
+	if (!existsSync(previous)) {
+		// Nothing to restore, so nothing good can be lost: the only binary here is
+		// the one that just failed, and a corpse at the canonical name would be
+		// adopted as the next `.prev` — poisoning the spare with bytes already
+		// known to fail. Remove it and leave `failed.log` as the evidence.
+		rmSync(current, { force: true });
 		return { ok: false, rolledBack: false, reason: `${reason}; no previous version to fall back to` };
 	}
+
+	const failedPath = `${current}.failed`;
+	rmSync(failedPath, { force: true });
+	if (existsSync(current)) renameSync(current, failedPath);
 	renameSync(previous, current);
 	if (process.platform !== "win32") chmodSync(current, 0o755);
+	rmSync(failedPath, { force: true });
 	let restored = false;
 	try {
 		restored = await deps.startRelay();

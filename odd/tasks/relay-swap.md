@@ -222,3 +222,36 @@ file name, that exactly one place stages a download and does it through
 
 Re-run needs one line of proof: `git rev-parse --short HEAD` inside the container
 source and `grep -c fetchDirectCatalog index.ts` (0 means it is not this branch).
+
+L16 (container report, rollback): the container reported an empty `bin/` — only
+`failed.log` — after an update whose new binary did not answer `/health`.
+
+What I did about it:
+
+1. Hardened the delete order, which was the actual hazard. The old sequence removed
+   `current` and only then asked whether `.prev` existed, so the delete and the
+   restore shared a name and a machine could end with no relay binary. Now: decide
+   whether there is a spare, MOVE the failed binary aside to `<name>.failed`, restore
+   `.prev` onto `current`, then delete the aside copy. The only binary this function
+   removes is one whose bytes already failed, and only after a known-good one is back
+   at the canonical name.
+2. Added the end state as the assertion, not "the rollback ran": after a failed
+   update with a spare, the directory holds `relay-linux-x64` and `failed.log`, the
+   bytes are the previous ones, and the restart saw those bytes already in place.
+3. Built the container harness the report asked for and checked it here:
+   `test/container/swap-e2e.mjs` + `.sh`. Real Linux, real spawn, real renames,
+   container-local port 8899.
+
+Result: the harness PASSES on the hardened code AND on `631dffb` (before the
+hardening). So the empty-directory outcome is not reproducible from either commit
+with this sequence, and the report's diagnosis (the delete naming the restored file)
+describes an order this branch never had — HEAD always restored after deleting.
+
+The one path that produces exactly `failed.log` alone is the no-spare branch, which
+happens on a directory that never had a working binary. Most likely reading: the
+second install ran against a different install directory or a different HOME than
+the one holding the working relay (for example a fresh container layer or a
+different user), so there was no spare to restore while a relay from elsewhere was
+still serving. That needs the container's own evidence to confirm: `HEAD` inside the
+source, `ls -la bin` BEFORE the update, the config's `relayBin`, and whether HOME
+changed between the two runs.

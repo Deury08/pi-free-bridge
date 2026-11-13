@@ -4456,3 +4456,61 @@ test("the extension never names an installed relay after a version (S1)", () => 
 		assert.equal(releaseMod.relayBinaryPath("/bin", asset), "/bin/" + asset);
 	}
 });
+
+test("a failed update leaves the previous good binary in place, byte for byte (S3.6)", async () => {
+	// The invariant, stated as an end state instead of as "the rollback ran":
+	// after a failed update WITH a good previous binary, the directory holds the
+	// working binary and nothing else, its bytes are the PREVIOUS ones, and the
+	// restart happened while those bytes were already at the canonical name.
+	const dir = swapFixture({ "relay-linux-x64": "GOOD-1", "relay-linux-x64.tmp": "BROKEN-2" });
+	const seenByRestart = [];
+	let starts = 0;
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.0",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => {
+			starts += 1;
+			seenByRestart.push(readOr(dir, "relay-linux-x64"));
+			return starts > 1; // the new binary fails, the restored one works
+		},
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, true, JSON.stringify(result));
+	assert.equal(readOr(dir, "relay-linux-x64"), "GOOD-1", "the good bytes are back at the canonical name");
+	assert.deepEqual(
+		readdirSync(dir).sort(),
+		["failed.log", "relay-linux-x64"],
+		"one binary and the evidence, no corpses",
+	);
+	assert.equal(seenByRestart[1], "GOOD-1", "the restart saw the restored binary, not the failed one");
+	assert.match(readOr(dir, "failed.log"), /\t0\.5\.0\t/, "the failure is recorded");
+});
+
+test("a failed update with no previous binary removes nothing good (S3.6)", async () => {
+	// The other half of the same invariant: when there is no spare there is no
+	// good copy to protect, so the failed binary goes and failed.log stays. What
+	// must never happen is deleting a working binary in the name of rollback.
+	const dir = swapFixture({ "relay-linux-x64.tmp": "BROKEN-1" });
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.0",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => false,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, false, "nothing to roll back to");
+	assert.match(result.reason, /no previous/);
+	assert.equal(readOr(dir, "relay-linux-x64"), undefined, "a failing binary does not stay at the canonical name");
+	assert.deepEqual(readdirSync(dir).sort(), ["failed.log"]);
+});
