@@ -6,6 +6,30 @@ Registra **únicamente** el tier gratuito anónimo de OpenCode bajo el provider 
 **`oc-sdk-zen`** e inyecta el contrato del gate desde un relay local ejecutado por
 Bun, así que sobrevive a `pi update` y no depende de ningún puente de terceros.
 
+## Instalación rápida
+
+```bash
+gentle-shell install pi-free-bridge
+```
+
+Reiniciá Pi una vez y escribí `/free-bridge` para abrir el menú.
+
+**No hace falta Bun ni tener OpenCode instalado.** El relay es un ejecutable por
+sistema operativo que la extensión descarga cuando se lo pedís desde el menú,
+después de confirmar: nada se baja al abrir Pi. Windows, Linux y macOS, en x64
+y ARM. Pi sí necesita Node, como cualquier extensión de Pi.
+
+Después de instalado, todo se maneja desde un solo comando:
+
+| Comando | Para qué |
+| --- | --- |
+| `/free-bridge` | El menú: instalar el relay, WARP, cable, modelos |
+| `/free-bridge-warp-recycle` | Reciclar la salida cuando algo se traba |
+| `/free-bridge-doctor` | Diagnóstico, para pegar en un issue |
+
+La guía paso a paso con capturas sigue abajo, para quien prefiera ir viendo
+cada pantalla.
+
 ## Instalar
 
 Siete pasos, todos desde el terminal. Las capturas son de una instalación real
