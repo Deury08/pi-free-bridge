@@ -125,3 +125,31 @@ installs, not an edge case. Falling through to the raw 404 would have left
 exactly those users with the message S5 exists to delete. They now get "el relay
 que corre no informa su versión, esta extensión necesita 0.5.1. Actualizalo
 desde «Instalar / actualizar relay»". Pinned by a test.
+
+L10 (correction from the human, overrides L1's mismatch check): do NOT implement a
+minimum-version check. "Versions must not become a contract." S5 is replaced by
+capability detection:
+
+- `version` stays in `/health` as information — display and diagnosis
+  ("corriendo v0.4.0") — never a gate.
+- The extension probes at runtime: `/models` answers → the catalog comes from the
+  relay; `/models` 404s → the extension falls back to the direct service call
+  (measured to work: 3/3 HTTP 200, 86 models, no WARP, no 429). It never refuses
+  to work because a number looks old.
+- Rationale, in the human's words: the numbers are aligned today only so we do
+  not lose track of which piece is which; in the future the relay and the
+  extension must be free to move independently.
+
+Removed with it: `MIN_RELAY_VERSION`, `isRelayVersionBelow`,
+`relayMismatchMessage`, and the two 404-message tests. `parseRelayVersion` stays
+for display. The fallback duplicates the relay's pricing reader on purpose
+(importing `relay.mjs` would drag its HTTP server into Pi's extension bundle),
+guarded by a differential test that feeds one fixture to both readers and
+requires identical ids.
+
+L11 (verified live, not assumed): with a fake pre-`/models` relay answering 404
+on port 8896, `fetchRelayCatalog()` returned **12 free models** with
+`source: https://opencode.ai/inference/v1/models (directo: el relay no tiene
+/models)` and **no `unavailable`** — the fallback is a catalog, not an error
+state. A relay that is not running at all still yields no models, which is the
+agreed gating for a machine that has not installed one.

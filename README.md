@@ -493,10 +493,16 @@ borrar la evidencia junto con el binario dejaría un fallo sin historia.
 
 **La versión del relay se puede preguntar.** `/health` publica `version`, y el
 relay que corre lo dice aunque no lo hayas instalado vos (`bun relay.mjs`, un
-binario viejo en el PATH, un archivo copiado). Si es más viejo que el que esta
-extensión necesita, el mensaje lo dice con nombre y apellido —«el relay que
-corre es X, esta extensión necesita Y»— en vez de mostrarte un 404 pelado de una
-ruta que ese relay no tiene.
+binario viejo en el PATH, un archivo copiado). Sirve para mostrarla y para
+diagnosticar: «corriendo v0.4.0».
+
+**Pero la versión no es un contrato.** La extensión no se niega a funcionar
+porque un número parezca viejo: pregunta por lo que el relay **puede hacer**. Si
+el relay tiene la ruta `/models`, el catálogo sale de ahí. Si no la tiene
+(404), la extensión le pide el catálogo al servicio directamente —la misma
+llamada que hacía antes de que la ruta existiera— y todo sigue funcionando. Hoy
+los números coinciden sólo para no perder de vista qué pieza es cuál; mañana el
+relay y la extensión tienen que poder moverse por separado.
 
 **El menú muestra sólo lo que podés usar.** No es una lista fija de siete: en
 una máquina recién instalada, sin relay y sin WARP, el menú es un solo ítem

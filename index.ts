@@ -28,6 +28,12 @@ const API = "openai-completions" as const;
  *  "public" keeps credentials out of the repo and out of auth.json. */
 const API_KEY = "public";
 
+/** Only the fallback path sends this, and only when the relay has no `/models`
+ *  route: the gate answers 403 to a user-agent without "opencode/". The relay
+ *  carries its own copy because it is normally the only process that talks to
+ *  the gate at all. */
+const FALLBACK_USER_AGENT = "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+
 /** Optional user config: `{ "sessionId": "ses_…", "liveIds": ["…"] }`. */
 export const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
 
@@ -1165,40 +1171,91 @@ export function parseRelayCatalog(status: number, body: any): CatalogResult {
  *  calls the vendor itself. */
 export async function fetchRelayCatalog(signal?: AbortSignal): Promise<CatalogResult> {
 	const url = `http://127.0.0.1:${RELAY_PORT}/models`;
+	let res: Response;
 	try {
-		const res = await fetch(url, { signal });
-		const body = await res.json().catch(() => undefined);
-		// A relay older than MIN_RELAY_VERSION has no /models route at all. A bare
-		// 404 sends the reader hunting for a broken extension, so when the relay can
-		// say what it is, name the version instead.
-		if (res.status === 404) {
-			const running = parseRelayVersion((await fetchRelayHealth(RELAY_PORT)) as unknown);
-			// A relay predating the version field — which is every install made before
-			// this feature — cannot be compared, but it can still be named. This is the
-			// common case, not the exotic one: falling back to the raw 404 here would
-			// leave most existing installs with the message this exists to delete.
-			if (!running) {
-				return {
-					models: [],
-					source: url,
-					unavailable: `el relay que corre no informa su versión, esta extensión necesita ${MIN_RELAY_VERSION}. Actualizalo desde «Instalar / actualizar relay»`,
-				};
-			}
-			if (isRelayVersionBelow(running, MIN_RELAY_VERSION)) {
-				return {
-					models: [],
-					source: url,
-					unavailable: relayMismatchMessage(running, MIN_RELAY_VERSION),
-				};
-			}
-		}
-		return parseRelayCatalog(res.status, body);
+		res = await fetch(url, { signal });
 	} catch (err) {
+		// No relay listening. That is the agreed state for a machine that has not
+		// installed one: no models, and a menu that only offers to install it.
 		return {
 			models: [],
 			source: url,
 			unavailable: `${url} unreachable: ${(err as Error).message}`,
 		};
+	}
+
+	// CAPABILITY, not version: a relay either has the route or it does not. 404
+	// means this relay predates /models, so the extension asks the service
+	// directly — the call it made before the route existed, measured to work (3/3
+	// HTTP 200, 86 models, no WARP, no 429). Never refuse to work because a
+	// number looks old: the relay and the extension must be free to move
+	// independently, and today's aligned numbers are bookkeeping, not a contract.
+	if (res.status === 404) return fetchDirectCatalog(signal);
+
+	const body = await res.json().catch(() => undefined);
+	return parseRelayCatalog(res.status, body);
+}
+
+/** A vendor model, read the way `relay.mjs`'s `freeCatalog` reads it.
+ *
+ *  This is the fallback path only, and the duplication is deliberate: importing
+ *  `relay.mjs` into the extension would drag its HTTP server into Pi's extension
+ *  bundle. A differential test feeds the same fixture to both implementations
+ *  and requires identical ids, so the two copies cannot drift apart in silence. */
+function freeFromUpstreamPayload(payload: unknown): RegistryModel[] {
+	const listed = ((payload as { data?: unknown[]; models?: unknown[] } | undefined)?.data ??
+		(payload as { models?: unknown[] } | undefined)?.models ??
+		[]) as unknown[];
+	const models: RegistryModel[] = [];
+	for (const entry of listed) {
+		if (!entry || typeof entry !== "object") continue;
+		const raw = entry as Record<string, any>;
+		const id = raw.id;
+		if (typeof id !== "string" || id.length === 0 || EXCLUDED_MODELS.has(id)) continue;
+		const price = (kind: "input" | "output"): number | undefined => {
+			const cost = raw.cost ?? {};
+			const node = (cost.text ?? {})[kind];
+			if (node && typeof node.price === "number") return node.price;
+			return typeof cost[kind] === "number" ? cost[kind] : undefined;
+		};
+		const input = price("input");
+		const output = price("output");
+		// Unreadable is not free: guessing would advertise a model that can spend quota.
+		if (input === undefined || output === undefined || input !== 0 || output !== 0) continue;
+		const limit = raw.limit ?? {};
+		const modalities = raw.modalities ?? {};
+		const capabilities = raw.capabilities ?? {};
+		models.push({
+			id,
+			name: typeof raw.name === "string" && raw.name ? raw.name : id,
+			meta: {
+				name: typeof raw.name === "string" ? raw.name : id,
+				family: raw.family,
+				reasoning: Boolean(capabilities.reasoning && capabilities.reasoning.supported),
+				limit,
+				cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+				modalities,
+			},
+		});
+	}
+	models.sort((a, b) => a.id.localeCompare(b.id));
+	return models;
+}
+
+/** The service itself, the way the extension used to call it: same headers, no
+ *  WARP. Used only when the relay has no `/models` route to serve. */
+async function fetchDirectCatalog(signal?: AbortSignal): Promise<CatalogResult> {
+	const url = `${UPSTREAM_URL}/models`;
+	const source = `${url} (directo: el relay no tiene /models)`;
+	try {
+		const res = await fetch(url, {
+			headers: { "user-agent": FALLBACK_USER_AGENT, authorization: `Bearer ${API_KEY}` },
+			signal,
+		});
+		if (!res.ok) return { models: [], source, unavailable: `${url} -> HTTP ${res.status}` };
+		return { models: freeFromUpstreamPayload(await res.json().catch(() => undefined)), source };
+	} catch (err) {
+		return { models: [], source, unavailable: `${url} unreachable: ${(err as Error).message}` };
 	}
 }
 
@@ -1816,35 +1873,16 @@ async function installWarpBinary(
  *  catalog comes from — first shipped in 0.5.1, so an older relay answers 404
  *  on it. Reporting that bare 404 sends the user hunting for a broken route;
  *  naming the version tells them what to do. */
-export const MIN_RELAY_VERSION = "0.5.1";
-
-/** The version a `/health` body reports, or undefined when it cannot be read. */
+/** The version a `/health` body reports, or undefined when it cannot be read.
+ *
+ *  INFORMATION ONLY — never a gate. The extension does not refuse to work
+ *  because a number looks old: it asks the relay for what it can do. The numbers
+ *  are aligned today only so we do not lose track of which piece is which; in
+ *  the future the relay and the extension must be free to move independently,
+ *  and a version comparison is exactly what would make that impossible. */
 export function parseRelayVersion(health: unknown): string | undefined {
 	const value = (health as { version?: unknown } | null | undefined)?.version;
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-/** Numeric parts of `[v]MAJOR.MINOR.PATCH`, or undefined for anything else. */
-function versionParts(value: string): number[] | undefined {
-	const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(value.trim());
-	return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
-}
-
-/** Whether `running` is older than `required`. An unreadable version counts as
- *  too old: a relay that cannot say what it is cannot be trusted to have the
- *  route, and "unknown" silently passing the check is how a 404 comes back. */
-export function isRelayVersionBelow(running: string, required: string): boolean {
-	const a = versionParts(running);
-	const b = versionParts(required);
-	if (!a || !b) return true;
-	for (let i = 0; i < 3; i++) {
-		if (a[i] !== b[i]) return a[i] < b[i];
-	}
-	return false;
-}
-
-export function relayMismatchMessage(running: string, required: string): string {
-	return `el relay que corre es ${running}, esta extensión necesita ${required}`;
 }
 
 /** Where a relay binary lives under a directory. The name carries no version:

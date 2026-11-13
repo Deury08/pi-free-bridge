@@ -4122,20 +4122,16 @@ test("relay /health reports a readable version (S2)", async () => {
 	assert.equal(health.version, RELAY_VERSION, "the relay and package.json agree");
 });
 
-test("relay version check: a lower version is named in plain words (S5)", () => {
+test("relay version is information, not a contract (S5)", () => {
+	// The numbers are aligned today only so we do not lose track of which piece
+	// is which; the relay and the extension must be free to move independently.
+	// So there is NO gate to test — only readable parsing.
 	assert.equal(releaseMod.parseRelayVersion({ version: "0.5.1" }), "0.5.1");
 	assert.equal(releaseMod.parseRelayVersion({}), undefined);
 	assert.equal(releaseMod.parseRelayVersion(null), undefined);
 	assert.equal(releaseMod.parseRelayVersion({ version: 5 }), undefined, "a number is not a version");
-
-	assert.equal(releaseMod.isRelayVersionBelow("0.4.0", "0.5.1"), true);
-	assert.equal(releaseMod.isRelayVersionBelow("0.5.1", "0.5.1"), false, "equal is not below");
-	assert.equal(releaseMod.isRelayVersionBelow("0.10.0", "0.9.0"), false, "numeric compare, not string compare");
-	assert.equal(releaseMod.isRelayVersionBelow("unknown", "0.5.1"), true, "an unreadable version cannot be trusted");
-
-	const message = releaseMod.relayMismatchMessage("0.4.0", "0.5.1");
-	assert.match(message, /0\.4\.0/, "the message names what is running");
-	assert.match(message, /0\.5\.1/, "and what the extension needs");
+	assert.equal(releaseMod.isRelayVersionBelow, undefined, "no version comparison exists to gate on");
+	assert.equal(releaseMod.relayMismatchMessage, undefined, "and no refusal message either");
 });
 
 test("swap: a healthy new binary becomes current and the old one becomes .prev (S3, S4)", async () => {
@@ -4246,44 +4242,58 @@ test("swap: nobody answers the question, so it rolls back on its own (S3.6)", as
 	assert.equal(readOr(dir, "relay-linux-x64"), "OLD");
 });
 
-test("fetchRelayCatalog: an old relay is named, not reported as a bare 404 (S5)", async () => {
-	// The user-visible promise: a relay older than the extension answers 404 on
-	// /models, and "404" alone sends the reader hunting for a broken extension.
+test("fetchRelayCatalog: a relay without /models still yields a catalog (S5)", async () => {
+	// Capability detection: 404 means this relay predates the route, and the
+	// extension falls back to the direct service call it made before the route
+	// existed. Fallback, not an error state.
 	const realFetch = globalThis.fetch;
 	try {
 		globalThis.fetch = async (url) => {
-			if (String(url).endsWith("/models")) {
+			if (String(url).includes("127.0.0.1")) {
 				return { ok: false, status: 404, json: async () => ({ error: { message: "no route for GET /models" } }) };
 			}
-			// /health answers, and says it is too old.
-			return { ok: true, status: 200, json: async () => ({ service: "pi-free-bridge-relay", ok: true, version: "0.4.0" }) };
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({
+					data: [
+						{ id: "beam-free", name: "Beam", cost: { text: { input: { price: 0 }, output: { price: 0 } } }, limit: { context: 1000 } },
+						{ id: "paid", cost: { text: { input: { price: 3 }, output: { price: 1 } } } },
+					],
+				}),
+			};
 		};
 		const result = await releaseMod.fetchRelayCatalog();
-		assert.equal(result.models.length, 0);
-		assert.match(String(result.unavailable), /0\.4\.0/, "names what is running");
-		assert.match(String(result.unavailable), /0\.5\.1/, "and what is needed");
+		assert.deepEqual(result.models.map((m) => m.id), ["beam-free"], "the direct call still gives a catalog");
+		assert.equal(result.unavailable, undefined, "falling back is not an error state");
+		assert.match(result.source, /directo|fallback/i, "and the source says where it came from");
 	} finally {
 		globalThis.fetch = realFetch;
 	}
 });
 
-test("fetchRelayCatalog: a relay that reports no version is named too (S5)", async () => {
-	// Every relay installed before this feature is exactly this case: it answers
-	// /health without a `version`, so a version comparison cannot run. Falling
-	// back to the raw 404 would leave the majority of existing installs with the
-	// message this feature exists to delete.
+test("the fallback reader agrees with the relay reader (drift guard)", async () => {
+	// The fallback duplicates the relay pricing logic on purpose: importing
+	// relay.mjs would drag its HTTP server into the Pi extension bundle. Same
+	// fixture through both readers, or the copies have silently drifted.
+	const fixture = {
+		data: [
+			{ id: "beam-free", name: "Beam", cost: { text: { input: { price: 0 }, output: { price: 0 } } }, limit: { context: 1048576, output: 131072 }, modalities: { input: ["text"] }, capabilities: { reasoning: { supported: true } } },
+			{ id: "flat-free", cost: { input: 0, output: 0 } },
+			{ id: "paid", cost: { text: { input: { price: 3 }, output: { price: 15 } } } },
+			{ id: "unpriced", cost: {} },
+		],
+	};
+	const fromRelay = freeCatalog(fixture).models.map((m) => m.id);
+	assert.deepEqual(fromRelay, ["beam-free", "flat-free"]);
 	const realFetch = globalThis.fetch;
 	try {
 		globalThis.fetch = async (url) => {
-			if (String(url).endsWith("/models")) {
-				return { ok: false, status: 404, json: async () => ({}) };
-			}
-			return { ok: true, status: 200, json: async () => ({ service: "pi-free-bridge-relay", ok: true }) };
+			if (String(url).includes("127.0.0.1")) return { ok: false, status: 404, json: async () => ({}) };
+			return { ok: true, status: 200, json: async () => fixture };
 		};
-		const result = await releaseMod.fetchRelayCatalog();
-		assert.equal(result.models.length, 0);
-		assert.match(String(result.unavailable), /no informa su versión/, "says the relay is too old to be asked");
-		assert.match(String(result.unavailable), /0\.5\.1/, "and what is needed");
+		const viaFallback = await releaseMod.fetchRelayCatalog();
+		assert.deepEqual(viaFallback.models.map((m) => m.id), fromRelay, "both readers keep the same models");
 	} finally {
 		globalThis.fetch = realFetch;
 	}
