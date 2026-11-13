@@ -1040,6 +1040,9 @@ function describeRelay(): string {
 type RelayHealth = {
 	sessionId?: string;
 	sessionSource?: string;
+	/** The relay's own version. Without it a relay nobody installed (an old
+	 *  `bun relay.mjs`, a file on PATH) cannot be told apart from a current one. */
+	version?: string;
 	warpMode?: string;
 	/** relay-warp-hot-reload: who set the reported mode. */
 	warpModeSource?: "env" | "config";
@@ -1072,11 +1075,13 @@ export async function fetchRelayHealth(port: number): Promise<RelayHealth | unde
 			warpRecycles?: unknown;
 			warpResends?: unknown;
 			localParkedForMs?: unknown;
+			version?: unknown;
 		};
 		if (payload?.service !== RELAY_SERVICE || payload.ok !== true) return undefined;
 		return {
 			sessionId: typeof payload.sessionId === "string" ? payload.sessionId : undefined,
 			sessionSource: typeof payload.sessionSource === "string" ? payload.sessionSource : undefined,
+			version: typeof payload.version === "string" ? payload.version : undefined,
 			warpMode: normalizeWarpMode(payload.warpMode),
 			warpModeSource:
 				typeof payload.warpModeSource === "string" &&

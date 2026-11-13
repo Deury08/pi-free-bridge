@@ -4245,3 +4245,24 @@ test("swap: nobody answers the question, so it rolls back on its own (S3.6)", as
 	assert.equal(result.rolledBack, true, "an unanswered question must not wait forever");
 	assert.equal(readOr(dir, "relay-linux-x64"), "OLD");
 });
+
+test("fetchRelayCatalog: an old relay is named, not reported as a bare 404 (S5)", async () => {
+	// The user-visible promise: a relay older than the extension answers 404 on
+	// /models, and "404" alone sends the reader hunting for a broken extension.
+	const realFetch = globalThis.fetch;
+	try {
+		globalThis.fetch = async (url) => {
+			if (String(url).endsWith("/models")) {
+				return { ok: false, status: 404, json: async () => ({ error: { message: "no route for GET /models" } }) };
+			}
+			// /health answers, and says it is too old.
+			return { ok: true, status: 200, json: async () => ({ service: "pi-free-bridge-relay", ok: true, version: "0.4.0" }) };
+		};
+		const result = await releaseMod.fetchRelayCatalog();
+		assert.equal(result.models.length, 0);
+		assert.match(String(result.unavailable), /0\.4\.0/, "names what is running");
+		assert.match(String(result.unavailable), /0\.5\.1/, "and what is needed");
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+});
