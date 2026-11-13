@@ -4514,3 +4514,111 @@ test("a failed update with no previous binary removes nothing good (S3.6)", asyn
 	assert.equal(readOr(dir, "relay-linux-x64"), undefined, "a failing binary does not stay at the canonical name");
 	assert.deepEqual(readdirSync(dir).sort(), ["failed.log"]);
 });
+
+test("a stale versioned relayBin is migrated to the canonical name (S3.0)", () => {
+	// Every install from before the two-name layout left
+	// relayBin = ".../bin/relay-linux-x64.v0.4.0". Nothing produces that name any
+	// more, so every start after the layout change pointed at a dead path: the
+	// relay never answered and the swap rolled back on a machine that had been
+	// healthy a minute earlier. The stale path is the bug, so it is rewritten.
+	const writes = [];
+	const resolved = releaseMod.migrateRelayBinConfig("/bin", "relay-linux-x64", {
+		read: () => ({ relayBin: "/bin/relay-linux-x64.v0.4.0" }),
+		write: (patch) => writes.push(patch),
+		exists: () => true,
+	});
+	assert.equal(resolved, "/bin/relay-linux-x64");
+	assert.deepEqual(writes, [{ relayBin: "/bin/relay-linux-x64" }], "written once, not on every start");
+});
+
+test("a relayBin pointing at a file that is gone is migrated too (S3.0)", () => {
+	const writes = [];
+	const resolved = releaseMod.migrateRelayBinConfig("/bin", "relay-linux-x64", {
+		read: () => ({ relayBin: "/elsewhere/gone-binary" }),
+		write: (patch) => writes.push(patch),
+		exists: () => false,
+	});
+	assert.equal(resolved, "/bin/relay-linux-x64");
+	assert.equal(writes.length, 1);
+});
+
+test("a healthy canonical relayBin is left alone (S3.0)", () => {
+	const writes = [];
+	const resolved = releaseMod.resolveRelayBin("/bin", "relay-linux-x64", {
+		read: () => ({ relayBin: "/bin/relay-linux-x64" }),
+		write: (patch) => writes.push(patch),
+		exists: () => true,
+	});
+	assert.equal(resolved, "/bin/relay-linux-x64");
+	assert.deepEqual(writes, [], "no write when nothing is wrong");
+});
+
+test("migration plus update: the versioned file becomes the spare (S1, S3.0)", async () => {
+	// The end state the migration promises: the leftover is adopted as .prev, the
+	// two names are the only ones left, and the config stops naming the dead path.
+	const dir = swapFixture({ "relay-linux-x64.v0.4.0": "GOOD-LEGACY", "relay-linux-x64.tmp": "BROKEN-NEW" });
+	const writes = [];
+	const previous = releaseMod.migrateRelayBinConfig(dir, "relay-linux-x64", {
+		read: () => ({ relayBin: join(dir, "relay-linux-x64.v0.4.0") }),
+		write: (patch) => writes.push(patch),
+		exists: (path) => existsSync(path),
+	});
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		previous,
+		stopRelay: async () => true,
+		startRelay: async () => false,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, true, JSON.stringify(result));
+	assert.deepEqual(writes, [{ relayBin: join(dir, "relay-linux-x64") }]);
+	assert.equal(readOr(dir, "relay-linux-x64"), "GOOD-LEGACY", "the legacy build is what runs again");
+	assert.deepEqual(readdirSync(dir).sort(), ["failed.log", "relay-linux-x64"], "no versioned leftovers");
+});
+
+test("a second install is refused while one is running (S3.8)", () => {
+	// A second Enter during the download started a second swap against the same
+	// two names. One at a time, in process.
+	assert.equal(releaseMod.isRelayInstallInFlight(), false);
+	assert.equal(releaseMod.beginRelayInstall(), true);
+	assert.equal(releaseMod.beginRelayInstall(), false, "the second one is refused");
+	assert.equal(releaseMod.isRelayInstallInFlight(), true);
+	releaseMod.endRelayInstall();
+	assert.equal(releaseMod.isRelayInstallInFlight(), false, "and the next one is allowed again");
+	assert.equal(releaseMod.beginRelayInstall(), true);
+	releaseMod.endRelayInstall();
+});
+
+test("resolving never writes: declining an install changes nothing (S3.0)", () => {
+	// The migration is a mutation, and the confirm comes first. Resolving is what
+	// the prompt needs to name the previous binary; if it wrote, saying "no" would
+	// leave a config pointing at a path that does not exist yet.
+	const writes = [];
+	const resolved = releaseMod.resolveRelayBin("/bin", "relay-linux-x64", {
+		read: () => ({ relayBin: "/bin/relay-linux-x64.v0.4.0" }),
+		write: (patch) => writes.push(patch),
+		exists: () => true,
+	});
+	assert.equal(resolved, "/bin/relay-linux-x64", "the prompt names the path that will exist");
+	assert.deepEqual(writes, [], "and nothing on disk changed");
+});
+
+test("a versioned leftover is never treated as the relay to start (S3.0)", () => {
+	// After the layout change a `.v0.5.0` may still sit on disk. Starting it would
+	// run the build the human just replaced, so the name itself disqualifies it.
+	assert.equal(releaseMod.isVersionedRelayBinName("/bin/relay-linux-x64.v0.4.0"), true);
+	assert.equal(releaseMod.isVersionedRelayBinName("C:\\bin\\relay-windows-x64.exe.v0.4.0"), true);
+	assert.equal(releaseMod.isVersionedRelayBinName("/bin/relay-linux-x64"), false);
+	assert.equal(releaseMod.isVersionedRelayBinName("/bin/relay-linux-x64.prev"), false);
+	assert.equal(
+		releaseMod.isVersionedRelayBinName("/usr/local/bin/relay-2"),
+		false,
+		"a foreign binary with a number in it is not ours to ignore",
+	);
+});

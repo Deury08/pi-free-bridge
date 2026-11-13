@@ -255,3 +255,35 @@ different user), so there was no spare to restore while a relay from elsewhere w
 still serving. That needs the container's own evidence to confirm: `HEAD` inside the
 source, `ls -la bin` BEFORE the update, the config's `relayBin`, and whether HOME
 changed between the two runs.
+
+L17 (the real trigger, found by the owner): the container's `relayBin` was still
+`.../bin/relay-linux-x64.v0.5.0`, written by the previous 0.5.0 install. Nothing
+migrated it after the layout change, so the extension kept resolving a name that
+would never exist again. That stale path — not the swap's rename order — is what
+made the update start from a dead file.
+
+Migration, split in two on purpose:
+
+- `resolveRelayBin(dir, asset, deps)` — read-only. Returns the canonical path when
+  the configured one is version-shaped or missing, and is what the confirm message
+  uses. Resolving must never write: declining an install has to leave the machine
+  exactly as it was, and writing before the question would point the config at a
+  file that does not exist yet.
+- `migrateRelayBinConfig(dir, asset, deps)` — called only after consent. Writes
+  `relayBin` to the canonical path once, so the next start cannot repeat it.
+
+`ensureRelay` also refuses a version-shaped `relayBin` even when the file still
+exists (it would run the build just replaced), and falls back to the canonical
+binary of this platform before Bun. `isVersionedRelayBinName` matches only the
+published asset names, so `/usr/local/bin/relay-2` is not mistaken for ours; it
+splits on both separators because a Windows path has to read the same everywhere.
+
+Concurrency: `beginRelayInstall` / `endRelayInstall` refuse a second install while
+one runs, in process. A second Enter during a download was enough to start a second
+swap against the same two names.
+
+Container proof, `test/container/swap-e2e.mjs`, two phases on real Linux with real
+processes: a plain install-then-failed-update, and a legacy config naming `.v0.4.0`
+which must migrate, adopt the leftover as `.prev`, and end with exactly
+`failed.log` + `relay-linux-x64` running the legacy bytes. Both PASS, and the
+resolving step is asserted not to touch the config.

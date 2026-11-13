@@ -2,7 +2,7 @@ import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-age
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
@@ -758,7 +758,20 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 	// installed on purpose. Bun stays the default, so an existing install keeps
 	// behaving exactly as before.
 	const configuredBin = readBridgeConfig().relayBin?.trim();
-	const relayBin = configuredBin && existsSync(configuredBin) ? configuredBin : undefined;
+	// A versioned leftover may still be on disk after the layout change, and
+	// starting it would run the build the human just replaced. So a version-shaped
+	// name is not a candidate at all: the canonical binary of this platform is, and
+	// only when that is missing do we fall back to Bun.
+	const usableConfigured = configuredBin && !isVersionedRelayBinName(configuredBin) ? configuredBin : undefined;
+	const canonicalBin = (() => {
+		for (const name of Object.values(RELAY_ASSETS)) {
+			const candidate = join(RELAY_INSTALL_DIR, name);
+			if (existsSync(candidate)) return candidate;
+		}
+		return undefined;
+	})();
+	const relayBin =
+		usableConfigured && existsSync(usableConfigured) ? usableConfigured : canonicalBin;
 	const bun = relayBin ? undefined : resolveBunPath();
 	if (!relayBin && !bun) {
 		// S27: never degrade into a silent 429.
@@ -2318,8 +2331,113 @@ async function installRelayBinary(
  *  checksum before executing anything, swaps atomically, restarts, polls
  *  /health, and rolls back to the previous runtime when the new binary does
  *  not come up. */
+/** Which binary the relay should be started from, migrating a config that names a
+ *  file the current layout no longer produces.
+ *
+ *  Installs before the two-name layout wrote `relayBin` as
+ *  `.../bin/relay-linux-x64.v0.4.0`. Nothing produces that name any more, so a
+ *  config still naming one points every start at a path that will never exist:
+ *  the relay never answers, the swap rolls back, and a machine that was healthy a
+ *  minute ago is left with no relay. That stale path IS the bug, so ignoring it
+ *  is not enough — it is rewritten once, so the next start cannot repeat it.
+ *
+ *  The versioned file is not thrown away: the swap adopts it as `.prev`
+ *  (versionedLeftovers), which is the one thing those leftovers are good for. */
+export type RelayBinDeps = {
+	read?: () => BridgeConfig;
+	write?: (patch: BridgeConfig) => unknown;
+	exists?: (path: string) => boolean;
+};
+
+export function resolveRelayBin(dir: string, assetName: string, deps: RelayBinDeps = {}): string {
+	const read = deps.read ?? readBridgeConfig;
+	const exists = deps.exists ?? existsSync;
+	const canonical = relayBinaryPath(dir, assetName);
+	const configured = read().relayBin?.trim();
+	if (!configured) return canonical;
+	if (!isStaleRelayBin(configured, assetName, exists)) return configured;
+	return canonical;
+}
+
+/** True when a path is a leftover of the version-in-filename scheme.
+ *
+ *  Matched against the published asset names only, so an unrelated binary that
+ *  happens to carry a number (`/usr/local/bin/relay-2`) is never mistaken for one
+ *  of ours and silently ignored. */
+export function isVersionedRelayBinName(path: string): boolean {
+	// Both separators on purpose: a Windows path must be read the same on every
+	// machine that parses it, and basename only knows its own platform.
+	const base = path.split(/[\\\\/]/).pop() ?? path;
+	for (const name of Object.values(RELAY_ASSETS)) {
+		if (!base.startsWith(`${name}.`)) continue;
+		if (/^v?\d/.test(base.slice(name.length + 1))) return true;
+	}
+	return false;
+}
+
+/** True when a configured `relayBin` names something the layout no longer
+ *  produces, or nothing at all. */
+function isStaleRelayBin(configured: string, assetName: string, exists: (path: string) => boolean): boolean {
+	const base = basename(configured);
+	const suffix = base.startsWith(`${assetName}.`) ? base.slice(assetName.length + 1) : undefined;
+	// Version-shaped is stale even when the file is still there: the swap adopts
+	// it as `.prev`, and nothing may start from that name again.
+	if (suffix !== undefined && /^v?\d/.test(suffix)) return true;
+	return !exists(configured);
+}
+
+/** Rewrite the config once, and only after the human said yes.
+ *
+ *  Split from `resolveRelayBin` on purpose: resolving is free and happens before
+ *  the confirm so the message can name the real previous binary, while writing is
+ *  a mutation that must not happen when the answer is "no" — declining an
+ *  install has to leave the machine exactly as it was. */
+export function migrateRelayBinConfig(dir: string, assetName: string, deps: RelayBinDeps = {}): string {
+	const read = deps.read ?? readBridgeConfig;
+	const write = deps.write ?? ((patch: BridgeConfig) => writeBridgeConfig(patch));
+	const exists = deps.exists ?? existsSync;
+	const canonical = relayBinaryPath(dir, assetName);
+	const configured = read().relayBin?.trim();
+	if (!configured || !isStaleRelayBin(configured, assetName, exists)) return canonical;
+	write({ relayBin: canonical });
+	return canonical;
+}
+
+/** True while an install is running. Two installs at once would each stop the
+ *  relay the other just started and then swap the same two names; a second Enter
+ *  during a download is enough to do it. */
+let relayInstallInFlight = false;
+
+export function beginRelayInstall(): boolean {
+	if (relayInstallInFlight) return false;
+	relayInstallInFlight = true;
+	return true;
+}
+
+export function endRelayInstall(): void {
+	relayInstallInFlight = false;
+}
+
+export function isRelayInstallInFlight(): boolean {
+	return relayInstallInFlight;
+}
+
 async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
-	const previousBin = readBridgeConfig().relayBin?.trim() || undefined;
+	if (!beginRelayInstall()) {
+		ctx.ui.notify(
+			"Ya hay una instalación del relay en curso. Esperá a que termine y volvé a intentar.",
+			"warning",
+		);
+		return false;
+	}
+	try {
+		return await runRelayInstallFlow(ctx);
+	} finally {
+		endRelayInstall();
+	}
+}
+
+async function runRelayInstallFlow(ctx: WarpPromptContext): Promise<boolean> {
 	const bun = resolveBunPath();
 	const release = await findRelayRelease();
 
@@ -2339,6 +2457,7 @@ async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolea
 		return false;
 	}
 
+	const previousBin = resolveRelayBin(RELAY_INSTALL_DIR, release.asset.name);
 	const sizeMb = release.asset.size > 0 ? ` (${(release.asset.size / 1048576).toFixed(1)} MB)` : "";
 	const lines = [
 		`${release.asset.name} — ${release.tag}${sizeMb}`,
@@ -2358,6 +2477,11 @@ async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolea
 		return false;
 	}
 
+	// Only now: consent was given, so the config may be rewritten. A `relayBin`
+	// naming a versioned path from before the layout change is migrated here, and
+	// the swap is told to work from the canonical name.
+	const previous = migrateRelayBinConfig(RELAY_INSTALL_DIR, release.asset.name);
+
 	const downloaded = await installRelayBinary(release, (message) => ctx.ui.notify(message, "info"));
 	if (!downloaded) {
 		ctx.ui.notify(
@@ -2376,7 +2500,7 @@ async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolea
 		downloaded,
 		version: String(release.tag ?? "").replace(/^v/, "") || "desconocida",
 		timeoutMs: RELAY_SWAP_TIMEOUT_MS,
-		previous: previousBin,
+		previous,
 		stopRelay: () => stopRelayByHealthPid(RELAY_SWAP_TIMEOUT_MS),
 		startRelay: async () => {
 			const resolved = resolveSessionId();
@@ -2417,7 +2541,7 @@ async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolea
 	// A rollback leaves the known-good binary AT the canonical name, so the config
 	// must point there. A first install left nothing behind: the config keeps
 	// naming whatever it named before, which still works.
-	writeBridgeConfig({ relayBin: result.rolledBack ? target : previousBin });
+	writeBridgeConfig({ relayBin: result.rolledBack ? target : previous });
 	ctx.ui.notify(
 		[
 			result.rolledBack
