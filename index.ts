@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,11 +52,11 @@ const SCOPE_PATTERN = `${PROVIDER}/*`;
  *
  *  Registration stays offline and deterministic: intersecting the registry with
  *  `GET /inference/v1/models` on every launch would put a network round-trip on
- *  the startup path. Refresh the snapshot with `/free-bridge-refresh`, which
+ *  the startup path. Refresh the snapshot with the "Refresh session" menu item, which
  *  fetches the live list and persists it to BRIDGE_CONFIG_PATH.
  *
  *  This list is what a **fresh install** registers before the user runs
- *  `/free-bridge-refresh`, so a stale entry here is a permanently broken model
+ *  that menu item, so a stale entry here is a permanently broken model
  *  in someone else's picker. `longcat-2.5-preview-free` and
  *  `minimax-m3.1-flash-free` were dropped on 2026-10-25 because the surface no
  *  longer advertises them; `flint-40b-free` was added. */
@@ -296,6 +296,8 @@ type BridgeConfig = {
 	warpEnabled?: string;
 	/** Path to the warp-minimal binary for supervised spawning. */
 	warpBin?: string;
+	/** Installed relay binary (versioned filename); unset means Bun from relay.mjs. */
+	relayBin?: string;
 };
 
 function readBridgeConfig(): BridgeConfig {
@@ -786,19 +788,24 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 		);
 	}
 
-	const bun = resolveBunPath();
-	if (!bun) {
+	// A configured binary wins over Bun: it is the standalone runtime the user
+	// installed on purpose. Bun stays the default, so an existing install keeps
+	// behaving exactly as before.
+	const configuredBin = readBridgeConfig().relayBin?.trim();
+	const relayBin = configuredBin && existsSync(configuredBin) ? configuredBin : undefined;
+	const bun = relayBin ? undefined : resolveBunPath();
+	if (!relayBin && !bun) {
 		// S27: never degrade into a silent 429.
 		throw new Error(
-			"pi-free-bridge: bun is required for the free-tier relay but was not found. " +
-				"Install Bun (https://bun.sh) or set PI_FREE_BRIDGE_BUN to the bun executable.",
+			"pi-free-bridge: the free-tier relay needs either a downloaded binary or bun, and neither was found. " +
+				"Run /free-bridge and choose \"Instalar / actualizar relay\", install Bun (https://bun.sh), " +
+				"or set PI_FREE_BRIDGE_BUN to the bun executable.",
 		);
 	}
 
-	const child = spawn(bun, [RELAY_SCRIPT], {
-		stdio: ["pipe", "pipe", "pipe"],
-		env: relayEnv(options),
-	});
+	const child = relayBin
+		? spawn(relayBin, [], { stdio: ["pipe", "pipe", "pipe"], env: relayEnv(options) })
+		: spawn(bun as string, [RELAY_SCRIPT], { stdio: ["pipe", "pipe", "pipe"], env: relayEnv(options) });
 
 	try {
 		await waitForListening(child, options.port);
@@ -931,7 +938,7 @@ async function ensureRelay(options: RelayOptions): Promise<RelayResult> {
 	// A non-off mode needs the WARP proxy alive; never fatal — auto degrades
 	// to local, `on` surfaces the 502 with its egress diagnostic. No console
 	// warning here: the download prompt is presented only when the user enters
-	// the WARP activation menu (/free-bridge-warp) and no binary is present.
+	// the WARP activation menu ("WARP: on / off") and no binary is present.
 	if (warpMode !== "off" && !(await ensureWarp())) {
 		// intentionally silent — prompt lives in the warp menu
 	}
@@ -1767,6 +1774,327 @@ async function installWarpBinary(
 	}
 }
 
+// ---------------------------------------------------------------------------
+//
+// Relay release binaries. The relay can run from a downloaded,
+// checksum-verified binary instead of requiring Bun — but only after an
+// explicit yes, never at Pi startup, and never replacing a working runtime
+// behind the user's back.
+//
+// Rollback is a filename, not a copy: every install lands under
+// RELAY_INSTALL_DIR with its release tag in the name, so the previous binary
+// is still on disk to run again.
+
+export const RELAY_RELEASE_API = "https://api.github.com/repos/Deury08/pi-free-bridge/releases/latest";
+export const RELAY_INSTALL_DIR = join(homedir(), ".pi", "agent", "pi-free-bridge", "bin");
+
+/** Published asset name per `<platform>/<arch>`. These are the exact strings
+ *  release v0.4.0 published; a wrong name is a 404 the reader cannot tell
+ *  apart from an unsupported machine, so this map never guesses. */
+const RELAY_ASSETS: Record<string, string> = {
+	"win32/x64": "relay-windows-x64.exe",
+	"linux/x64": "relay-linux-x64",
+	"linux/arm64": "relay-linux-arm64",
+	"darwin/x64": "relay-darwin-x64",
+	"darwin/arm64": "relay-darwin-arm64",
+};
+
+/** The published asset name for a platform/arch pair, or a thrown error naming
+ *  both so an unsupported machine reads as unsupported, not as a bug. */
+export function relayAssetName(platform: string = process.platform, arch: string = process.arch): string {
+	const name = RELAY_ASSETS[`${platform}/${arch}`];
+	if (!name) {
+		throw new Error(
+			`pi-free-bridge: no relay binary is published for ${platform}/${arch}. ` +
+				`Published: ${Object.keys(RELAY_ASSETS).join(", ")}.`,
+		);
+	}
+	return name;
+}
+
+/** Parse a published SHA256SUMS file into name -> lowercase hex digest.
+ *  Ordinary parse problems are collected instead of thrown, so the caller can
+ *  refuse rather than crash. Tolerates CRLF, blank lines and the binary-marker
+ *  form (`hash *name`) that `sha256sum --binary` emits. */
+export function parseChecksums(text: unknown): { entries: Map<string, string>; errors: string[] } {
+	const entries = new Map<string, string>();
+	const errors: string[] = [];
+	const lines = String(text ?? "").split(/\r?\n/);
+	for (const [index, raw] of lines.entries()) {
+		const line = raw.trim();
+		if (!line) continue;
+		const match = line.match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/);
+		if (!match) {
+			errors.push(`line ${index + 1} is not a sha256 entry: ${line}`);
+			continue;
+		}
+		const digest = match[1].toLowerCase();
+		const name = match[2].trim();
+		const previous = entries.get(name);
+		if (previous && previous !== digest) {
+			errors.push(`line ${index + 1} lists ${name} twice with different digests`);
+			continue;
+		}
+		entries.set(name, digest);
+	}
+	return { entries, errors };
+}
+
+/** Whether the downloaded bytes may be executed.
+ *  Refuses on a digest mismatch — the security-critical path — and on an asset
+ *  the manifest does not list, because an unlisted binary cannot be verified.
+ *  No refusal ever returns a success shape. */
+export function verifyRelayChecksum(input: {
+	assetName?: string;
+	bytes?: Uint8Array | Buffer | string;
+	checksums?: unknown;
+}): {
+	ok: boolean;
+	reason?: "mismatch" | "not-listed";
+	assetName?: string;
+	expected?: string;
+	actual: string;
+	message?: string;
+} {
+	const assetName = input?.assetName ?? "";
+	const raw = input?.bytes;
+	const body = raw === undefined ? Buffer.alloc(0) : Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+	const actual = createHash("sha256").update(body).digest("hex");
+
+	const parsed = input?.checksums instanceof Map
+		? { entries: input.checksums as Map<string, string>, errors: [] as string[] }
+		: input?.checksums && typeof input.checksums === "object" && "entries" in (input.checksums as object)
+			? (input.checksums as { entries: Map<string, string>; errors: string[] })
+			: parseChecksums(input?.checksums);
+
+	const expected = parsed.entries.get(assetName);
+	if (!expected) {
+		return {
+			ok: false,
+			reason: "not-listed",
+			assetName,
+			actual,
+			message:
+				`pi-free-bridge: ${assetName || "the download"} is not listed in the published SHA256SUMS — ` +
+				"refusing to run an unverifiable download.",
+		};
+	}
+	if (expected !== actual) {
+		return {
+			ok: false,
+			reason: "mismatch",
+			assetName,
+			expected,
+			actual,
+			message:
+				`pi-free-bridge: checksum mismatch for ${assetName} — expected ${expected}, got ${actual}. ` +
+				"The download was discarded and nothing was replaced.",
+		};
+	}
+	return { ok: true, assetName, expected, actual };
+}
+
+/** Versioned on-disk name, so an update never overwrites the binary that is
+ *  currently running: rolling back is running the previous file. */
+export function relayBinaryFilename(assetName: string, tag: string): string {
+	const version = String(tag ?? "").trim().replace(/[^0-9A-Za-z._-]/g, "");
+	if (!version) throw new Error("pi-free-bridge: a release tag is required to name an installed relay binary");
+	return `${assetName}.${version}`;
+}
+
+/** The release asset for this machine plus the SHA256SUMS that must verify it. */
+async function findRelayRelease(): Promise<
+	{ tag: string; asset: { name: string; url: string; size: number }; checksumsUrl: string } | undefined
+> {
+	try {
+		const name = relayAssetName();
+		const res = await fetch(RELAY_RELEASE_API, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(10000),
+		});
+		if (!res.ok) return undefined;
+		const release = (await res.json()) as {
+			tag_name?: unknown;
+			assets?: { name?: unknown; browser_download_url?: unknown; size?: unknown }[];
+		};
+		const assets = release.assets ?? [];
+		const asset = assets.find((a) => a.name === name && typeof a.browser_download_url === "string");
+		const sums = assets.find((a) => a.name === "SHA256SUMS" && typeof a.browser_download_url === "string");
+		if (!asset || !sums) return undefined;
+		return {
+			tag: typeof release.tag_name === "string" ? release.tag_name : "unknown",
+			asset: {
+				name,
+				url: asset.browser_download_url as string,
+				size: typeof asset.size === "number" ? asset.size : 0,
+			},
+			checksumsUrl: sums.browser_download_url as string,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/** Download, verify against the published SHA256SUMS, and install the relay
+ *  binary for this machine. Returns the installed path, or undefined after
+ *  reporting why — a refusal leaves the current runtime untouched. */
+async function installRelayBinary(
+	release: { tag: string; asset: { name: string; url: string; size: number }; checksumsUrl: string },
+	status?: (message: string) => void,
+): Promise<string | undefined> {
+	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
+	try {
+		status?.(`Downloading ${release.asset.name} ${release.tag}…`);
+		const res = await fetch(release.asset.url, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(120000),
+		});
+		if (!res.ok) {
+			console.error(`pi-free-bridge: relay download failed — HTTP ${res.status}`);
+			return undefined;
+		}
+		const bytes = Buffer.from(await res.arrayBuffer());
+
+		status?.("Verifying the published SHA256SUMS…");
+		const sumsRes = await fetch(release.checksumsUrl, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(15000),
+		});
+		if (!sumsRes.ok) {
+			console.error(`pi-free-bridge: SHA256SUMS unreachable — HTTP ${sumsRes.status}`);
+			return undefined;
+		}
+		const verdict = verifyRelayChecksum({
+			assetName: release.asset.name,
+			bytes,
+			checksums: await sumsRes.text(),
+		});
+		if (!verdict.ok) {
+			console.error(verdict.message);
+			status?.(verdict.message ?? "checksum verification failed");
+			return undefined;
+		}
+
+		status?.(`Installing to ${RELAY_INSTALL_DIR}…`);
+		mkdirSync(RELAY_INSTALL_DIR, { recursive: true });
+		const target = join(RELAY_INSTALL_DIR, relayBinaryFilename(release.asset.name, release.tag));
+		// Write beside the target and rename, so an interrupted download never
+		// leaves a half-written file under a name a later run would execute.
+		const staging = join(tmpDir, "staged-binary");
+		writeFileSync(staging, bytes);
+		if (process.platform !== "win32") chmodSync(staging, 0o755);
+		if (existsSync(target)) rmSync(target, { force: true });
+		renameSync(staging, target);
+		return target;
+	} catch (err) {
+		const message = `relay install failed: ${(err as Error).message}`;
+		console.error(`pi-free-bridge: ${message}`);
+		status?.(message);
+		return undefined;
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+}
+
+/** Restart the relay with whatever runtime the config now names, then confirm
+ *  /health answers. Returns whether it came up. */
+async function restartRelayWithConfiguredBin(): Promise<boolean> {
+	const resolved = resolveSessionId();
+	try {
+		await stopRelay();
+		await ensureRelay({
+			port: RELAY_PORT,
+			sessionId: resolved.sessionId,
+			sessionSource: resolved.source,
+			upstream: UPSTREAM_URL,
+			cwd: process.cwd(),
+		});
+	} catch (err) {
+		console.error(`pi-free-bridge: relay restart failed — ${(err as Error).message}`);
+		return false;
+	}
+	return !!(await fetchRelayHealth(RELAY_PORT));
+}
+
+/** Guided relay install/update: the only place a binary is ever downloaded.
+ *  Asks first and says that it restarts the relay, verifies the published
+ *  checksum before executing anything, swaps atomically, restarts, polls
+ *  /health, and rolls back to the previous runtime when the new binary does
+ *  not come up. */
+async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
+	const previousBin = readBridgeConfig().relayBin?.trim() || undefined;
+	const bun = resolveBunPath();
+	const release = await findRelayRelease();
+
+	if (!release) {
+		ctx.ui.notify(
+			[
+				"pi-free-bridge: no hay release alcanzable para esta máquina.",
+				`  plataforma: ${process.platform}/${process.arch}`,
+				`  bun:        ${bun ?? "no encontrado"}`,
+				"",
+				bun
+					? "  Sin release, el relay sigue usando Bun desde relay.mjs."
+					: "  Sin release y sin Bun, el relay no puede arrancar.",
+			].join("\n"),
+			"warning",
+		);
+		return false;
+	}
+
+	const sizeMb = release.asset.size > 0 ? ` (${(release.asset.size / 1048576).toFixed(1)} MB)` : "";
+	const lines = [
+		`${release.asset.name} — ${release.tag}${sizeMb}`,
+		"desde github.com/Deury08/pi-free-bridge",
+		"",
+		`Se verifica el SHA256SUMS publicado y se instala en ${RELAY_INSTALL_DIR}.`,
+		"",
+		previousBin
+			? `Esto REINICIA el relay y reemplaza el binario anterior (${previousBin}).`
+			: "Esto REINICIA el relay para que use el binario nuevo.",
+	];
+	if (bun) lines.push("", `Bun ya está disponible (${bun}): si decís que no, nada cambia.`);
+
+	if (!ctx.hasUI) return false;
+	if (!(await ctx.ui.confirm("pi-free-bridge: instalar / actualizar relay", lines.join("\n")))) {
+		ctx.ui.notify("Sin cambios: no se descargó nada.", "info");
+		return false;
+	}
+
+	const installed = await installRelayBinary(release, (message) => ctx.ui.notify(message, "info"));
+	if (!installed) {
+		ctx.ui.notify(
+			`La instalación falló y no se cambió nada. El relay sigue como estaba${bun ? " (Bun)" : ""}.`,
+			"error",
+		);
+		return false;
+	}
+
+	writeBridgeConfig({ relayBin: installed });
+	ctx.ui.notify(`Instalado en ${installed}. Reiniciando el relay…`, "info");
+
+	if (await restartRelayWithConfiguredBin()) {
+		ctx.ui.notify(`Relay actualizado y respondiendo en ${relayHealthUrl(RELAY_PORT)}.`, "info");
+		return true;
+	}
+
+	// Roll back: restore the previous runtime and restart it, so a bad download
+	// never leaves the user without a working relay.
+	writeBridgeConfig({ relayBin: previousBin });
+	const restored = await restartRelayWithConfiguredBin();
+	ctx.ui.notify(
+		[
+			restored
+				? "El binario nuevo no respondió /health. Se volvió al anterior y el relay está arriba."
+				: "El binario nuevo no respondió /health y el relay TAMPOCO volvió a levantar con el anterior.",
+			`  anterior: ${previousBin ?? "Bun desde relay.mjs"}`,
+			`  nuevo:    ${installed} (queda en disco, no se borra)`,
+		].join("\n"),
+		"error",
+	);
+	return false;
+}
+
 /** Minimal structural view of Pi's command ctx used by the WARP prompts. */
 type WarpPromptContext = {
 	hasUI: boolean;
@@ -1815,13 +2143,13 @@ async function ensureWarpWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
 				`and install it to ${WARP_INSTALL_DIR}?`
 			: `WARP is not running and no warp-minimal binary is installed.\n\n` +
 				`No release asset is reachable right now.\n\n` +
-				`Configure the path manually with: /free-bridge-warp bin <path>\n` +
+				`Configure the path manually with warpBin in ${BRIDGE_CONFIG_PATH}\n` +
 				`or set PI_FREE_BRIDGE_WARP_BIN.`,
 	);
 	if (!consent) return false;
 	if (!asset) {
 		ctx.ui.notify(
-			`No release asset is reachable right now. Configure the path with\n/free-bridge-warp bin <path>`,
+			`No release asset is reachable right now. Configure warpBin in\n${BRIDGE_CONFIG_PATH}, or set PI_FREE_BRIDGE_WARP_BIN.`,
 			"warning",
 		);
 		return false;
@@ -1832,7 +2160,7 @@ async function ensureWarpWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
 	if (!installed) {
 		ctx.ui.notify(
 			`warp-minimal install failed — see the Pi error log.\n` +
-				`You can still configure the path manually:\n/free-bridge-warp bin <path>`,
+				`You can still configure the path manually: warpBin in\n${BRIDGE_CONFIG_PATH}, or PI_FREE_BRIDGE_WARP_BIN.`,
 			"warning",
 		);
 		return false;
@@ -1847,7 +2175,7 @@ async function ensureWarpWithPrompt(ctx: WarpPromptContext): Promise<boolean> {
 	if (!up) {
 		ctx.ui.notify(
 			`warp-minimal was installed but did not answer ${target.healthUrl}.\n` +
-				`Check that the binary runs on this system, then retry with /free-bridge-warp.`,
+				`Check that the binary runs on this system, then retry with the "WARP: on / off" menu item.`,
 			"warning",
 		);
 		return false;
@@ -2306,23 +2634,11 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(`pi-free-bridge: wire mode set to ${chosen} in ${BRIDGE_CONFIG_PATH}`, "info");
 	}
 
-	/** Menu item 1: install or update the relay binary.
-	 *  The guided download (S4-S6) is wired in the second slice of this
-	 *  feature; until then this reports the runtime the relay uses. */
+	/** Menu item 1: install or update the relay binary, after an explicit yes.
+	 *  This is also the only path that ever downloads one: nothing is fetched at
+	 *  Pi startup, and an existing Bun keeps being used until the user asks. */
 	async function installOrUpdateRelay(ctx: MenuCtx): Promise<void> {
-		const bun = resolveBunPath();
-		ctx.ui.notify(
-			[
-				"pi-free-bridge: instalar / actualizar relay",
-				`  bun:    ${bun ?? "no encontrado"}`,
-				`  relay:  ${describeRelay()}`,
-				`  health: ${relayHealthUrl(RELAY_PORT)}`,
-				"",
-				"  La descarga del binario todavía no está cableada en esta rama.",
-				"  Hasta entonces el relay se ejecuta con Bun desde relay.mjs.",
-			].join("\n"),
-			"warning",
-		);
+		await runRelayInstallWithPrompt(ctx);
 	}
 
 	/** Ask which menu entry to run. `select` when Pi exposes it, otherwise a
@@ -2450,7 +2766,7 @@ export default function (pi: ExtensionAPI) {
 				`  If the models still do not appear, run:`,
 				`    pi -p --model ${PROVIDER}/deepseek-v4.1-flash-free "Reply with exactly: OK"`,
 				"  A non-zero exit or a non-OK reply is a gate or session-id problem,",
-				"  not a scope problem — see /free-bridge-session.",
+				"  not a scope problem — see the \"Relay status\" menu item.",
 			);
 
 			ctx.ui.notify(lines.join("\n"), result.status === "malformed" ? "error" : "info");

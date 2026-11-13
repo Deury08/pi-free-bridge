@@ -34,10 +34,19 @@ Two work-unit commits: (1) command surface + menu, (2) downloader. Tests and doc
 
 ## Tasks
 
-- T1 — S1, S2, S3 — command surface + flat menu, one shared `runWarpRecycle` — commit 1
-- T2 — S4, S5, S6, S10 — downloader with checksum verify, atomic swap, rollback — commit 2
-- T3 — S7 — checksum parser/verifier test, asset-mapping test, mismatch-refused test; suite stays 194 — commit 1 and 2
-- T4 — S8 — README Spanish section — commit 2
+- [x] T1 — S1, S2, S3 — command surface + flat menu, one shared `runWarpRecycle` — `395201b`
+- [x] T2 — S4, S5, S6 — downloader with checksum verify, atomic swap, rollback — commit 2
+- [x] T3 — S7 — checksum parser/verifier, asset mapping, mismatch-refused, plus a
+      registration test pinning S1; suite 194 -> 201 pass — commit 2
+- [x] T4 — S8 — README Spanish section, and every stale reference to a removed
+      command rewritten — commit 2
+- [x] T5 — S10 — n/a: no new module was added, so the `files` allowlist is
+      unchanged. The pure helpers live in `index.ts` and are exported, which is
+      how this repo already exposes them (the suite imports `../index.ts`).
+
+## Slice boundaries
+
+`395201b` — slice 1: command surface and menu (`index.ts`, 393 authored lines).
 
 ## Log
 
@@ -80,3 +89,52 @@ cut; this session left it untouched.
 
 L3 (state at cut): `feat/relay-release` is pushed at `e648a8a` and release
 `v0.4.0` is published (run 43328430977, success, 5 binaries + SHA256SUMS).
+
+L4 (implementation decisions, slice 1 — `395201b`):
+
+- The three surviving commands register in this order: `free-bridge`,
+  `free-bridge-warp-recycle`, `free-bridge-doctor`. The menu declares neither
+  `args` nor `argumentHint`, which is what keeps it argument-free in
+  autocomplete.
+- `runWarpRecycle(ctx)` is one body with two callers (menu item 4 and the
+  direct command). Its "warp is off" advice was rewritten to point at the menu
+  item, since `/free-bridge-warp auto` no longer exists.
+- Menu items 3 and 5 carry the current state in their label (`— ahora: auto`,
+  `— ahora: v1`), so a toggle is never a guess. Both refuse to pretend when
+  `PI_FREE_BRIDGE_WARP_MODE` or `RELAY_WIRE_MODE` pins the value.
+- Menu item 7 `Refrescar sesión` maps to the old `free-bridge-refresh` body
+  (re-fetch the live free-model list, persist it, re-register the provider).
+  Setting a session id by hand is no longer reachable; the relay resolves it
+  and «Estado del relay» reports which one and from where.
+- Fallback when Pi exposes no `ctx.ui.select`: a numbered confirmation chain,
+  so the menu is not a dead end on a minimal UI.
+
+L5 (implementation decisions, slice 2):
+
+- S10 does not apply. The pure helpers (`relayAssetName`, `parseChecksums`,
+  `verifyRelayChecksum`, `relayBinaryFilename`) are exported from `index.ts`
+  instead of a new module, matching how this repo already exposes testable
+  helpers — the suite imports `../index.ts` and calls them through the module
+  namespace. No new file means no `files` allowlist change.
+- A configured binary wins over Bun in `startRelay`; `relayBin` is only ever
+  set by an explicit install, so an existing Bun install behaves exactly as
+  before. That is how "existing users notice nothing" is enforced rather than
+  promised.
+- The download happens only from menu item 1, after `ctx.ui.confirm`. The
+  relay start path has no `ctx`, so a prompt there is not architected; its
+  failure message now names the menu item instead of a removed command.
+- Verification is a refusal, not a warning: digest mismatch AND an asset
+  absent from `SHA256SUMS` both refuse, because an unlisted binary cannot be
+  verified.
+- Install is atomic: written to the temp dir, `chmod` if not Windows, then
+  renamed onto the versioned target. The version lives in the filename, so
+  rollback runs the previous file rather than restoring a copy.
+- Rollback restores the previous `relayBin` (or none, meaning Bun), restarts,
+  and reports honestly when even the rollback does not come up. The failed
+  binary is left on disk and named in the message; nothing is deleted.
+- RED was observed, not assumed: against `395201b` (index.ts without the
+  downloader) the six new download tests fail with `is not a function`; after
+  the change the suite is 201 pass, 0 fail. Baseline 194 preserved.
+- Runtime proof for S1: the extension's default export was driven with a stub
+  `pi` and registered exactly `free-bridge`, `free-bridge-warp-recycle`,
+  `free-bridge-doctor`. That assertion is committed as a test.
