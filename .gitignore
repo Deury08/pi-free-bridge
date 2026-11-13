@@ -7,3 +7,5 @@ node_modules/
 # not part of the package.
 big.txt
 raw_*.txt
+# Release tarballs are build output, not source.
+*.tgz
