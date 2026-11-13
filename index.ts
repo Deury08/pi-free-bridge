@@ -2346,6 +2346,29 @@ export default async function (pi: ExtensionAPI) {
 	const g = globalThis as Record<symbol, unknown>;
 	if (g[REG_KEY]) return;
 
+	/** Register or re-register the provider from a catalog. Registration after
+	 *  initial loading takes effect immediately (docs/custom-provider.md:122),
+	 *  so publishing a fresh list never asks the user to restart Pi.
+	 *
+	 *  One body for the three callers — startup, the menu refresh and the
+	 *  post-install republish — because three copies would eventually disagree
+	 *  about `refreshModels` or the streaming handler. */
+	function publishCatalog(models: RegistryModel[]): void {
+		pi.registerProvider(PROVIDER, {
+			apiKey: API_KEY,
+			api: API,
+			baseUrl: RELAY_URL,
+			authHeader: true,
+			models: buildPiModels(models),
+			// Pi calls this on every model refresh, so the picker follows the
+			// service instead of a snapshot taken at startup. No embedded list
+			// and no fallback: an unreachable catalog reports empty.
+			refreshModels: async ({ signal }: { signal?: AbortSignal }) =>
+				buildPiModels((await fetchUpstreamCatalog(signal)).models) as never,
+			streamSimple: gateStreamSimple,
+		});
+	}
+
 	const session = resolveSessionId();
 	const live = resolveLiveIds();
 	// The catalog comes from the service itself, never from the OpenCode cache
@@ -2372,19 +2395,7 @@ export default async function (pi: ExtensionAPI) {
 				"Run /free-bridge to install the relay.",
 		);
 	} else {
-		pi.registerProvider(PROVIDER, {
-			apiKey: API_KEY,
-			api: API,
-			baseUrl: RELAY_URL,
-			authHeader: true,
-			models: buildPiModels(discovered.models),
-			// Pi calls this on every model refresh, so the picker follows the
-			// service instead of a snapshot taken at startup. No embedded list
-			// and no fallback: an unreachable catalog reports empty.
-			refreshModels: async ({ signal }: { signal?: AbortSignal }) =>
-				buildPiModels((await fetchUpstreamCatalog(signal)).models) as never,
-			streamSimple: gateStreamSimple,
-		});
+		publishCatalog(discovered.models);
 	}
 
 	g[REG_KEY] = true;
@@ -2618,16 +2629,7 @@ export default async function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			pi.registerProvider(PROVIDER, {
-				apiKey: API_KEY,
-				api: API,
-				baseUrl: RELAY_URL,
-				authHeader: true,
-				models: buildPiModels(catalog.models),
-				refreshModels: async ({ signal }: { signal?: AbortSignal }) =>
-					buildPiModels((await fetchUpstreamCatalog(signal)).models) as never,
-				streamSimple: gateStreamSimple,
-			});
+			publishCatalog(catalog.models);
 			ctx.ui.notify(
 				`${PROVIDER} now registers ${catalog.models.length} free models: ${catalog.models.map((m) => m.id).join(", ")}`,
 				"info",
@@ -2765,7 +2767,26 @@ export default async function (pi: ExtensionAPI) {
 	 *  This is also the only path that ever downloads one: nothing is fetched at
 	 *  Pi startup, and an existing Bun keeps being used until the user asks. */
 	async function installOrUpdateRelay(ctx: MenuCtx): Promise<void> {
-		await runRelayInstallWithPrompt(ctx);
+		const installed = await runRelayInstallWithPrompt(ctx);
+		if (!installed) return;
+
+		// S3: a relay that just started is a catalog the picker may never have
+		// seen. Publish it now — registration is live, so there is no restart.
+		const catalog = await fetchUpstreamCatalog(AbortSignal.timeout(8000));
+		if (catalog.models.length === 0) {
+			ctx.ui.notify(
+				`Relay instalado, pero el catálogo no respondió (${catalog.source}). ` +
+					"El ítem «Modelos» lo reintenta sin reiniciar nada.",
+				"warning",
+			);
+			return;
+		}
+		publishCatalog(catalog.models);
+		ctx.ui.notify(
+			`${PROVIDER}: ${catalog.models.length} modelos gratis registrados en vivo. ` +
+				"No hace falta reiniciar Pi.",
+			"info",
+		);
 	}
 
 	/** Ask which menu entry to run. `select` when Pi exposes it, otherwise a

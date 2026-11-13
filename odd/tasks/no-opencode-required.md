@@ -53,7 +53,7 @@ agreed order."
 | T2 | S5 | inline | done — commit `1e8a0f4` |
 | T3 | S1, S5 tests | inline | done — commit `1e8a0f4` |
 | T4 | S2 | inline | done — commit `11036b8` |
-| T5 | S3 | inline | **open** — largely covered by `refreshModels` |
+| T5 | S3 | inline | done — commit `c29327d` |
 
 ## Log
 
@@ -104,3 +104,22 @@ L7 (slice 2 evidence): fetchUpstreamCatalog against the live service returns
 12 free models, 74 skipped, and preserves longcat-2.5-free at context 1000000.
 That is the same 12 the smoke test registered through the OpenCode cache, so
 dropping OpenCode costs no models. Suite: 206 pass, 0 fail.
+
+L8 (slice 3, T5/S3): the provider registration was duplicated three times
+(startup, menu refresh, and now the post-install republish), which is how copies
+drift apart. It is one function, publishCatalog(models), called by all three.
+installOrUpdateRelay now uses the boolean runRelayInstallWithPrompt already
+returned: on success it fetches the catalog and publishes it live, and on an
+unreachable catalog it warns instead of failing. Registration after loading is
+immediate per docs/custom-provider.md:122, so there is no restart to ask for.
+
+L9 (test hygiene): the new catalog test passed alone and failed in the full
+suite because an earlier test leaves PI_FREE_BRIDGE_SKIP_CATALOG=1 in
+process.env and the child process inherits it. Fixed by pinning the variable to
+"" in that child env. A test that only passes alone is not a test.
+
+L10 (build note): "bun build index.ts" exits 1 on a node:url browser-polyfill
+error because Bun defaults to a browser target; that is pre-existing and not a
+regression. The truthful check is "bun build index.ts --target=node", which
+exits 0. Earlier green build reports in this project were the exit status of a
+piped tail, not of bun.

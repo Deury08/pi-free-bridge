@@ -4046,3 +4046,43 @@ test("normalizeUpstreamModel: keeps the free ones, refuses paid and unpriced", (
 	assert.equal(normalizeUpstreamModel({ cost: { input: 0, output: 0 } }), undefined, "an entry with no id");
 	assert.equal(normalizeUpstreamModel(null), undefined);
 });
+
+test("the provider is published from the service catalog with refreshModels wired", () => {
+	// S2/S3: the catalog arrives from the service and registration is live, so
+	// the same call path serves startup, the menu refresh and the post-install
+	// republish. The fetch is stubbed: this asserts wiring, not the network.
+	const home = mkdtempSync(join(tmpdir(), "pfb-catalog-"));
+	const marker = "@@PUBLISHED@@";
+	const script = `
+		const payload = { data: [
+			{ id: "a-free", name: "A Free", cost: { text: { input: { price: 0 }, output: { price: 0 } } }, limit: { context: 1000, output: 100 } },
+			{ id: "b-paid", cost: { text: { input: { price: 1 }, output: { price: 2 } } } },
+		] };
+		globalThis.fetch = async () => ({ ok: true, json: async () => payload });
+		const { default: factory } = await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});
+		const providers = [];
+		await factory({
+			registerCommand: () => {},
+			registerProvider: (name, config) => providers.push({ name, config }),
+			registerTool: () => {},
+			on: () => {},
+			config: {},
+			ui: { notify() {} },
+		});
+		const config = providers[0] && providers[0].config;
+		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify({
+			count: config ? config.models.length : -1,
+			ids: config ? config.models.map((m) => m.id) : [],
+			hasRefresh: typeof (config && config.refreshModels) === "function",
+		}));
+	`;
+	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "" },
+		encoding: "utf-8",
+	});
+	const published = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+
+	assert.deepEqual(published.ids, ["a-free"], "only the free model is published");
+	assert.equal(published.count, 1);
+	assert.equal(published.hasRefresh, true, "Pi refreshes the catalog through refreshModels");
+});
