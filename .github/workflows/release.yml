@@ -33,12 +33,27 @@ jobs:
         with:
           bun-version: 1.4.4
 
+      - name: Check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          # Coherence between RELEASES, which is not the same as coupling the two
+          # components at runtime: the extension never compares versions, but a
+          # tag that disagrees with package.json would ship a binary whose baked
+          # version is wrong from the first byte.
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+
       - name: Compile
         run: |
           set -euo pipefail
-          # One source of truth: the version the extension requires is the version
-          # package.json declares, baked into the binary so /health can report it
-          # even when nobody installed this relay.
+          # One source of truth: package.json. Baked into the binary so /health can
+          # report it even when nobody installed this relay. It is information the
+          # extension displays and a human reads in a bug report, never a gate.
           version=$(node -p "require('./package.json').version")
           echo "baking relay version $version"
           bun build --compile --target=${{ matrix.target }} relay.mjs --outfile dist/${{ matrix.asset }} \

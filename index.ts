@@ -1917,6 +1917,43 @@ export type SwapResult = {
 	installed?: string;
 };
 
+/** Remove leftovers from the version-in-filename scheme.
+ *
+ *  Deliberately narrow: only files named after this binary with a `.` suffix
+ *  that is not the two names this layout owns. `failed.log` and anything else a
+ *  user put there is never touched — a cleanup step that deletes by wildcard is
+ *  how a tool eats something it did not create. */
+function purgeVersionedLeftovers(dir: string, name: string): void {
+	let entries: string[];
+	try {
+		entries = readdirSync(dir);
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		if (entry === name || entry === `${name}.prev` || entry === `${name}.tmp`) continue;
+		if (!entry.startsWith(`${name}.`)) continue;
+		rmSync(join(dir, entry), { force: true });
+	}
+}
+
+/** One line per failure, capped: a log that grows forever is a log nobody reads.
+ *  The newest failure is the one that explains the current state, so the oldest
+ *  lines are the ones dropped. */
+export const FAILED_LOG_MAX_LINES = 20;
+
+function appendFailedLog(path: string, line: string, max: number = FAILED_LOG_MAX_LINES): void {
+	let existing = "";
+	try {
+		existing = readFileSync(path, "utf8");
+	} catch {
+		existing = "";
+	}
+	const lines = existing.split("\n").filter((entry) => entry.trim().length > 0);
+	lines.push(line);
+	writeFileSync(path, `${lines.slice(-max).join("\n")}\n`);
+}
+
 /** Replace the running relay binary with a verified download.
  *
  *  INVARIANT (S4): whatever is named `current` has answered `/health` at least
@@ -1962,6 +1999,12 @@ export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
 	renameSync(deps.downloaded, current);
 	if (process.platform !== "win32") chmodSync(current, 0o755);
 
+	// S1: two names, not a cemetery. The scheme before this one left one file per
+	// release (`relay-linux-x64.v0.3.0`, `.v0.4.0`, ...) and nothing ever removed
+	// them. The one that was actually running became `.prev` above; every other
+	// versioned leftover is dead weight and goes now.
+	purgeVersionedLeftovers(deps.dir, deps.name);
+
 	// S3.5
 	let started = false;
 	try {
@@ -1993,7 +2036,7 @@ export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
 	const reason = `el relay ${deps.version} no respondió /health`;
 	const hadPrevious = existsSync(previous);
 	rmSync(current, { force: true });
-	appendFileSync(logPath, `${now().toISOString()}\t${deps.version}\t${reason}\n`);
+	appendFailedLog(logPath, `${now().toISOString()}\t${deps.version}\t${reason}`);
 	if (!hadPrevious) {
 		return { ok: false, rolledBack: false, reason: `${reason}; no previous version to fall back to` };
 	}
@@ -2252,8 +2295,8 @@ async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolea
 		`Se verifica el SHA256SUMS publicado y se instala en ${RELAY_INSTALL_DIR}.`,
 		"",
 		previousBin
-			? `Esto REINICIA el relay y reemplaza el binario anterior (${previousBin}).`
-			: "Esto REINICIA el relay para que use el binario nuevo.",
+			? `Esto DETIENE el relay que está corriendo —lo haya arrancado esta extensión o vos— y reemplaza el binario anterior (${previousBin}).`
+			: "Esto DETIENE el relay que está corriendo —lo haya arrancado esta extensión o vos— para que use el binario nuevo.",
 	];
 	if (bun) lines.push("", `Bun ya está disponible (${bun}): si decís que no, nada cambia.`);
 
@@ -2766,7 +2809,7 @@ export default async function (pi: ExtensionAPI) {
 			`  health:     ${health ? "answering" : "not answering"} (${relayHealthUrl(RELAY_PORT)})`,
 			// Information, not a contract: it says which piece is running, and the
 			// extension has already decided what to do by capability.
-			`  version:    ${health?.version ?? "not reported (relay older than the version field)"}`,
+			`  version:    ${parseRelayVersion(health) ?? "not reported (relay older than the version field)"}`,
 			`  catalog:    ${discovered.models.length} free from ${discovered.source}`,
 			`  session:    ${
 				health?.sessionId

@@ -160,3 +160,24 @@ looks for it — menu item 2, "Estado del relay", prints
 catalog source line was renamed from `models:` to `catalog:` so it says where the
 list came from. That is what "information for display and diagnosis" means in
 practice; nothing reads the number to decide anything.
+
+L13 (the four answers, applied):
+a) The tag/package.json equality check is in the release workflow, and ONLY there:
+   releases must be coherent; the two components stay uncoupled at runtime. With
+   no floor left, this is the only place a version can be trusted.
+b) `purgeVersionedLeftovers` runs during the swap: the versioned file that was
+   actually running becomes `.prev`, every other `*.v*` leftover is deleted. No
+   109 MB cemetery. Deliberately narrow — only names starting with this binary's
+   name — because a cleanup that deletes by wildcard is how a tool eats a file it
+   did not create. `failed.log` and anything else in the directory survive.
+c) `failed.log` keeps the last 20 lines (`FAILED_LOG_MAX_LINES`). A log that grows
+   forever is a log nobody reads, and the newest line is the one that explains
+   the current state.
+d) The install confirm now says the relay will be STOPPED, whoever started it,
+   instead of "restarted" as if the extension owned the process. Pinned by a test
+   that reads the source, because the wording is the whole feature here.
+
+Also removed: the two test assertions that named the deleted symbols
+(`isRelayVersionBelow`, `relayMismatchMessage`). Asserting the absence of a name
+is still coupling to it, and once the functions are gone the assertion tests
+nothing.
