@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -987,6 +987,48 @@ async function stopRelay(): Promise<void> {
 const RELAY_PORT = resolveRelayPort();
 const RELAY_URL = relayUrl(RELAY_PORT);
 
+/** Whether a pid still exists, used to wait for a relay we asked to stop. */
+function isPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Stop whatever relay is listening, using the `pid` `/health` already publishes.
+ *
+ *  Using that pid rather than only our own child handle is what makes the swap
+ *  work for a relay the extension did not start (`bun relay.mjs`, an old binary
+ *  on PATH): those are exactly the ones that need replacing, and a handle we do
+ *  not have cannot be killed. Returns whether the process is really gone.
+ */
+async function stopRelayByHealthPid(timeoutMs: number): Promise<boolean> {
+	const health = (await fetchRelayHealth(RELAY_PORT)) as { pid?: unknown } | undefined;
+	const pid = typeof health?.pid === "number" ? health.pid : undefined;
+	if (!pid) {
+		// Nothing answering: there is no relay to stop, and that is success.
+		await stopRelay();
+		return true;
+	}
+	if (relayState?.child?.pid === pid) {
+		await stopRelay();
+	} else {
+		try {
+			process.kill(pid, "SIGTERM");
+		} catch {
+			// Already gone between the health probe and here.
+		}
+	}
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isPidAlive(pid)) return true;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	return !isPidAlive(pid);
+}
+
 /** S29: one line for `/free-bridge-doctor`. */
 function describeRelay(): string {
 	if (!relayState) return "not started";
@@ -1121,6 +1163,19 @@ export async function fetchRelayCatalog(signal?: AbortSignal): Promise<CatalogRe
 	try {
 		const res = await fetch(url, { signal });
 		const body = await res.json().catch(() => undefined);
+		// A relay older than MIN_RELAY_VERSION has no /models route at all. A bare
+		// 404 sends the reader hunting for a broken extension, so when the relay can
+		// say what it is, name the version instead.
+		if (res.status === 404) {
+			const running = parseRelayVersion((await fetchRelayHealth(RELAY_PORT)) as unknown);
+			if (running && isRelayVersionBelow(running, MIN_RELAY_VERSION)) {
+				return {
+					models: [],
+					source: url,
+					unavailable: relayMismatchMessage(running, MIN_RELAY_VERSION),
+				};
+			}
+		}
 		return parseRelayCatalog(res.status, body);
 	} catch (err) {
 		return {
@@ -1741,8 +1796,174 @@ async function installWarpBinary(
 // RELAY_INSTALL_DIR with its release tag in the name, so the previous binary
 // is still on disk to run again.
 
+/** The oldest relay this extension can talk to. `/models` — the route the
+ *  catalog comes from — first shipped in 0.5.1, so an older relay answers 404
+ *  on it. Reporting that bare 404 sends the user hunting for a broken route;
+ *  naming the version tells them what to do. */
+export const MIN_RELAY_VERSION = "0.5.1";
+
+/** The version a `/health` body reports, or undefined when it cannot be read. */
+export function parseRelayVersion(health: unknown): string | undefined {
+	const value = (health as { version?: unknown } | null | undefined)?.version;
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/** Numeric parts of `[v]MAJOR.MINOR.PATCH`, or undefined for anything else. */
+function versionParts(value: string): number[] | undefined {
+	const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(value.trim());
+	return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+}
+
+/** Whether `running` is older than `required`. An unreadable version counts as
+ *  too old: a relay that cannot say what it is cannot be trusted to have the
+ *  route, and "unknown" silently passing the check is how a 404 comes back. */
+export function isRelayVersionBelow(running: string, required: string): boolean {
+	const a = versionParts(running);
+	const b = versionParts(required);
+	if (!a || !b) return true;
+	for (let i = 0; i < 3; i++) {
+		if (a[i] !== b[i]) return a[i] < b[i];
+	}
+	return false;
+}
+
+export function relayMismatchMessage(running: string, required: string): string {
+	return `el relay que corre es ${running}, esta extensión necesita ${required}`;
+}
+
+/** Where a relay binary lives under a directory. The name carries no version:
+ *  `current` is what runs and `current.prev` is what ran before. */
+export function relayBinaryPath(dir: string, assetName: string): string {
+	return join(dir, assetName);
+}
+
+/** What a swap needs from the outside world, injected so the sequence can be
+ *  tested with fake binaries and no process is ever spawned. */
+export type SwapDeps = {
+	dir: string;
+	name: string;
+	downloaded: string;
+	version: string;
+	timeoutMs: number;
+	/** The binary the config points at today. On a first update under the
+	 *  two-name layout it is the versioned file an older scheme installed, and it
+	 *  is the thing that actually answered `/health`, so it becomes `.prev`. */
+	previous?: string;
+	stopRelay: () => Promise<boolean>;
+	startRelay: () => Promise<boolean>;
+	askContinue: () => Promise<"wait" | "rollback" | "none">;
+	logPath?: string;
+	now?: () => Date;
+};
+
+export type SwapResult = {
+	ok: boolean;
+	rolledBack: boolean;
+	reason?: string;
+	installed?: string;
+};
+
+/** Replace the running relay binary with a verified download.
+ *
+ *  INVARIANT (S4): whatever is named `current` has answered `/health` at least
+ *  once, and so has `.prev`. A version that fails is deleted, never kept, so
+ *  `.prev` is always a known-good build. With no `.prev` there is nothing to
+ *  roll back to, and the honest outcome is a clean failure that leaves nothing
+ *  installed — not a half-installed relay nobody can explain later.
+ *
+ *  Order matters (S3): the download is verified before anything is touched, so
+ *  a bad download never leaves the relay down; and the swap is byte-identical
+ *  on every platform, because the relay restarts anyway and therefore does not
+ *  need Linux's rename-while-running.
+ */
+export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
+	const current = relayBinaryPath(deps.dir, deps.name);
+	const previous = `${current}.prev`;
+	const logPath = deps.logPath ?? join(deps.dir, "failed.log");
+	const now = deps.now ?? (() => new Date());
+
+	if (!existsSync(deps.downloaded)) {
+		return { ok: false, rolledBack: false, reason: `no está el binario descargado en ${deps.downloaded}` };
+	}
+
+	// S3.2-3: a relay that will not stop must not be replaced underneath itself.
+	let stopped = false;
+	try {
+		stopped = await deps.stopRelay();
+	} catch {
+		stopped = false;
+	}
+	if (!stopped) {
+		return { ok: false, rolledBack: false, reason: "no se pudo detener el relay que corre" };
+	}
+
+	// S3.4: keep whatever answered a moment ago as the rollback target.
+	const incumbent = existsSync(current)
+		? current
+		: deps.previous && existsSync(deps.previous)
+			? deps.previous
+			: undefined;
+	rmSync(previous, { force: true });
+	if (incumbent) renameSync(incumbent, previous);
+	renameSync(deps.downloaded, current);
+	if (process.platform !== "win32") chmodSync(current, 0o755);
+
+	// S3.5
+	let started = false;
+	try {
+		started = await deps.startRelay();
+	} catch {
+		started = false;
+	}
+	if (started) return { ok: true, rolledBack: false, installed: current };
+
+	// S3.6: one more chance if the user asks for it. Nobody answering is not
+	// permission to wait forever, so anything but an explicit "wait" rolls back.
+	let answer: "wait" | "rollback" | "none" = "none";
+	try {
+		answer = await deps.askContinue();
+	} catch {
+		answer = "none";
+	}
+	if (answer === "wait") {
+		let retried = false;
+		try {
+			retried = await deps.startRelay();
+		} catch {
+			retried = false;
+		}
+		if (retried) return { ok: true, rolledBack: false, installed: current };
+	}
+
+	// S3.6-7: roll back, delete the binary that failed, keep the evidence.
+	const reason = `el relay ${deps.version} no respondió /health`;
+	const hadPrevious = existsSync(previous);
+	rmSync(current, { force: true });
+	appendFileSync(logPath, `${now().toISOString()}\t${deps.version}\t${reason}\n`);
+	if (!hadPrevious) {
+		return { ok: false, rolledBack: false, reason: `${reason}; no previous version to fall back to` };
+	}
+	renameSync(previous, current);
+	if (process.platform !== "win32") chmodSync(current, 0o755);
+	let restored = false;
+	try {
+		restored = await deps.startRelay();
+	} catch {
+		restored = false;
+	}
+	return {
+		ok: false,
+		rolledBack: true,
+		reason: restored ? reason : `${reason}; la versión anterior tampoco respondió`,
+	};
+}
+
 export const RELAY_RELEASE_API = "https://api.github.com/repos/Deury08/pi-free-bridge/releases/latest";
 export const RELAY_INSTALL_DIR = join(homedir(), ".pi", "agent", "pi-free-bridge", "bin");
+
+/** How long a swap waits for the relay to stop and then to answer /health.
+ *  Shared by both waits on purpose: the same patience, applied twice. */
+const RELAY_SWAP_TIMEOUT_MS = 15000;
 
 /** Published asset name per `<platform>/<arch>`. These are the exact strings
  *  release v0.4.0 published; a wrong name is a 404 the reader cannot tell
@@ -1850,14 +2071,6 @@ export function verifyRelayChecksum(input: {
 	return { ok: true, assetName, expected, actual };
 }
 
-/** Versioned on-disk name, so an update never overwrites the binary that is
- *  currently running: rolling back is running the previous file. */
-export function relayBinaryFilename(assetName: string, tag: string): string {
-	const version = String(tag ?? "").trim().replace(/[^0-9A-Za-z._-]/g, "");
-	if (!version) throw new Error("pi-free-bridge: a release tag is required to name an installed relay binary");
-	return `${assetName}.${version}`;
-}
-
 /** The release asset for this machine plus the SHA256SUMS that must verify it. */
 async function findRelayRelease(): Promise<
 	{ tag: string; asset: { name: string; url: string; size: number }; checksumsUrl: string } | undefined
@@ -1931,17 +2144,16 @@ async function installRelayBinary(
 			return undefined;
 		}
 
-		status?.(`Installing to ${RELAY_INSTALL_DIR}…`);
+		status?.(`Descargando en ${RELAY_INSTALL_DIR}…`);
 		mkdirSync(RELAY_INSTALL_DIR, { recursive: true });
-		const target = join(RELAY_INSTALL_DIR, relayBinaryFilename(release.asset.name, release.tag));
-		// Write beside the target and rename, so an interrupted download never
-		// leaves a half-written file under a name a later run would execute.
-		const staging = join(tmpDir, "staged-binary");
-		writeFileSync(staging, bytes);
-		if (process.platform !== "win32") chmodSync(staging, 0o755);
-		if (existsSync(target)) rmSync(target, { force: true });
-		renameSync(staging, target);
-		return target;
+		// S3.1: the verified bytes land in a transient `.tmp` beside the two names
+		// that matter, while the old relay keeps serving. Nothing is renamed until
+		// the swap runs, so a bad download never leaves the relay down.
+		const staged = `${relayBinaryPath(RELAY_INSTALL_DIR, release.asset.name)}.tmp`;
+		if (existsSync(staged)) rmSync(staged, { force: true });
+		writeFileSync(staged, bytes);
+		if (process.platform !== "win32") chmodSync(staged, 0o755);
+		return staged;
 	} catch (err) {
 		const message = `relay install failed: ${(err as Error).message}`;
 		console.error(`pi-free-bridge: ${message}`);
@@ -1950,26 +2162,6 @@ async function installRelayBinary(
 	} finally {
 		rmSync(tmpDir, { recursive: true, force: true });
 	}
-}
-
-/** Restart the relay with whatever runtime the config now names, then confirm
- *  /health answers. Returns whether it came up. */
-async function restartRelayWithConfiguredBin(): Promise<boolean> {
-	const resolved = resolveSessionId();
-	try {
-		await stopRelay();
-		await ensureRelay({
-			port: RELAY_PORT,
-			sessionId: resolved.sessionId,
-			sessionSource: resolved.source,
-			upstream: UPSTREAM_URL,
-			cwd: process.cwd(),
-		});
-	} catch (err) {
-		console.error(`pi-free-bridge: relay restart failed — ${(err as Error).message}`);
-		return false;
-	}
-	return !!(await fetchRelayHealth(RELAY_PORT));
 }
 
 /** Guided relay install/update: the only place a binary is ever downloaded.
@@ -2017,8 +2209,8 @@ async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolea
 		return false;
 	}
 
-	const installed = await installRelayBinary(release, (message) => ctx.ui.notify(message, "info"));
-	if (!installed) {
+	const downloaded = await installRelayBinary(release, (message) => ctx.ui.notify(message, "info"));
+	if (!downloaded) {
 		ctx.ui.notify(
 			`La instalación falló y no se cambió nada. El relay sigue como estaba${bun ? " (Bun)" : ""}.`,
 			"error",
@@ -2026,25 +2218,64 @@ async function runRelayInstallWithPrompt(ctx: WarpPromptContext): Promise<boolea
 		return false;
 	}
 
-	writeBridgeConfig({ relayBin: installed });
-	ctx.ui.notify(`Instalado en ${installed}. Reiniciando el relay…`, "info");
+	ctx.ui.notify("Deteniendo el relay, intercambiando el binario y arrancando el nuevo…", "info");
+	const target = relayBinaryPath(RELAY_INSTALL_DIR, release.asset.name);
+	const timeoutSeconds = Math.round(RELAY_SWAP_TIMEOUT_MS / 1000);
+	const result = await swapRelayBinary({
+		dir: RELAY_INSTALL_DIR,
+		name: release.asset.name,
+		downloaded,
+		version: String(release.tag ?? "").replace(/^v/, "") || "desconocida",
+		timeoutMs: RELAY_SWAP_TIMEOUT_MS,
+		previous: previousBin,
+		stopRelay: () => stopRelayByHealthPid(RELAY_SWAP_TIMEOUT_MS),
+		startRelay: async () => {
+			const resolved = resolveSessionId();
+			try {
+				await ensureRelay({
+					port: RELAY_PORT,
+					sessionId: resolved.sessionId,
+					sessionSource: resolved.source,
+					upstream: UPSTREAM_URL,
+					cwd: process.cwd(),
+				});
+			} catch {
+				return false;
+			}
+			return !!(await fetchRelayHealth(RELAY_PORT));
+		},
+		askContinue: async () => {
+			if (!ctx.hasUI) return "none";
+			const wait = await ctx.ui.confirm(
+				"pi-free-bridge: el relay nuevo no responde",
+				[
+					`El binario nuevo se instaló pero no contestó /health en ${timeoutSeconds}s.`,
+					"",
+					"¿Esperar otra vez lo mismo, o volver al binario anterior?",
+					"Si no contestás, vuelve solo al anterior: no se queda esperando para siempre.",
+				].join("\n"),
+			);
+			return wait ? "wait" : "rollback";
+		},
+	});
 
-	if (await restartRelayWithConfiguredBin()) {
+	if (result.ok) {
+		writeBridgeConfig({ relayBin: target });
 		ctx.ui.notify(`Relay actualizado y respondiendo en ${relayHealthUrl(RELAY_PORT)}.`, "info");
 		return true;
 	}
 
-	// Roll back: restore the previous runtime and restart it, so a bad download
-	// never leaves the user without a working relay.
-	writeBridgeConfig({ relayBin: previousBin });
-	const restored = await restartRelayWithConfiguredBin();
+	// A rollback leaves the known-good binary AT the canonical name, so the config
+	// must point there. A first install left nothing behind: the config keeps
+	// naming whatever it named before, which still works.
+	writeBridgeConfig({ relayBin: result.rolledBack ? target : previousBin });
 	ctx.ui.notify(
 		[
-			restored
-				? "El binario nuevo no respondió /health. Se volvió al anterior y el relay está arriba."
-				: "El binario nuevo no respondió /health y el relay TAMPOCO volvió a levantar con el anterior.",
-			`  anterior: ${previousBin ?? "Bun desde relay.mjs"}`,
-			`  nuevo:    ${installed} (queda en disco, no se borra)`,
+			result.rolledBack
+				? `El binario nuevo no respondió /health: ${result.reason}. Se volvió al anterior.`
+				: `El binario nuevo no respondió /health: ${result.reason}.`,
+			`  nuevo:    ${target} (eliminado, no se conserva una versión que falla)`,
+			`  registro: ${join(RELAY_INSTALL_DIR, "failed.log")}`,
 		].join("\n"),
 		"error",
 	);

@@ -422,6 +422,26 @@ export async function resolveRelaySession({
 // ---------------------------------------------------------------------------
 
 const SERVICE = "pi-free-bridge-relay";
+
+/** The relay's own version, so a relay nobody installed can still be identified.
+ *
+ *  One source of truth: `package.json` when running from source, and the value
+ *  the release build bakes in (`bun build --compile --define
+ *  BUILD_VERSION='"x.y.z"'`, measured to survive compilation). Without this a
+ *  `bun relay.mjs` from an old checkout is indistinguishable from a current
+ *  one, and the extension can only report a bare 404 from a route it lacks. */
+export const RELAY_VERSION = (() => {
+	if (typeof BUILD_VERSION !== "undefined") return String(BUILD_VERSION);
+	try {
+		// `import.meta.dir` is Bun's; Node has no such field, and the test suite runs
+		// this file under plain Node, where the fallback path is the one that works.
+		const dir = typeof import.meta.dir === "string" ? import.meta.dir : fileURLToPath(new URL(".", import.meta.url));
+		const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+		return typeof pkg.version === "string" && pkg.version ? pkg.version : "unknown";
+	} catch {
+		return "unknown";
+	}
+})();
 const DEFAULT_PORT = 8788;
 const DEFAULT_UPSTREAM = "https://opencode.ai/inference/v1";
 const DEFAULT_USER_AGENT = "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
@@ -2336,6 +2356,7 @@ export async function handle(req, res, config) {
 		sendJson(res, 200, {
 			service: SERVICE,
 			ok: true,
+			version: RELAY_VERSION,
 			sessionId: config.session,
 			sessionSource: config.sessionSource,
 			warpMode: config.warpMode,
