@@ -1124,6 +1124,86 @@ function isFree(meta: Record<string, unknown>): boolean {
 	return declared.length > 0 && declared.every((v) => v === 0);
 }
 
+/** Upstream prices are nested (`cost.text.<kind>.price`), unlike the flattened
+ *  shape the OpenCode cache file used. Reading only flat numbers classifies
+ *  every upstream model as paid — that is the whole reason this adapter exists:
+ *  with the old reader the live catalog yields 0 free models, not 12.
+ *
+ *  Exported because it is the one rule that decides what the picker shows. */
+export function upstreamPrice(meta: Record<string, unknown>, kind: "input" | "output"): number | undefined {
+	const cost = (meta.cost ?? {}) as Record<string, any>;
+	const text = (cost.text ?? {}) as Record<string, any>;
+	const node = text[kind];
+	if (node && typeof node.price === "number") return node.price;
+	// Flat fallback: older payloads and the cache file wrote plain numbers.
+	if (typeof cost[kind] === "number") return cost[kind];
+	return undefined;
+}
+
+/** Turn one upstream `/models` entry into the flat shape `buildPiModels` reads.
+ *  Returns undefined for anything this bridge will not offer: a paid model, an
+ *  excluded id, or an entry too malformed to price honestly. Refusing is the
+ *  point — a model whose cost cannot be read must not be advertised as free. */
+export function normalizeUpstreamModel(entry: unknown): RegistryModel | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const meta = entry as Record<string, any>;
+	const id = meta.id;
+	if (typeof id !== "string" || id.length === 0 || EXCLUDED_MODELS.has(id)) return undefined;
+
+	const input = upstreamPrice(meta, "input");
+	const output = upstreamPrice(meta, "output");
+	if (input === undefined || output === undefined) return undefined;
+	if (input !== 0 || output !== 0) return undefined;
+
+	const limit = (meta.limit ?? {}) as Record<string, unknown>;
+	const modalities = (meta.modalities ?? {}) as Record<string, unknown>;
+	const capabilities = (meta.capabilities ?? {}) as Record<string, any>;
+	return {
+		id,
+		name: typeof meta.name === "string" && meta.name ? meta.name : id,
+		meta: {
+			name: meta.name,
+			family: meta.family,
+			reasoning: Boolean(capabilities.reasoning?.supported),
+			limit: { context: limit.context, output: limit.output },
+			cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+			modalities: { input: modalities.input ?? ["text"] },
+		},
+	};
+}
+
+/** The free catalog, read from the service itself. No OpenCode cache file and
+ *  no embedded list: the machines that most need this bridge are the ones with
+ *  nothing installed, and they were exactly the machines that got zero models. */
+export async function fetchUpstreamCatalog(
+	signal?: AbortSignal,
+): Promise<{ models: RegistryModel[]; source: string; skipped: string[] }> {
+	const url = `${UPSTREAM_URL}/models`;
+	try {
+		const res = await fetch(url, {
+			headers: { "user-agent": USER_AGENT, authorization: `Bearer ${API_KEY}` },
+			signal,
+		});
+		if (!res.ok) return { models: [], source: `${url} -> HTTP ${res.status}`, skipped: [] };
+		const payload = (await res.json()) as { data?: unknown[]; models?: unknown[] };
+		const models: RegistryModel[] = [];
+		const skipped: string[] = [];
+		for (const entry of payload.data ?? payload.models ?? []) {
+			const model = normalizeUpstreamModel(entry);
+			if (model) {
+				models.push(model);
+				continue;
+			}
+			const id = entry && typeof entry === "object" ? (entry as { id?: unknown }).id : undefined;
+			if (typeof id === "string") skipped.push(id);
+		}
+		models.sort((a, b) => a.id.localeCompare(b.id));
+		return { models, source: url, skipped };
+	} catch (err) {
+		return { models: [], source: `${url} unreachable: ${(err as Error).message}`, skipped: [] };
+	}
+}
+
 function discoverFreeModels(liveIds: Set<string>): { models: RegistryModel[]; source: string; skipped: string[] } {
 	const path = resolveRegistryPath();
 	if (!path) return { models: [], source: "registry not found", skipped: [] };
@@ -2262,13 +2342,19 @@ export function visibleMenuIndices(state: { relayReady: boolean; warpReady: bool
 	return visible;
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
 	const g = globalThis as Record<symbol, unknown>;
 	if (g[REG_KEY]) return;
 
 	const session = resolveSessionId();
 	const live = resolveLiveIds();
-	const discovered = discoverFreeModels(live.liveIds);
+	// The catalog comes from the service itself, never from the OpenCode cache
+	// file: that file only exists on a machine that already has OpenCode, which
+	// is the opposite of the machine this bridge is for.
+	const discovered =
+		process.env.PI_FREE_BRIDGE_SKIP_CATALOG === "1"
+			? { models: [] as RegistryModel[], source: "catalog fetch skipped", skipped: [] as string[] }
+			: await fetchUpstreamCatalog(AbortSignal.timeout(4000));
 
 	if (process.env.PI_FREE_BRIDGE_DRY_RUN === "1") {
 		printDryRun(discovered, session, live);
@@ -2292,6 +2378,11 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: RELAY_URL,
 			authHeader: true,
 			models: buildPiModels(discovered.models),
+			// Pi calls this on every model refresh, so the picker follows the
+			// service instead of a snapshot taken at startup. No embedded list
+			// and no fallback: an unreachable catalog reports empty.
+			refreshModels: async ({ signal }: { signal?: AbortSignal }) =>
+				buildPiModels((await fetchUpstreamCatalog(signal)).models) as never,
 			streamSimple: gateStreamSimple,
 		});
 	}
@@ -2514,33 +2605,31 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(lines.join("\n"), "info");
 	}
 
-	/** Menu item 7: re-fetch the live free-model list and re-register the provider. */
+	/** Menu item 7: re-fetch the catalog from the service and re-register.
+	 *  Registration is live (docs/custom-provider.md:122), so no Pi restart. */
 	async function refreshLiveModels(ctx: MenuCtx): Promise<void> {
-		ctx.ui.notify("Refreshing the live free-model list…", "info");
+		ctx.ui.notify("Refreshing the free-model catalog from the service…", "info");
 		try {
-			const registryFree = new Set<string>();
-			for (const [id, meta] of Object.entries<Record<string, unknown>>(
-				JSON.parse(readFileSync(resolveRegistryPath()!, "utf-8"))?.opencode?.models ?? {},
-			)) {
-				if (isFree(meta) && !EXCLUDED_MODELS.has(id)) registryFree.add(id);
-			}
-			const liveIds = await fetchLiveFreeIds(registryFree);
-			if (liveIds.length === 0) {
-				ctx.ui.notify("The surface advertised no free models; keeping the current list", "warning");
+			const catalog = await fetchUpstreamCatalog(AbortSignal.timeout(8000));
+			if (catalog.models.length === 0) {
+				ctx.ui.notify(
+					`The service advertised no free models (${catalog.source}); keeping the current list`,
+					"warning",
+				);
 				return;
 			}
-			writeBridgeConfig({ liveIds });
-			const refreshed = discoverFreeModels(new Set(liveIds));
 			pi.registerProvider(PROVIDER, {
 				apiKey: API_KEY,
 				api: API,
 				baseUrl: RELAY_URL,
 				authHeader: true,
-				models: buildPiModels(refreshed.models),
+				models: buildPiModels(catalog.models),
+				refreshModels: async ({ signal }: { signal?: AbortSignal }) =>
+					buildPiModels((await fetchUpstreamCatalog(signal)).models) as never,
 				streamSimple: gateStreamSimple,
 			});
 			ctx.ui.notify(
-				`${PROVIDER} now registers ${refreshed.models.length} free models: ${refreshed.models.map((m) => m.id).join(", ")}`,
+				`${PROVIDER} now registers ${catalog.models.length} free models: ${catalog.models.map((m) => m.id).join(", ")}`,
 				"info",
 			);
 		} catch (err) {

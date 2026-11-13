@@ -52,8 +52,8 @@ agreed order."
 | T1 | S1, S4 | inline | done — commit `1e8a0f4` |
 | T2 | S5 | inline | done — commit `1e8a0f4` |
 | T3 | S1, S5 tests | inline | done — commit `1e8a0f4` |
-| T4 | S2 | inline | **open** |
-| T5 | S3 | inline | **open** |
+| T4 | S2 | inline | done — commit `11036b8` |
+| T5 | S3 | inline | **open** — largely covered by `refreshModels` |
 
 ## Log
 
@@ -83,3 +83,24 @@ L4 (open): T4 and T5 are untouched. S2 needs the provider to move from the
 legacy `ProviderConfig` form to the native `Provider` form that supports
 `refreshModels` (`docs/extensions.md:2084`), and S3 needs the install path to
 re-register. Neither is claimed done.
+
+L5 (slice 2 decisions): the fork was "new /models route in the relay" versus
+"fetch the service directly". The relay has no catalog route at all — a live
+GET /models returns {"error":{"message":"no route for GET /models"}} — so the
+first option meant editing relay.mjs, rebuilding the binary and cutting a
+release before the container test could see it. Fetching the service directly
+removes the OpenCode dependency today with no release, so that was chosen. It
+does not satisfy "from the relay" literally; that remains an option only if a
+future release makes it free.
+
+L6 (the trap that would have shipped broken): the service nests prices as
+cost.text.<kind>.price, while the OpenCode cache file used flat numbers. The
+existing isFree() looks for flat numbers, so pointing it at the live service
+classifies ALL 86 models as paid and yields zero free models. The adapter
+upstreamPrice() reads the nested shape with a flat fallback, and a model whose
+price cannot be read is refused rather than assumed free.
+
+L7 (slice 2 evidence): fetchUpstreamCatalog against the live service returns
+12 free models, 74 skipped, and preserves longcat-2.5-free at context 1000000.
+That is the same 12 the smoke test registered through the OpenCode cache, so
+dropping OpenCode costs no models. Suite: 206 pass, 0 fail.

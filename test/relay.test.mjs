@@ -3894,6 +3894,8 @@ test("relayBinaryFilename: keeps the version in the name so rollback is the prev
 });
 
 test("the extension registers exactly three commands, no aliases, no argument form", async () => {
+	// The catalog fetch is skipped so this test never depends on the network.
+	process.env.PI_FREE_BRIDGE_SKIP_CATALOG = "1";
 	// S1: the whole point of the change is the autocomplete list, so the list
 	// itself is what gets asserted — not a grep of the source.
 	const registered = [];
@@ -3966,7 +3968,7 @@ test("commands register even when model discovery finds nothing at all", () => {
 	// DRY_RUN keeps the child from spawning a relay; its output is skipped by
 	// reading from the marker instead of parsing the whole stream.
 	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
-		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1" },
+		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "1" },
 		encoding: "utf-8",
 	});
 	const registered = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
@@ -4003,4 +4005,44 @@ test("recycle is hidden without a WARP binary and shown with one", () => {
 		"rotating an exit with no WARP binary can only fail",
 	);
 	assert.equal(visibleMenuIndices({ relayReady: true, warpReady: true }).includes(MENU_RECYCLE), true);
+});
+
+test("upstreamPrice: reads the nested service shape and the older flat one", () => {
+	// The live service nests prices under cost.text.<kind>.price. Reading only
+	// flat numbers classified every model as paid — zero free models out of 86.
+	const { upstreamPrice } = releaseMod;
+	assert.equal(upstreamPrice({ cost: { text: { input: { price: 0 }, output: { price: 0 } } } }, "input"), 0);
+	assert.equal(upstreamPrice({ cost: { text: { input: { price: 3 }, output: { price: 15 } } } }, "output"), 15);
+	assert.equal(upstreamPrice({ cost: { input: 0, output: 0 } }, "input"), 0, "flat fallback");
+	assert.equal(upstreamPrice({}, "input"), undefined);
+	assert.equal(upstreamPrice({ cost: { text: {} } }, "output"), undefined);
+});
+
+test("normalizeUpstreamModel: keeps the free ones, refuses paid and unpriced", () => {
+	const { normalizeUpstreamModel } = releaseMod;
+	const free = normalizeUpstreamModel({
+		id: "longcat-2.5-free",
+		name: "LongCat 2.5 Free",
+		family: "longcat",
+		cost: { text: { input: { price: 0 }, output: { price: 0 } } },
+		limit: { context: 1000000, output: 32000 },
+		modalities: { input: ["text"] },
+		capabilities: { reasoning: { supported: true } },
+	});
+	assert.equal(free.id, "longcat-2.5-free");
+	assert.equal(free.meta.limit.context, 1000000, "a 1M context must survive the adapter");
+	assert.equal(free.meta.limit.output, 32000);
+	assert.deepEqual(free.meta.cost, { input: 0, output: 0, cache_read: 0, cache_write: 0 });
+	assert.equal(free.meta.reasoning, true);
+	assert.deepEqual(free.meta.modalities.input, ["text"]);
+
+	// Anything that cannot be proven free is refused, not defaulted to free.
+	assert.equal(
+		normalizeUpstreamModel({ id: "paid", cost: { text: { input: { price: 3 }, output: { price: 15 } } } }),
+		undefined,
+		"a paid model must never be offered",
+	);
+	assert.equal(normalizeUpstreamModel({ id: "unpriced" }), undefined, "no price is not the same as free");
+	assert.equal(normalizeUpstreamModel({ cost: { input: 0, output: 0 } }), undefined, "an entry with no id");
+	assert.equal(normalizeUpstreamModel(null), undefined);
 });
