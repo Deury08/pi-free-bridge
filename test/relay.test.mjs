@@ -29,6 +29,7 @@ import {
 	classifyGate429,
 	freeCatalog,
 	relayCatalog,
+	RELAY_VERSION,
 	ensureEnvBlock,
 	forwardedHeaders,
 	ensureGateTools,
@@ -3887,13 +3888,14 @@ test("verifyRelayChecksum: accepts a matching download and refuses an unlisted a
 	assert.match(unlisted.message, /not listed in the published SHA256SUMS/);
 });
 
-test("relayBinaryFilename: keeps the version in the name so rollback is the previous file", () => {
-	const first = releaseMod.relayBinaryFilename("relay-linux-x64", "v0.4.0");
-	const next = releaseMod.relayBinaryFilename("relay-linux-x64", "v0.5.0");
-	assert.equal(first, "relay-linux-x64.v0.4.0");
-	assert.notEqual(first, next, "an update must not overwrite the running binary");
-	assert.equal(releaseMod.relayBinaryFilename("relay-windows-x64.exe", "v0.4.0"), "relay-windows-x64.exe.v0.4.0");
-	assert.throws(() => releaseMod.relayBinaryFilename("relay-linux-x64", ""), /release tag is required/);
+test("the installed binary keeps its plain name; the previous one is .prev (S1)", () => {
+	// The version left the filename on purpose: TWO names, not one per release.
+	// `current` is what runs, `current.prev` is what ran before, and a transient
+	// `.tmp` exists only while a download is being placed.
+	const current = releaseMod.relayBinaryPath("/opt/bin", "relay-linux-x64");
+	assert.equal(current, "/opt/bin/relay-linux-x64", "no version in the name");
+	assert.equal(releaseMod.relayBinaryPath("/opt/bin", "relay-windows-x64.exe"), "/opt/bin/relay-windows-x64.exe");
+	assert.equal(String(current) + ".prev", "/opt/bin/relay-linux-x64.prev");
 });
 
 test("the extension registers exactly three commands, no aliases, no argument form", async () => {
@@ -4087,4 +4089,536 @@ test("parseRelayCatalog: a failed catalog is not an empty catalog", () => {
 	assert.deepEqual(free.models.map((m) => m.id), ["a-free"]);
 	assert.equal(free.models[0].meta.limit.context, 1000);
 	assert.deepEqual(free.models[0].meta.cost, { input: 0, output: 0, cache_read: 0, cache_write: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// Relay swap (spec odd/tasks/relay-swap.md, S1-S6): one current binary, one
+// previous, one version everybody reads.
+// ---------------------------------------------------------------------------
+
+/** A throwaway bin/ directory with the fake binaries a swap will move around. */
+function swapFixture(files) {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-swap-"));
+	for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
+	return dir;
+}
+
+const readOr = (dir, name) => {
+	try {
+		return readFileSync(join(dir, name), "utf8");
+	} catch {
+		return undefined;
+	}
+};
+
+test("relay /health reports a readable version (S2)", async () => {
+	// Without this the extension cannot tell "an old relay I did not install"
+	// from "a relay that has no /models route", and the user gets a bare 404.
+	const res = fakeRelayRes();
+	await handle({ method: "GET", url: "/health" }, res, { ...FORWARD_CONFIG });
+	const health = JSON.parse(res.body());
+	assert.equal(typeof health.version, "string", "/health must publish its version");
+	assert.notEqual(health.version, "unknown", "a binary that cannot say its version cannot be checked");
+	assert.equal(health.version, RELAY_VERSION, "the relay and package.json agree");
+});
+
+test("relay version is information, not a contract (S5)", () => {
+	// The numbers are aligned today only so we do not lose track of which piece
+	// is which; the relay and the extension must be free to move independently.
+	// So there is NO gate to test — only readable parsing.
+	assert.equal(releaseMod.parseRelayVersion({ version: "0.5.1" }), "0.5.1");
+	assert.equal(releaseMod.parseRelayVersion({}), undefined);
+	assert.equal(releaseMod.parseRelayVersion(null), undefined);
+	assert.equal(releaseMod.parseRelayVersion({ version: 5 }), undefined, "a number is not a version");
+});
+
+test("swap: a healthy new binary becomes current and the old one becomes .prev (S3, S4)", async () => {
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => true,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, true, JSON.stringify(result));
+	assert.equal(readOr(dir, "relay-linux-x64"), "NEW", "the new binary is what runs");
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), "OLD", "the known-good one is kept for rollback");
+	assert.equal(readOr(dir, "relay-linux-x64.tmp"), undefined, "the transient file never survives a swap");
+	assert.equal(readOr(dir, "failed.log"), undefined, "nothing failed, so nothing is logged");
+});
+
+test("swap: a binary that never answers is rolled back to .prev and deleted (S3.6-7)", async () => {
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	let starts = 0;
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		// The new binary never answers; the rollback one does.
+		startRelay: async () => ++starts > 1,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, true, "there was a .prev, so it rolled back");
+	assert.equal(readOr(dir, "relay-linux-x64"), "OLD", "the known-good binary runs again");
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), undefined, "rollback consumes the spare");
+	assert.notEqual(readOr(dir, "relay-linux-x64"), "NEW", "the failing binary is never kept");
+	const log = readOr(dir, "failed.log");
+	assert.ok(log, "the failure is recorded, not silently forgotten");
+	assert.match(log, /0\.5\.1/, "the log names the version that failed");
+	assert.equal(log.trim().split("\n").length, 1, "one line per failure");
+});
+
+test("swap: a first install that fails leaves nothing installed and says so (S4)", async () => {
+	const dir = swapFixture({ "relay-linux-x64.tmp": "NEW" });
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => false,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, false, "with no .prev there is nothing to roll back to");
+	assert.equal(readOr(dir, "relay-linux-x64"), undefined, "nothing is installed");
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), undefined);
+	assert.match(String(result.reason), /sin versión anterior|no previous/i, "the reason says why");
+	assert.match(readOr(dir, "failed.log") ?? "", /0\.5\.1/, "the failure is still evidence");
+});
+
+test("swap: a relay that cannot be stopped aborts before touching anything (S3.3)", async () => {
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => false,
+		startRelay: async () => {
+			throw new Error("must not start a relay that was never stopped");
+		},
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.match(String(result.reason), /no se pudo detener|could not be stopped/i);
+	assert.equal(readOr(dir, "relay-linux-x64"), "OLD", "the running binary is untouched");
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), undefined, "no rename happened");
+	assert.equal(readOr(dir, "relay-linux-x64.tmp"), "NEW", "the download is not lost either");
+});
+
+test("swap: nobody answers the question, so it rolls back on its own (S3.6)", async () => {
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	let starts = 0;
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => ++starts > 1,
+		askContinue: async () => "none", // nobody answered
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, true, "an unanswered question must not wait forever");
+	assert.equal(readOr(dir, "relay-linux-x64"), "OLD");
+});
+
+test("fetchRelayCatalog: a relay without /models still yields a catalog (S5)", async () => {
+	// Capability detection: 404 means this relay predates the route, and the
+	// extension falls back to the direct service call it made before the route
+	// existed. Fallback, not an error state.
+	const realFetch = globalThis.fetch;
+	try {
+		globalThis.fetch = async (url) => {
+			if (String(url).includes("127.0.0.1")) {
+				return { ok: false, status: 404, json: async () => ({ error: { message: "no route for GET /models" } }) };
+			}
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({
+					data: [
+						{ id: "beam-free", name: "Beam", cost: { text: { input: { price: 0 }, output: { price: 0 } } }, limit: { context: 1000 } },
+						{ id: "paid", cost: { text: { input: { price: 3 }, output: { price: 1 } } } },
+					],
+				}),
+			};
+		};
+		const result = await releaseMod.fetchRelayCatalog();
+		assert.deepEqual(result.models.map((m) => m.id), ["beam-free"], "the direct call still gives a catalog");
+		assert.equal(result.unavailable, undefined, "falling back is not an error state");
+		assert.match(result.source, /directo|fallback/i, "and the source says where it came from");
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+});
+
+test("the fallback reader agrees with the relay reader (drift guard)", async () => {
+	// The fallback duplicates the relay pricing logic on purpose: importing
+	// relay.mjs would drag its HTTP server into the Pi extension bundle. Same
+	// fixture through both readers, or the copies have silently drifted.
+	const fixture = {
+		data: [
+			{ id: "beam-free", name: "Beam", cost: { text: { input: { price: 0 }, output: { price: 0 } } }, limit: { context: 1048576, output: 131072 }, modalities: { input: ["text"] }, capabilities: { reasoning: { supported: true } } },
+			{ id: "flat-free", cost: { input: 0, output: 0 } },
+			{ id: "paid", cost: { text: { input: { price: 3 }, output: { price: 15 } } } },
+			{ id: "unpriced", cost: {} },
+		],
+	};
+	const fromRelay = freeCatalog(fixture).models.map((m) => m.id);
+	assert.deepEqual(fromRelay, ["beam-free", "flat-free"]);
+	const realFetch = globalThis.fetch;
+	try {
+		globalThis.fetch = async (url) => {
+			if (String(url).includes("127.0.0.1")) return { ok: false, status: 404, json: async () => ({}) };
+			return { ok: true, status: 200, json: async () => fixture };
+		};
+		const viaFallback = await releaseMod.fetchRelayCatalog();
+		assert.deepEqual(viaFallback.models.map((m) => m.id), fromRelay, "both readers keep the same models");
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+});
+
+test("swap: older versioned leftovers are purged, the running one is adopted (S1)", async () => {
+	// The old scheme left one file per release. Keeping them is a 109 MB
+	// cemetery; keeping none of them removes the only real rollback target. So:
+	// adopt the one that was running, delete the rest.
+	const dir = swapFixture({
+		"relay-linux-x64.tmp": "NEW",
+		"relay-linux-x64.v0.3.0": "ANCIENT",
+		"relay-linux-x64.v0.4.0": "RAN-JUST-NOW",
+	});
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		previous: join(dir, "relay-linux-x64.v0.4.0"),
+		stopRelay: async () => true,
+		startRelay: async () => true,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, true, JSON.stringify(result));
+	assert.equal(readOr(dir, "relay-linux-x64"), "NEW");
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), "RAN-JUST-NOW", "the binary that answered /health is kept");
+	assert.equal(readOr(dir, "relay-linux-x64.v0.3.0"), undefined, "older leftovers are gone");
+	assert.equal(readOr(dir, "relay-linux-x64.v0.4.0"), undefined, "adopted, not left behind");
+	const left = readdirSync(dir).sort();
+	assert.deepEqual(left, ["relay-linux-x64", "relay-linux-x64.prev"], "two names, nothing else");
+});
+
+test("swap: failed.log keeps the last 20 lines and drops the rest (S3.7)", async () => {
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	// 25 older failures, so the cap has something to cut.
+	const past = Array.from({ length: 25 }, (_, i) => `2026-01-01T00:00:${String(i).padStart(2, "0")}.000Z\t0.0.${i}\tviejo`).join("\n");
+	writeFileSync(join(dir, "failed.log"), past + "\n");
+
+	await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => false,
+		askContinue: async () => "rollback",
+	});
+
+	const lines = readOr(dir, "failed.log").trim().split("\n");
+	assert.equal(lines.length, 20, "a log that grows forever is a log nobody reads");
+	assert.match(lines[19], /0\.5\.1/, "the newest failure is the one kept at the end");
+	assert.doesNotMatch(lines.join("\n"), /0\.0\.0/, "the oldest lines are the ones dropped");
+});
+
+test("the install confirm says it STOPS the running relay, whoever started it (S3.2)", () => {
+	// Someone who started the relay by hand deserves to know it will be
+	// terminated, not "restarted" as if the extension owned it.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.match(source, /DETIENE el relay que está corriendo/);
+	assert.doesNotMatch(source, /Esto REINICIA el relay/);
+});
+
+test("swap: with nothing saying what ran, the newest leftover is adopted (S1)", async () => {
+	// No `current` and no config previous: the only evidence of order is the
+	// version in the filename, so the highest number becomes the spare.
+	const dir = swapFixture({
+		"relay-linux-x64.tmp": "NEW",
+		"relay-linux-x64.v0.3.0": "OLDEST",
+		"relay-linux-x64.v0.4.0": "NEWEST",
+		"relay-linux-x64.v0.4.1": "NEWER-STILL",
+	});
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => true,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, true, JSON.stringify(result));
+	assert.equal(readOr(dir, "relay-linux-x64"), "NEW");
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), "NEWER-STILL", "the highest version survives");
+	assert.deepEqual(readdirSync(dir).sort(), ["relay-linux-x64", "relay-linux-x64.prev"]);
+});
+
+test("swap: the known-good incumbent beats a higher number on disk (S1)", async () => {
+	// A newer file that sits next to a lower one the config says was running is a
+	// build somebody rolled back FROM. Keeping it as the spare would hand the next
+	// rollback a binary already known to fail.
+	const dir = swapFixture({
+		"relay-linux-x64.tmp": "NEW",
+		"relay-linux-x64.v0.3.0": "KNOWN-GOOD",
+		"relay-linux-x64.v0.4.0": "ROLLED-BACK-FROM",
+	});
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		previous: join(dir, "relay-linux-x64.v0.3.0"),
+		stopRelay: async () => true,
+		startRelay: async () => true,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, true, JSON.stringify(result));
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), "KNOWN-GOOD", "the build that answered /health is the spare");
+	assert.equal(readOr(dir, "relay-linux-x64.v0.4.0"), undefined, "the rolled-back build is deleted, not kept");
+	assert.deepEqual(readdirSync(dir).sort(), ["relay-linux-x64", "relay-linux-x64.prev"]);
+});
+
+test("swap: a file the tool did not create survives the purge (S1)", async () => {
+	// The purge matches by shape, so a human's notes in the same directory are not
+	// collateral damage. A cleanup that deletes by wildcard eats what it did not make.
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	writeFileSync(join(dir, "notes.txt"), "mine");
+	writeFileSync(join(dir, "relay-linux-x64.keep-me"), "mine too");
+
+	await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => true,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(readOr(dir, "notes.txt"), "mine");
+	assert.equal(readOr(dir, "relay-linux-x64.keep-me"), "mine too", "not a version, so not ours to delete");
+});
+
+test("the extension never names an installed relay after a version (S1)", () => {
+	// The container run that reported bin/relay-linux-x64.v0.5.0 was running the
+	// published 0.5.1, whose namer was relayBinaryFilename(asset, tag). This guard
+	// exists so that behaviour cannot come back: one namer, no version in a name.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(source, /relayBinaryFilename/, "the version-in-filename namer must not exist");
+	assert.doesNotMatch(
+		source,
+		/\.v\$\{/,
+		"no path may interpolate a version into a file name",
+	);
+
+	// Every write of a binary goes through the two-name layout: the staged file is
+	// hand-built here and nowhere else.
+	const staged = source.match(/const staged = [^\n]+/g) ?? [];
+	assert.equal(staged.length, 1, "exactly one place stages a downloaded binary");
+	assert.match(staged[0], /relayBinaryPath\(RELAY_INSTALL_DIR/, staged[0]);
+
+	// And the namer itself is version-free for every asset name.
+	for (const asset of ["relay-linux-x64", "relay-darwin-arm64", "relay-windows-x64.exe"]) {
+		assert.equal(releaseMod.relayBinaryPath("/bin", asset), "/bin/" + asset);
+	}
+});
+
+test("a failed update leaves the previous good binary in place, byte for byte (S3.6)", async () => {
+	// The invariant, stated as an end state instead of as "the rollback ran":
+	// after a failed update WITH a good previous binary, the directory holds the
+	// working binary and nothing else, its bytes are the PREVIOUS ones, and the
+	// restart happened while those bytes were already at the canonical name.
+	const dir = swapFixture({ "relay-linux-x64": "GOOD-1", "relay-linux-x64.tmp": "BROKEN-2" });
+	const seenByRestart = [];
+	let starts = 0;
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.0",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => {
+			starts += 1;
+			seenByRestart.push(readOr(dir, "relay-linux-x64"));
+			return starts > 1; // the new binary fails, the restored one works
+		},
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, true, JSON.stringify(result));
+	assert.equal(readOr(dir, "relay-linux-x64"), "GOOD-1", "the good bytes are back at the canonical name");
+	assert.deepEqual(
+		readdirSync(dir).sort(),
+		["failed.log", "relay-linux-x64"],
+		"one binary and the evidence, no corpses",
+	);
+	assert.equal(seenByRestart[1], "GOOD-1", "the restart saw the restored binary, not the failed one");
+	assert.match(readOr(dir, "failed.log"), /\t0\.5\.0\t/, "the failure is recorded");
+});
+
+test("a failed update with no previous binary removes nothing good (S3.6)", async () => {
+	// The other half of the same invariant: when there is no spare there is no
+	// good copy to protect, so the failed binary goes and failed.log stays. What
+	// must never happen is deleting a working binary in the name of rollback.
+	const dir = swapFixture({ "relay-linux-x64.tmp": "BROKEN-1" });
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.0",
+		timeoutMs: 50,
+		stopRelay: async () => true,
+		startRelay: async () => false,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, false, "nothing to roll back to");
+	assert.match(result.reason, /no previous/);
+	assert.equal(readOr(dir, "relay-linux-x64"), undefined, "a failing binary does not stay at the canonical name");
+	assert.deepEqual(readdirSync(dir).sort(), ["failed.log"]);
+});
+
+test("a stale versioned relayBin is migrated to the canonical name (S3.0)", () => {
+	// Every install from before the two-name layout left
+	// relayBin = ".../bin/relay-linux-x64.v0.4.0". Nothing produces that name any
+	// more, so every start after the layout change pointed at a dead path: the
+	// relay never answered and the swap rolled back on a machine that had been
+	// healthy a minute earlier. The stale path is the bug, so it is rewritten.
+	const writes = [];
+	const resolved = releaseMod.migrateRelayBinConfig("/bin", "relay-linux-x64", {
+		read: () => ({ relayBin: "/bin/relay-linux-x64.v0.4.0" }),
+		write: (patch) => writes.push(patch),
+		exists: () => true,
+	});
+	assert.equal(resolved, "/bin/relay-linux-x64");
+	assert.deepEqual(writes, [{ relayBin: "/bin/relay-linux-x64" }], "written once, not on every start");
+});
+
+test("a relayBin pointing at a file that is gone is migrated too (S3.0)", () => {
+	const writes = [];
+	const resolved = releaseMod.migrateRelayBinConfig("/bin", "relay-linux-x64", {
+		read: () => ({ relayBin: "/elsewhere/gone-binary" }),
+		write: (patch) => writes.push(patch),
+		exists: () => false,
+	});
+	assert.equal(resolved, "/bin/relay-linux-x64");
+	assert.equal(writes.length, 1);
+});
+
+test("a healthy canonical relayBin is left alone (S3.0)", () => {
+	const writes = [];
+	const resolved = releaseMod.resolveRelayBin("/bin", "relay-linux-x64", {
+		read: () => ({ relayBin: "/bin/relay-linux-x64" }),
+		write: (patch) => writes.push(patch),
+		exists: () => true,
+	});
+	assert.equal(resolved, "/bin/relay-linux-x64");
+	assert.deepEqual(writes, [], "no write when nothing is wrong");
+});
+
+test("migration plus update: the versioned file becomes the spare (S1, S3.0)", async () => {
+	// The end state the migration promises: the leftover is adopted as .prev, the
+	// two names are the only ones left, and the config stops naming the dead path.
+	const dir = swapFixture({ "relay-linux-x64.v0.4.0": "GOOD-LEGACY", "relay-linux-x64.tmp": "BROKEN-NEW" });
+	const writes = [];
+	const previous = releaseMod.migrateRelayBinConfig(dir, "relay-linux-x64", {
+		read: () => ({ relayBin: join(dir, "relay-linux-x64.v0.4.0") }),
+		write: (patch) => writes.push(patch),
+		exists: (path) => existsSync(path),
+	});
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		previous,
+		stopRelay: async () => true,
+		startRelay: async () => false,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, true, JSON.stringify(result));
+	assert.deepEqual(writes, [{ relayBin: join(dir, "relay-linux-x64") }]);
+	assert.equal(readOr(dir, "relay-linux-x64"), "GOOD-LEGACY", "the legacy build is what runs again");
+	assert.deepEqual(readdirSync(dir).sort(), ["failed.log", "relay-linux-x64"], "no versioned leftovers");
+});
+
+test("a second install is refused while one is running (S3.8)", () => {
+	// A second Enter during the download started a second swap against the same
+	// two names. One at a time, in process.
+	assert.equal(releaseMod.isRelayInstallInFlight(), false);
+	assert.equal(releaseMod.beginRelayInstall(), true);
+	assert.equal(releaseMod.beginRelayInstall(), false, "the second one is refused");
+	assert.equal(releaseMod.isRelayInstallInFlight(), true);
+	releaseMod.endRelayInstall();
+	assert.equal(releaseMod.isRelayInstallInFlight(), false, "and the next one is allowed again");
+	assert.equal(releaseMod.beginRelayInstall(), true);
+	releaseMod.endRelayInstall();
+});
+
+test("resolving never writes: declining an install changes nothing (S3.0)", () => {
+	// The migration is a mutation, and the confirm comes first. Resolving is what
+	// the prompt needs to name the previous binary; if it wrote, saying "no" would
+	// leave a config pointing at a path that does not exist yet.
+	const writes = [];
+	const resolved = releaseMod.resolveRelayBin("/bin", "relay-linux-x64", {
+		read: () => ({ relayBin: "/bin/relay-linux-x64.v0.4.0" }),
+		write: (patch) => writes.push(patch),
+		exists: () => true,
+	});
+	assert.equal(resolved, "/bin/relay-linux-x64", "the prompt names the path that will exist");
+	assert.deepEqual(writes, [], "and nothing on disk changed");
+});
+
+test("a versioned leftover is never treated as the relay to start (S3.0)", () => {
+	// After the layout change a `.v0.5.0` may still sit on disk. Starting it would
+	// run the build the human just replaced, so the name itself disqualifies it.
+	assert.equal(releaseMod.isVersionedRelayBinName("/bin/relay-linux-x64.v0.4.0"), true);
+	assert.equal(releaseMod.isVersionedRelayBinName("C:\\bin\\relay-windows-x64.exe.v0.4.0"), true);
+	assert.equal(releaseMod.isVersionedRelayBinName("/bin/relay-linux-x64"), false);
+	assert.equal(releaseMod.isVersionedRelayBinName("/bin/relay-linux-x64.prev"), false);
+	assert.equal(
+		releaseMod.isVersionedRelayBinName("/usr/local/bin/relay-2"),
+		false,
+		"a foreign binary with a number in it is not ours to ignore",
+	);
 });
