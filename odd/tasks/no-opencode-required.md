@@ -175,3 +175,16 @@ and someone verifying one should not have to hold the others in their head.
   claims that the extension needs no OpenCode and no Bun. They are true only
   because of the three commits above, so they must land with them and never on
   `master` alone. Publishing that text on `master` would ship a false claim.
+- `L14` (consequence found by the owner's question, not by the tests): putting the
+  catalog behind the relay created an ORDERING bug that could not exist while
+  the extension had its own door — the catalog was fetched before `ensureRelay`
+  ran, so a cold start asked a process that was not up yet, published nothing,
+  and started the relay afterwards. Fixed in `cce57b2`: relay first, then its
+  catalog. Not unit-tested, because exercising `ensureRelay` would spawn a real
+  relay on the live port 8788; the tested consequence is the user-visible one.
+- `L15` (honest limit of "one door"): the relay's `/models` route reuses the wire
+  headers but NOT the WARP egress ladder. If the vendor ever blocks direct
+  requests while `/v1` survives through the tunnel, the catalog returns a
+  readable 502 and offers nothing. Making the route walk the same egress ladder
+  as `forward` is the follow-up; it was not done here because there is no
+  evidence today that direct access fails (L11).
