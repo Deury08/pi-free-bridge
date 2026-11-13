@@ -117,3 +117,11 @@ then `GET /health` answered `"version":"0.5.1"`. From source under Node the
 fallback path had to use `fileURLToPath` because `import.meta.dir` is Bun-only;
 without it the suite saw `unknown`, which is exactly the state the mismatch
 check must not accept.
+
+L9 (gap found while writing the test, not by reading the code): every relay
+installed before this feature answers `/health` WITHOUT a `version`, so a pure
+version comparison cannot run for them — and they are the majority of existing
+installs, not an edge case. Falling through to the raw 404 would have left
+exactly those users with the message S5 exists to delete. They now get "el relay
+que corre no informa su versión, esta extensión necesita 0.5.1. Actualizalo
+desde «Instalar / actualizar relay»". Pinned by a test.

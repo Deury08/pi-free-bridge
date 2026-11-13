@@ -1173,7 +1173,18 @@ export async function fetchRelayCatalog(signal?: AbortSignal): Promise<CatalogRe
 		// say what it is, name the version instead.
 		if (res.status === 404) {
 			const running = parseRelayVersion((await fetchRelayHealth(RELAY_PORT)) as unknown);
-			if (running && isRelayVersionBelow(running, MIN_RELAY_VERSION)) {
+			// A relay predating the version field — which is every install made before
+			// this feature — cannot be compared, but it can still be named. This is the
+			// common case, not the exotic one: falling back to the raw 404 here would
+			// leave most existing installs with the message this exists to delete.
+			if (!running) {
+				return {
+					models: [],
+					source: url,
+					unavailable: `el relay que corre no informa su versión, esta extensión necesita ${MIN_RELAY_VERSION}. Actualizalo desde «Instalar / actualizar relay»`,
+				};
+			}
+			if (isRelayVersionBelow(running, MIN_RELAY_VERSION)) {
 				return {
 					models: [],
 					source: url,

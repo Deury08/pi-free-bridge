@@ -4266,3 +4266,25 @@ test("fetchRelayCatalog: an old relay is named, not reported as a bare 404 (S5)"
 		globalThis.fetch = realFetch;
 	}
 });
+
+test("fetchRelayCatalog: a relay that reports no version is named too (S5)", async () => {
+	// Every relay installed before this feature is exactly this case: it answers
+	// /health without a `version`, so a version comparison cannot run. Falling
+	// back to the raw 404 would leave the majority of existing installs with the
+	// message this feature exists to delete.
+	const realFetch = globalThis.fetch;
+	try {
+		globalThis.fetch = async (url) => {
+			if (String(url).endsWith("/models")) {
+				return { ok: false, status: 404, json: async () => ({}) };
+			}
+			return { ok: true, status: 200, json: async () => ({ service: "pi-free-bridge-relay", ok: true }) };
+		};
+		const result = await releaseMod.fetchRelayCatalog();
+		assert.equal(result.models.length, 0);
+		assert.match(String(result.unavailable), /no informa su versión/, "says the relay is too old to be asked");
+		assert.match(String(result.unavailable), /0\.5\.1/, "and what is needed");
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+});
