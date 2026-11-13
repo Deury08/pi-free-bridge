@@ -123,3 +123,20 @@ error because Bun defaults to a browser target; that is pre-existing and not a
 regression. The truthful check is "bun build index.ts --target=node", which
 exits 0. Earlier green build reports in this project were the exit status of a
 piped tail, not of bun.
+
+## Slice boundaries
+
+The tooling reports this branch past the ~400 authored line review unit (~580
+lines, 4 commits). It was split on purpose: each slice is a different failure,
+and someone verifying one should not have to hold the others in their head.
+
+- `88418c5` — S1, S4, S5. Verifiable alone: does the menu exist on a machine
+  with no OpenCode, and does it hide what cannot work there.
+- `427accd` — S2. Verifiable alone: 12 free models from the service and no
+  registry read. This is the slice carrying the pricing-shape trap.
+- `ee93ad1` — S3. Live publish after install, plus collapsing three copies of
+  the provider registration into one `publishCatalog(models)`.
+- `8e9e448` (peer-authored) and the README edits in this doc's branch — the
+  claims that the extension needs no OpenCode and no Bun. They are true only
+  because of the three commits above, so they must land with them and never on
+  `master` alone. Publishing that text on `master` would ship a false claim.
