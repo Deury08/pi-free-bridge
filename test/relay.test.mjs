@@ -4432,3 +4432,27 @@ test("swap: a file the tool did not create survives the purge (S1)", async () =>
 	assert.equal(readOr(dir, "notes.txt"), "mine");
 	assert.equal(readOr(dir, "relay-linux-x64.keep-me"), "mine too", "not a version, so not ours to delete");
 });
+
+test("the extension never names an installed relay after a version (S1)", () => {
+	// The container run that reported bin/relay-linux-x64.v0.5.0 was running the
+	// published 0.5.1, whose namer was relayBinaryFilename(asset, tag). This guard
+	// exists so that behaviour cannot come back: one namer, no version in a name.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(source, /relayBinaryFilename/, "the version-in-filename namer must not exist");
+	assert.doesNotMatch(
+		source,
+		/\.v\$\{/,
+		"no path may interpolate a version into a file name",
+	);
+
+	// Every write of a binary goes through the two-name layout: the staged file is
+	// hand-built here and nowhere else.
+	const staged = source.match(/const staged = [^\n]+/g) ?? [];
+	assert.equal(staged.length, 1, "exactly one place stages a downloaded binary");
+	assert.match(staged[0], /relayBinaryPath\(RELAY_INSTALL_DIR/, staged[0]);
+
+	// And the namer itself is version-free for every asset name.
+	for (const asset of ["relay-linux-x64", "relay-darwin-arm64", "relay-windows-x64.exe"]) {
+		assert.equal(releaseMod.relayBinaryPath("/bin", asset), "/bin/" + asset);
+	}
+});

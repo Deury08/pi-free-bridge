@@ -199,3 +199,26 @@ the spare is for.
 The match is by shape (`<name>.` + optional `v` + a digit), so `notes.txt` and
 `relay-linux-x64.keep-me` survive; a cleanup that deletes by wildcard eats what it
 did not create. Pinned by a test.
+
+L15 (container report, layout): the container reported `bin/relay-linux-x64.v0.5.0`.
+That name cannot come from this branch. Evidence:
+
+- `relayBinaryFilename(asset, tag)` — the namer that appended the version — exists
+  only in `.git/gentle-ai/candidate-views/<id>/index.ts`, a review snapshot of an
+  older candidate. It is not in the tree.
+- HEAD has exactly one writer of a relay binary: `writeFileSync(staged, bytes)` in
+  `installRelayBinary`, and `staged` is `relayBinaryPath(RELAY_INSTALL_DIR, asset)`
+  plus `.tmp`. The swap renames it to `relayBinaryPath(dir, name)`.
+- The 12 models do not prove the fallback ran: 0.5.1 already serves the catalog
+  through the relay, and after installing the relay it answers `/models`. A
+  published-0.5.1 extension plus a working relay produces exactly that message.
+
+So the container ran the published 0.5.1, not the branch. The requested test is
+still worth having, because it is the assertion that would catch a regression of
+this exact shape: `the extension never names an installed relay after a version`
+checks that the namer does not exist, that no path interpolates a version into a
+file name, that exactly one place stages a download and does it through
+`relayBinaryPath`, and that the namer is version-free for every asset name.
+
+Re-run needs one line of proof: `git rev-parse --short HEAD` inside the container
+source and `grep -c fetchDirectCatalog index.ts` (0 means it is not this branch).
