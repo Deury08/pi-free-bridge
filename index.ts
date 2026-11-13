@@ -2764,12 +2764,15 @@ export default async function (pi: ExtensionAPI) {
 			`  url:        ${RELAY_URL}`,
 			`  process:    ${describeRelay()}`,
 			`  health:     ${health ? "answering" : "not answering"} (${relayHealthUrl(RELAY_PORT)})`,
+			// Information, not a contract: it says which piece is running, and the
+			// extension has already decided what to do by capability.
+			`  version:    ${health?.version ?? "not reported (relay older than the version field)"}`,
+			`  catalog:    ${discovered.models.length} free from ${discovered.source}`,
 			`  session:    ${
 				health?.sessionId
 					? `${health.sessionId} (from ${health.sessionSource})`
 					: "resolved at the first request by the relay"
 			}`,
-			`  models:     ${discovered.models.length} free from ${discovered.source}`,
 			`  warp:       ${health?.warpMode ?? resolveWarpMode()}${
 				health?.lastEgress ? ` — last egress ${health.lastEgress}` : ""
 			}`,

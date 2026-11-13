@@ -153,3 +153,10 @@ on port 8896, `fetchRelayCatalog()` returned **12 free models** with
 /models)` and **no `unavailable`** — the fallback is a catalog, not an error
 state. A relay that is not running at all still yields no models, which is the
 agreed gating for a machine that has not installed one.
+
+L12 (display, per the same correction): the version is now shown where a human
+looks for it — menu item 2, "Estado del relay", prints
+`version: <x>` (or "not reported (relay older than the version field)") and the
+catalog source line was renamed from `models:` to `catalog:` so it says where the
+list came from. That is what "information for display and diagnosis" means in
+practice; nothing reads the number to decide anything.
