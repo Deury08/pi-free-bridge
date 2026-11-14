@@ -596,7 +596,7 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 
 ### Dentro de una sesión de Pi (slash commands)
 
-Sólo quedan **cuatro comandos registrados**. Todo lo demás vive en un menú,
+Sólo quedan **tres comandos registrados**. Todo lo demás vive en un menú,
 porque cada comando registrado ocupa una línea del autocompletado — y los
 alias también aparecen ahí, así que no son una salida.
 
@@ -608,29 +608,34 @@ alias también aparecen ahí, así que no son una salida.
 
 ### El menú de `/free-bridge`
 
-Una lista plana, sin submenús, en este orden:
+Dos niveles: primero el **sector**, después la acción. Un sector cuyas acciones
+están todas ocultas no se ofrece, así que el menú nunca abre en un callejón.
 
-| # | Ítem | Qué hace |
+| Sector | Acción | Qué hace |
 |---|---|---|
-| 1 | Instalar / actualizar relay | Baja el binario del relay para tu sistema, verifica el `SHA256SUMS` publicado, lo instala y reinicia el relay. **Pregunta antes** y avisa que reinicia el relay. Guarda el binario que corría como `.prev`: si el nuevo no responde `/health`, te pregunta si esperar o volver, y si no contestás vuelve solo al anterior. Una versión que falla se borra y queda anotada en `failed.log` |
-| 2 | Estado del relay | URL, proceso, versión, `/health`, session id y su origen, modelos, WARP, cable y Bun |
-| 3 | WARP: on / off | Muestra el modo actual y lo cambia. Los modos son `off`, `auto` y `on`; sin `warp-minimal` arriba, ofrece instalarlo |
-| 4 | Reciclar WARP | Lo mismo que `/free-bridge-warp-recycle` |
-| 5 | Cable: v1 / v2 | Muestra el modo actual y lo cambia |
-| 6 | Modelos | Lista los modelos gratis efectivamente registrados y de dónde salieron: hoy, el catálogo del servicio |
-| 7 | Refrescar sesión | Vuelve a pedir el catálogo gratis al servicio y re-registra el provider **en vivo**, sin reiniciar Pi |
+| **Relay** | Instalar / actualizar relay | Baja el binario del relay, verifica el `SHA256SUMS` publicado, lo instala y reinicia el relay. **Pregunta antes** y guarda el binario que corría como `.prev`: si el nuevo no responde `/health`, vuelve solo al anterior |
+| **Relay** | Estado del relay | URL, proceso, versión, `/health`, session id y su origen, modelos, WARP, cable y Bun |
+| **WARP** | Modo: on / off | Muestra el modo actual y lo cambia (`off`, `auto`, `on`); sin `warp-minimal` arriba, ofrece instalarlo |
+| **WARP** | Instalar/actualizar warp | Descarga **siempre** la última release publicada de `warp-minimal` y reemplaza el archivo. Es la única acción que **detiene el proxy**; muestra el costo y pide confirmación |
+| **WARP** | Reciclar WARP | Lo mismo que `/free-bridge-warp-recycle` |
+| **Red** | Protocolo: v1 / v2 | Muestra el modo actual y lo cambia |
+| **Sesión** | Modelos | Lista los modelos gratis efectivamente registrados y de dónde salieron |
+| **Sesión** | Refrescar sesión | Vuelve a pedir el catálogo gratis al servicio y re-registra el provider **en vivo**, sin reiniciar Pi |
 
-Los ítems 3 y 5 muestran el estado actual en la etiqueta antes de que elijas,
-así el toggle nunca es una adivinanza. Si una variable de entorno fija el valor
+El modo de WARP y el protocolo muestran el estado actual en la etiqueta antes de
+que elijas, así el toggle nunca es una adivinanza.
+Si una variable de entorno fija el valor
 (`PI_FREE_BRIDGE_WARP_MODE`, `RELAY_WIRE_MODE`), el menú te lo dice en vez de
 fingir que lo cambió.
 
-**El menú muestra sólo lo que podés usar.** No es una lista fija de siete: en
-una máquina recién instalada, sin relay y sin WARP, el menú es un solo ítem
-—«Instalar / actualizar relay»— porque los demás sólo podrían fallar. Cuando el
-relay ya corre aparecen los otros seis, y «Reciclar WARP» se suma recién cuando
-hay un binario de WARP al cual pedirle la rotación. La lista se arma en cada
-entrada al menú, así que si instalás algo, la próxima vez está ahí.
+**El menú muestra sólo lo que podés usar.** No es una lista fija: en una máquina
+recién instalada, sin relay y sin WARP, el único sector con acciones es **Relay**
+—«Instalar / actualizar relay»— porque las demás sólo podrían fallar. La excepción
+deliberada es **WARP → Instalar/actualizar warp**, que está siempre: es la fila
+que crea el binario, así que esconderla detrás de su propia ausencia la haría
+inaccesible justo cuando hace falta. «Reciclar WARP» se suma recién cuando hay un
+binario al cual pedirle la rotación. La lista se arma en cada entrada al menú, así
+que si instalás algo, la próxima vez está ahí.
 
 ### Dos nombres, no uno por versión
 

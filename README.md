@@ -201,21 +201,22 @@ desaparece solo.
 Escribí cualquier cosa y mirá el pie: `ctx` sube, el costo queda en **`$0.000`**.
 Eso es el tier gratuito funcionando a través del relay.
 
-## Los cuatro comandos
+## Los tres comandos
 
-Después de instalado, todo se maneja desde cuatro comandos:
+Después de instalado, todo se maneja desde tres comandos:
 
 | Comando | Para qué |
 | --- | --- |
-| `/free-bridge` | El menú: instalar el relay, WARP, cable, modelos |
+| `/free-bridge` | El menú, por sectores: Relay, WARP, Red, Sesión |
 | `/free-bridge-warp-recycle` | Pedir una dirección nueva cuando algo se traba |
-| `/free-bridge-warp-update` | Actualizar `warp-minimal` a la última release |
 | `/free-bridge-doctor` | Diagnóstico, para pegar en un issue |
 
-**`/free-bridge-warp-update` es el único que detiene el proxy**, porque reemplaza
-el binario debajo del proceso que sirve, y pregunta antes de tocarlo. **Nada lo
-detiene automáticamente**: ni cerrar una sesión de Pi, ni recargar, ni desactivar
-WARP.
+Instalar o actualizar `warp-minimal` vive en el menú, en **WARP →
+Instalar/actualizar warp**: descarga siempre la última release publicada y
+reemplaza el archivo. **Es la única acción que detiene el proxy**, porque el
+binario cambia debajo del proceso que sirve, y pregunta antes de tocarlo.
+**Nada lo detiene automáticamente**: ni cerrar una sesión de Pi, ni recargar,
+ni desactivar WARP.
 
 ## Si algo falla
 
