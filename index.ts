@@ -1692,6 +1692,20 @@ export function warpBuildNotice({ running, installed }: { running: string | null
 	return `the proxy runs ${running}, the installed build is ${installed} — /warp update`;
 }
 
+/** T9c: is there anything to install? A release publishes its tag and its
+ *  assets, never the commit it was built from, and the binary's own `-version`
+ *  prints the version constant from the source (v0.2.3 today), not the tag. So
+ *  "already up to date" cannot be inferred from the download; it is read from
+ *  the record this extension writes after a successful install. `unknown` is its
+ *  own answer: no latest tag read means no claim either way. */
+export function warpUpdateDecision({ latestTag, installedTag }: { latestTag: string | null; installedTag: string | null }): "up-to-date" | "update" | "unknown" {
+	const normalize = (tag: string | null): string => (typeof tag === "string" ? tag.trim().replace(/^v/i, "").toLowerCase() : "");
+	const latest = normalize(latestTag);
+	if (!latest) return "unknown";
+	const installed = normalize(installedTag);
+	return installed === latest ? "up-to-date" : "update";
+}
+
 /** T9b: the two observations the notice needs, injected so the decision can be
  *  tested without a proxy or a spawn. A dependency that fails is "no answer",
  *  never an exception: this runs at an entry point and must not break it. */
@@ -3580,3 +3594,4 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 }
+

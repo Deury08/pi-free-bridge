@@ -6594,3 +6594,21 @@ test("warpBuildDrift: matching builds produce no notice at all (T9b)", async () 
 	assert.equal(notice, null);
 });
 
+// T9c: a release publishes its tag, never the commit inside it, and the binary
+// prints the source's version constant rather than the tag — so "up to date" is
+// read from the install record, not guessed from the download.
+test("warpUpdateDecision: the same tag decides nothing is to be installed (T9c)", () => {
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: "v0.4.0" }), "up-to-date");
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: "0.4.0" }), "up-to-date");
+});
+
+test("warpUpdateDecision: a different or missing record means install (T9c)", () => {
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: "v0.3.1" }), "update");
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: null }), "update");
+});
+
+test("warpUpdateDecision: no latest tag is unknown, which is not 'update' (T9c)", () => {
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: null, installedTag: "v0.4.0" }), "unknown");
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "  ", installedTag: "v0.4.0" }), "unknown");
+});
+
