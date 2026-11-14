@@ -6631,18 +6631,18 @@ test("warpBuildNotice: equal builds say nothing at all (T9b)", () => {
 test("warpBuildNotice: an unidentifiable proxy names the update, which is what installs identity (T9b)", () => {
 	assert.equal(
 		releaseMod.warpBuildNotice({ running: null, installed: null }),
-		"warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update",
+		"warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /free-bridge-warp-update",
 	);
 	assert.equal(
 		releaseMod.warpBuildNotice({ running: null, installed: "b04459a" }),
-		"warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update",
+		"warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /free-bridge-warp-update",
 	);
 });
 
 test("warpBuildNotice: a different build on disk names both commits (T9b)", () => {
 	assert.equal(
 		releaseMod.warpBuildNotice({ running: "b04459a", installed: "9a1c2f0" }),
-		"the proxy runs b04459a, the installed build is 9a1c2f0 — /warp update",
+		"the proxy runs b04459a, the installed build is 9a1c2f0 — /free-bridge-warp-update",
 	);
 });
 

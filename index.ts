@@ -1686,10 +1686,10 @@ export function parseWarpBuildVersion(text: string): string | null {
  *  update would advise a downgrade, so it says nothing instead of misleading. */
 export function warpBuildNotice({ running, installed }: { running: string | null; installed: string | null }): string | null {
 	if (!running) {
-		return "warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update";
+		return "warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /free-bridge-warp-update";
 	}
 	if (!installed || installed === running) return null;
-	return `the proxy runs ${running}, the installed build is ${installed} — /warp update`;
+	return `the proxy runs ${running}, the installed build is ${installed} — /free-bridge-warp-update`;
 }
 
 /** T9c: what an update really costs, in the exact words shown before consent.
@@ -3616,7 +3616,7 @@ export default async function (pi: ExtensionAPI) {
 		if (runningBin && !sameDir(dirname(runningBin), WARP_INSTALL_DIR)) {
 			ctx.ui.notify(
 				[
-					"pi-free-bridge warp update",
+					"free-bridge-warp-update",
 					`  runs from: ${runningBin}`,
 					`  replaces:  ${binPath}`,
 					"",
@@ -3750,7 +3750,7 @@ export default async function (pi: ExtensionAPI) {
 			}
 		}
 
-		const lines = ["pi-free-bridge warp update", `  target:  ${describeWarpTarget(target)}`];
+		const lines = ["free-bridge-warp-update", `  target:  ${describeWarpTarget(target)}`];
 
 		if (!result) {
 			lines.push(`  the update stopped on an error: ${thrown ?? "no result was reported"}.`, ...restoreNote());
