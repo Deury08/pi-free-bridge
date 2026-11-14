@@ -522,3 +522,34 @@ serves two real egress addresses in distinct /64s — `2a09:bac5:3053:323c::501:
 `2a09:bac5:3057:323c::501:12`. The proxy's `served` counter reads 1 on exactly the
 exit the relay named and 0 on the other, so the credential channel works end to end
 in production. D7 is closed in production by the deployed binary.
+
+L29 (evidence, peer agent, read-only, `path:line`): the three warp capabilities the owner
+asked about, priced.
+
+- **Reconnect without re-enrolling: not possible today**, and for a concrete reason — the
+  `WireGuardConfig` that `RegisterDevice` returns is used to build the tunnel and then
+  discarded. `Exit` (internal/warp/types.go) keeps `PrivateKey`, `Endpoint`, `IPv6`,
+  `tunnel`, `obs`; neither it nor `Tunnel` (tunnel.go:49) keeps `DeviceID` or `Token`.
+  Retaining that cfg plus a `reconnect` verb would make replacing a tunnel cost a
+  `connect-ip`, not a registration. **Whether the egress address is per connection or per
+  device cannot be decided from the code**: it is Cloudflare's policy, and this pool has
+  never reconnected the same device, so there is no observation either. If it is per
+  connection, round 2 costs zero enrollments; if it is per device, reconnecting returns
+  the same burnt address and only helps D6 (a dead tunnel whose IP is not burnt). Only an
+  experiment answers it, and the experiment needs the cfg retained first.
+- **Liveness as a fact: the measurement already exists.** `traceEgressIP` /
+  `observeEgressIP` (internal/warp/facts.go) already drive one health check per MASQUE exit
+  and return `(ip, family, at, error)`; `egressObservation` stores `ip`, `family`,
+  `observedAt` and **drops the error**, which is why a failure only shows up as an
+  `observed_at` that stops renewing. Publishing `trace:{ok,error,at}` is a small change
+  with no new measurement, provided readers stay behind the 45 s cache.
+- **Registration pressure: nothing is kept.** `Pool` holds `recycling`, `swapping`,
+  `swapTarget`, `retrying`, `fillRetry*`, `replaceAttempts*` and no last-error or
+  retry-until field; `replaceExit`'s backoff is local to its goroutine and the error is
+  logged and lost. So this is not exposing an existing fact but creating one, with its
+  semantics still to define.
+
+L30 (correction to the peer's closing line): the peer reported that "the live 8789 still
+runs the old binary in memory". That was already false when it was written — `/health` on
+8789 answers `capabilities:{exits:true}` and `/exits` serves both real IPv6 egress
+addresses. The peer was working from its own earlier notes.
