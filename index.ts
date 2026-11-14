@@ -3337,20 +3337,69 @@ export function visibleMenuIndices(state: {
 	const runnable = state.bunReady || state.binaryPresent;
 	const visible: number[] = [];
 	for (let index = 0; index < MENU_ITEMS.length; index++) {
-		// Installing the proxy needs neither the relay nor a warp binary to exist:
-		// it is the row that creates the second one, so hiding it behind its own
-		// absence would make it unreachable exactly when it is needed. It is asked
-		// for explicitly, so it always appears.
-		if (index === MENU_UPDATE_WARP) {
-			visible.push(index);
+		if (index === MENU_INSTALL) {
+			// The install row exists for the machine that has no other way to run the
+			// relay. With Bun present the relay source already ships in this package
+			// and npm carries its updates, so a compiled copy changes nothing.
+			if (!state.bunReady) visible.push(index);
 			continue;
 		}
-		if (index === MENU_INSTALL && state.bunReady) continue;
-		if (index !== MENU_INSTALL && !runnable) continue;
+		// Everything else needs a runnable relay: a binary, or Bun. On a machine
+		// with neither, the menu is the single row that can fix that and nothing
+		// else — every other action could only fail.
+		if (!runnable) continue;
 		if (index === MENU_RECYCLE && !state.warpReady) continue;
 		visible.push(index);
 	}
 	return visible;
+}
+
+/** What a row can honestly say about being behind. The label carries a fact, not
+ *  a promise: with no installed tag there is nothing to compare, so it names the
+ *  published version instead of claiming "up to date". A row that cannot read
+ *  the release says so — it never guesses "al día". */
+export function menuUpdateSuffix({
+	latestTag,
+	currentTag,
+}: {
+	latestTag: string | null;
+	currentTag: string | null;
+}): string {
+	if (!latestTag) return " — no se pudo verificar la última versión";
+	const latest = String(latestTag).trim().replace(/^v/, "");
+	if (!latest) return " — no se pudo verificar la última versión";
+	if (!currentTag) return ` — última publicada: ${latest}`;
+	const current = String(currentTag).trim().replace(/^v/, "");
+	if (current === latest) return ` — al día (${latest})`;
+	return ` — hay ${latest}, corre ${current}`;
+}
+
+/** The latest published tag, cached. The menu opens far more often than a
+ *  release is published, and an unauthenticated GitHub API tolerates sixty reads
+ *  an hour: without this, opening the menu a few times would spend them. A
+ *  failure is cached too, as "no answer", so a broken network does not turn every
+ *  menu open into an eight-second wait. */
+const LATEST_TAG_TTL_MS = 5 * 60 * 1000;
+const latestTagCache = new Map<string, { at: number; tag: string | null }>();
+
+export async function latestPublishedTag(url: string, now = Date.now()): Promise<string | null> {
+	const hit = latestTagCache.get(url);
+	if (hit && now - hit.at < LATEST_TAG_TTL_MS) return hit.tag;
+	let tag: string | null = null;
+	try {
+		const res = await fetch(url, {
+			headers: { "user-agent": "pi-free-bridge" },
+			signal: AbortSignal.timeout(8000),
+		});
+		if (res.ok) {
+			const body = (await res.json()) as { tag_name?: unknown };
+			tag = typeof body.tag_name === "string" ? body.tag_name : null;
+		}
+	} catch {
+		tag = null;
+	}
+	latestTagCache.set(url, { at: now, tag });
+	return tag;
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -4124,12 +4173,28 @@ export default async function (pi: ExtensionAPI) {
 		const section = sections[pickedSector];
 		if (!section) return;
 
-		const labels = section.actions.map((index) => {
-			const item = MENU_ITEMS[index];
-			if (index === MENU_WARP) return `${item} — ahora: ${warpNow}`;
-			if (index === MENU_WIRE) return `${item} — ahora: ${wireNow}`;
-			return item;
-		});
+		// The label carries a fact, so building it may read a release. Only the
+		// sector the user actually opened pays for it, and the read is cached.
+		const labels: string[] = [];
+		for (const index of section.actions) {
+			let label: string = MENU_ITEMS[index];
+			if (index === MENU_WARP) label = `${label} — ahora: ${warpNow}`;
+			if (index === MENU_WIRE) label = `${label} — ahora: ${wireNow}`;
+			if (index === MENU_UPDATE_WARP) {
+				label = `${label}${menuUpdateSuffix({
+					latestTag: await latestPublishedTag(WARP_RELEASE_API),
+					currentTag: readWarpInstallRecord()?.tag ?? null,
+				})}`;
+			}
+			if (index === MENU_INSTALL) {
+				const relayHealth = await fetchRelayHealth(RELAY_PORT);
+				label = `${label}${menuUpdateSuffix({
+					latestTag: await latestPublishedTag(RELAY_RELEASE_API),
+					currentTag: parseRelayVersion(relayHealth) ?? null,
+				})}`;
+			}
+			labels.push(label);
+		}
 
 		const picked = await pickMenuItem(ctx, labels);
 		if (picked === undefined) return;
