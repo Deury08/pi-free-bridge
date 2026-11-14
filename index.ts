@@ -1888,6 +1888,65 @@ async function stopWarpFromMenu(healthUrl: string): Promise<"stopped" | "nothing
 	});
 }
 
+/** The five answers the stop policy can give, named once so the swap gate and
+ *  the stop itself cannot drift apart. */
+export type WarpStopResult = "stopped" | "nothing-to-stop" | "unknown-pid" | "refused" | "unverified";
+
+/** D11: a swap replaces the binary underneath the proxy, so it may go ahead only
+ *  when the old process is provably gone. "nothing-to-stop" is fine — there is
+ *  nothing to replace underneath. The three refusals are not: an unstopped proxy
+ *  still serving an old binary is exactly the wrong kill this policy forbids. */
+export async function warpStopForSwap(healthUrl: string, stop: (url: string) => Promise<WarpStopResult> = stopWarpFromMenu): Promise<boolean> {
+	try {
+		const result = await stop(healthUrl);
+		return result === "stopped" || result === "nothing-to-stop";
+	} catch {
+		// A stop that threw proved nothing, so it is not permission to replace.
+		return false;
+	}
+}
+
+/** How long the poll waits between probes. Together with the attempt count this
+ *  is the whole deadline: no probe can extend it. */
+const WARP_RESTART_POLL_MS = 250;
+
+export type StartAndVerifyDeps = {
+	start: () => Promise<unknown>;
+	/** The proxy's `/health` body, or undefined when nothing answers. */
+	probe: () => Promise<unknown>;
+	sleep: (ms: number) => Promise<void>;
+	attempts?: number;
+};
+
+/** D11 / S30c: relaunch the proxy, then wait for the new binary to prove itself
+ *  with `warpReadyFact`. The wait is a fixed number of probes, never an open
+ *  loop, so an old build that keeps serving fails the swap instead of hanging
+ *  the update. Never throws: the caller has to be able to report the failure. */
+export async function warpStartAndVerify(deps: StartAndVerifyDeps): Promise<boolean> {
+	try {
+		await deps.start();
+	} catch {
+		// Nothing was launched, so there is nothing that could turn ready.
+		return false;
+	}
+	const attempts = deps.attempts ?? 20;
+	for (let i = 0; i < attempts; i++) {
+		try {
+			if (warpReadyFact(await deps.probe())) return true;
+		} catch {
+			// A probe that fails is a proxy that is not ready yet, nothing more.
+		}
+		if (i < attempts - 1) {
+			try {
+				await deps.sleep(WARP_RESTART_POLL_MS);
+			} catch {
+				// A failed wait still leaves the remaining attempts to spend.
+			}
+		}
+	}
+	return false;
+}
+
 /** D11 / S30c: the new binary is in place only if the answering proxy proves it:
  *  an identity, the exit capability, and at least one exit with an address. A
  *  restart that leaves the old build serving fails here, which is the whole

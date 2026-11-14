@@ -6765,3 +6765,88 @@ test("warpReadyFact: a new binary proves itself with identity, capability and an
 	assert.equal(releaseMod.warpReadyFact({ ...good, exits: [] }), false);
 	assert.equal(releaseMod.warpReadyFact({ ...good, exits: [{ id: "warp-1" }] }), false, "an exit without an address is not eligible");
 });
+
+// D11: a swap replaces a binary underneath a running proxy, so it may go ahead
+// only when the old process is provably gone. Only two of the five answers prove
+// that; the three refusals mean the proxy may still be serving, so replacing it
+// would be the wrong kill the stop policy exists to prevent.
+test("warpStopForSwap: only a stop it can prove lets the binary be replaced (D11)", async () => {
+	const expected = {
+		stopped: true,
+		"nothing-to-stop": true,
+		"unknown-pid": false,
+		refused: false,
+		unverified: false,
+	};
+	for (const [result, allowed] of Object.entries(expected)) {
+		let called = 0;
+		let seenUrl;
+		const swapped = await releaseMod.warpStopForSwap("http://127.0.0.1:8789/health", async (url) => {
+			called += 1;
+			seenUrl = url;
+			return result;
+		});
+		assert.equal(swapped, allowed, `${result} allows the swap: ${allowed}`);
+		assert.equal(called, 1, "the stop is asked exactly once");
+		assert.equal(seenUrl, "http://127.0.0.1:8789/health", "the health URL is handed to the stop");
+	}
+});
+
+// D11: the restarted proxy must prove it is the new binary. One not-ready probe
+// is a restart still coming up, not a failure, so the poll must continue.
+test("warpStartAndVerify: the restarted proxy is ready on the second probe (D11)", async () => {
+	const ready = { build: { commit: "b04459a" }, capabilities: { exits: true }, exits: [{ id: "warp-1", ip: "2a09::1" }] };
+	let starts = 0;
+	let probes = 0;
+	let sleeps = 0;
+	const ok = await releaseMod.warpStartAndVerify({
+		start: async () => {
+			starts += 1;
+		},
+		probe: async () => {
+			probes += 1;
+			return probes >= 2 ? ready : { build: { commit: "unknown" }, capabilities: { exits: true }, exits: [] };
+		},
+		sleep: async () => {
+			sleeps += 1;
+		},
+		attempts: 4,
+	});
+	assert.equal(ok, true, "a proxy that turns ready is a successful start");
+	assert.equal(starts, 1, "the proxy is launched once");
+	assert.equal(probes, 2, "the poll stops as soon as the fact is proven");
+	assert.equal(sleeps, 1, "one wait between the two probes");
+});
+
+// D11: a proxy that never proves itself must fail the swap quickly and honestly,
+// bounded by a fixed number of probes, and it must not throw — the update has to
+// report the failure, not die inside it.
+test("warpStartAndVerify: a proxy that never proves itself fails within a bounded number of probes (D11)", async () => {
+	let probes = 0;
+	const ok = await releaseMod.warpStartAndVerify({
+		start: async () => undefined,
+		probe: async () => {
+			probes += 1;
+			return { build: { commit: "unknown" }, capabilities: { exits: false }, exits: [] };
+		},
+		sleep: async () => undefined,
+		attempts: 3,
+	});
+	assert.equal(ok, false, "the old build serving is not a successful start");
+	assert.equal(probes, 3, "the deadline is a fixed number of probes, never an open loop");
+
+	let afterThrow = 0;
+	const survived = await releaseMod.warpStartAndVerify({
+		start: async () => {
+			throw new Error("spawn failed");
+		},
+		probe: async () => {
+			afterThrow += 1;
+			return undefined;
+		},
+		sleep: async () => undefined,
+		attempts: 3,
+	});
+	assert.equal(survived, false, "a launch that throws is a false result, not an exception");
+	assert.equal(afterThrow, 0, "nothing is probed when nothing was launched");
+});
