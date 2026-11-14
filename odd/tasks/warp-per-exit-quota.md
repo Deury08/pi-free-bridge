@@ -157,6 +157,10 @@ If any 429 in round 1 classified as `session_suspect` (`classifyGate429`), the
 cause is not the egress: no rotation, the original 429 is delivered. The same
 `warpSwapDecision` that already decides whether a swap is worth its enrollment
 gates round 2, so a long `retry-after` never buys a rotation that cannot help.
+**Round 2 costs two enrollments, not one.** The proxy's `RecycleAll` rotates every
+exit that is not cooling down, in parallel, and each replacement registers a new
+device, so a rotation over two healthy exits spends two enrollments on the same
+rate-limited registration.
 
 S22. The client sees **exactly one 429 per request**, and it is the terminal one.
 The delivered response is the original rebuilt byte-exact with `forwardedHeaders`
@@ -168,6 +172,16 @@ S23. Every rung is observable. `/health` reports how many round-1 cross-exit
 attempts were made, how many round-2 rotations ran, and how many requests ended
 in a terminal 429, so a ladder that is quietly burning enrollments is visible in
 the same place the ledger already is.
+
+S26. The proxy's rotation contract, as measured by the peer (`path:line`, installed
+binary, unchanged by the feature branch): the `POST /recycle` body reports
+`recycling:true` **unconditionally**, including when nothing started, so it is never
+evidence of progress; the truthful field is `/health.recycling`, which is the pool's
+own flag and clears when the rotation finishes. Exit ids after a rotation are always
+new (`warp-<unixnano>`), never reused. The number of exits that come back is **not
+guaranteed**: a replacement that fails permanently releases its slot, so the pool may
+publish two, one, or none. The ladder therefore counts what the pool publishes and
+must handle all three, and never infers a count.
 
 S24. The ladder terminates by construction. A request spends at most one attempt
 per eligible exit in round 1 plus one attempt per exit the pool publishes after a
@@ -422,8 +436,20 @@ escalera inerna nuevamente y ahi no hace el rety cuando llega al cliente el segu
 429»
 
 L21 (decision, asked and answered): round 2 is **automatic** — the relay rotates and
-retries on its own, and the client sees a single terminal 429. The cost was stated
-before choosing: one enrollment per request that reaches round 2.
+retries on its own, and the client sees a single terminal 429. **The cost I stated
+when asking was wrong**: I said one enrollment, and `RecycleAll` spends two (L24). The
+choice was made on the correct direction — free rung first, one paid rotation at
+most — but the price is double what the user was told.
+
+L24 (evidence, peer agent, `path:line` from the installed binary): a recycle rotates
+**every** exit not in cooldown, in parallel (`RecycleAll`, pool.go:566-600), each via
+`replaceExit` → `buildExit` → `createExit` → `RegisterDevice` (pool.go:528), so a
+rotation over two healthy exits spends **two enrollments and two devices**. The POST
+`/recycle` body sets `recycling:true` unconditionally (`recycleHandler`, main.go:266+),
+even when a concurrent rotation meant `started == false`, so it proves nothing;
+`/health.recycling` is the pool's own flag and clears when the WaitGroup finishes.
+Ids are new every time (`warp-<unixnano>`), and the count is not guaranteed — a
+permanently failed replacement releases its slot, so the pool can return 0, 1 or 2.
 
 L22 (user, constraint): «pero el proxy debe ser agnostico a eso». So S25: the ladder
 is relay policy end to end. The proxy keeps only facts and verbs, and never learns
