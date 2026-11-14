@@ -3890,6 +3890,32 @@ export default async function (pi: ExtensionAPI) {
 		// Nothing is downloaded at Pi startup.
 		await ensureWarpWithPrompt(ctx);
 
+		// T9b: the one place the build-drift notice is shown. It runs after
+		// ensureWarpWithPrompt, so the proxy has answered and its build is a fact
+		// rather than a guess; the installed side is the record the update command
+		// wrote, so nothing is spawned to ask a binary its version. Silence when the
+		// two agree, when the record is missing, or when the lookup fails: a notice
+		// that cannot name a real drift is noise, and an error here must never
+		// stop the menu.
+		try {
+			const drift = await warpBuildDrift({
+				fetchProxyBuild: async () => {
+					const response = await fetch(warpTarget.healthUrl);
+					if (!response.ok) return null;
+					const body = (await response.json()) as { build?: { commit?: unknown } };
+					// Go publishes the literal "unknown" for a build with no injected
+					// commit (S25: the proxy states facts). That is not an identity, so it
+					// must not become the "running" side of a comparison.
+					const commit = body.build?.commit;
+					return typeof commit === "string" && commit !== "unknown" ? commit : null;
+				},
+				readInstalledBuild: () => readWarpInstallRecord()?.commit ?? null,
+			});
+			if (drift) ctx.ui.notify(drift, "warning");
+		} catch {
+			// No answer is not a drift.
+		}
+
 		// Menú rápido: cambiar el modo sin tener que escribirlo completo.
 		// Usa ctx.ui.select (opciones seleccionables) cuando Pi lo expone,
 		// igual que /gentle:yolo; si no, cae a confirmaciones encadenadas.
