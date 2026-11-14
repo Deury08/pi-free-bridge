@@ -6612,3 +6612,12 @@ test("warpUpdateDecision: no latest tag is unknown, which is not 'update' (T9c)"
 	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "  ", installedTag: "v0.4.0" }), "unknown");
 });
 
+
+// D10: the port the relay listens on and the variable its clash message names
+// must be the same one, otherwise following the advice cannot change anything.
+test("D10: the listen port reads the variable the error message names", async () => {
+	const { resolveListenPort } = await import("../relay.mjs");
+	assert.equal(resolveListenPort({ PI_FREE_BRIDGE_RELAY_PORT: "9123", PORT: "8788" }), 9123);
+	assert.equal(resolveListenPort({ PORT: "8788" }), 8788, "PORT stays supported for the spawn path");
+	assert.ok(Number.isNaN(resolveListenPort({})), "no port named is not a port");
+});

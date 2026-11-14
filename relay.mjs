@@ -1299,6 +1299,15 @@ export function nearestQuotaReset(ledger, now = Date.now()) {
 	return nearest;
 }
 
+/** D10: the variable the clash message tells you to set is the variable the
+ *  relay actually reads. `PI_FREE_BRIDGE_RELAY_PORT` was named in the advice
+ *  while only `PORT` was ever read, so following the advice changed nothing.
+ *  `PORT` stays supported for the existing spawn path. */
+export function resolveListenPort(env = process.env) {
+	const raw = env.PI_FREE_BRIDGE_RELAY_PORT ?? env.PORT ?? "";
+	return Number.parseInt(String(raw).trim(), 10);
+}
+
 /** Pure: what `/health` publishes about the ledger. `nearestResetInMs` is a
  *  remaining window, like `localParkedForMs`, because that is the number a human
  *  reads; 0 means nothing is parked (S12).
@@ -3412,7 +3421,7 @@ export async function handle(req, res, config) {
 }
 
 async function startServer() {
-	const parsedPort = Number.parseInt(process.env.PORT ?? "", 10);
+	const parsedPort = resolveListenPort();
 	const port = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort < 65536 ? parsedPort : DEFAULT_PORT;
 
 	// S31: resolve the session before listening, so a missing id is a clear
