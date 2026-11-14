@@ -553,3 +553,26 @@ L30 (correction to the peer's closing line): the peer reported that "the live 87
 runs the old binary in memory". That was already false when it was written — `/health` on
 8789 answers `capabilities:{exits:true}` and `/exits` serves both real IPv6 egress
 addresses. The peer was working from its own earlier notes.
+
+L31 (delivery, T7 thin layer, verified by the parent): 287 pass / 0 fail, no timeouts,
++193/-5 in relay.mjs and +218 in the tests. The free round and the terminal rule landed
+as a layer on top: no line of `swapWarpExit`, `waitForPoolReplacement`, `resendWarpOnce`,
+`rotateWarp`, `resendAfterRotation` or `warpSwapDecision` was modified. The first attempt
+at this task produced 1068 lines, six failures and a test that hung the file for 150 s; it
+was cancelled with the brief narrowed to two behaviours and a hard no-unbounded-wait rule.
+
+Two gaps the worker declared, recorded rather than buried:
+
+- **S28 is only partly met on the paid path.** `resendWarpOnce` returns `undefined` when
+  the resend also refuses, so a terminal 429 that follows a paid resend carries round 1's
+  freshest `retry-after`, not the resend's. The rule says the last real refusal wins;
+  today the last *raw* refusal wins. Fixing it needs `resendWarpOnce`, deliberately out of
+  scope.
+- **A behaviour change on shared code.** While the whole pool is parked,
+  `preferredExitForAttempt` now names the last candidate instead of sending no credential,
+  so the pre-existing unattributed plain-proxy request no longer happens for structured
+  proxies. This is what S28 asks for ("take the last one and make the request"), and it is
+  pinned by a test, but it changes what every request does in that state and needs the
+  owner's explicit acceptance. Side effect: fully parked, one client request can spend two
+  real attempts against parked exits.
+
