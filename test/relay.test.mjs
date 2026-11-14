@@ -6850,3 +6850,176 @@ test("warpStartAndVerify: a proxy that never proves itself fails within a bounde
 	assert.equal(survived, false, "a launch that throws is a false result, not an exception");
 	assert.equal(afterThrow, 0, "nothing is probed when nothing was launched");
 });
+
+// ---------------------------------------------------------------------------
+// The update orchestration, with every effect injected (T9c).
+//
+// Nothing here downloads, swaps or talks to the proxy: each effect is a fake
+// counted by the helper below, so "nothing was downloaded" is an observed fact
+// rather than a claim. The order is the contract: decision, consent, download,
+// swap, then read the running commit and write the record.
+// ---------------------------------------------------------------------------
+
+const DOWNLOADED_RELAY = "/tmp/pi-free-bridge-relay";
+
+function updateFakes({
+	latestTag = async () => "v0.5.0",
+	installedTag = "v0.4.0",
+	confirmAnswer = true,
+	downloadFails = false,
+	swapResult = { ok: true, rolledBack: false },
+	runningCommit = "9f1c2ab",
+} = {}) {
+	const calls = { latestTag: 0, confirm: 0, download: 0, swap: 0, readRunningCommit: 0, writeRecord: 0 };
+	const written = [];
+	const swaps = [];
+	const deps = {
+		latestTag: async () => {
+			calls.latestTag += 1;
+			return latestTag();
+		},
+		installedRecord: () => (installedTag === null ? undefined : { tag: installedTag, commit: "b04459a" }),
+		confirm: async () => {
+			calls.confirm += 1;
+			return confirmAnswer;
+		},
+		download: async () => {
+			calls.download += 1;
+			return downloadFails ? undefined : DOWNLOADED_RELAY;
+		},
+		swap: async (path, tag) => {
+			calls.swap += 1;
+			swaps.push({ path, tag });
+			return swapResult;
+		},
+		readRunningCommit: async () => {
+			calls.readRunningCommit += 1;
+			return runningCommit;
+		},
+		writeRecord: (record) => {
+			calls.writeRecord += 1;
+			written.push(record);
+		},
+	};
+	return { deps, calls, written, swaps };
+}
+
+// The text shown before the confirm is the whole consent: it has to name the
+// real cost, because "a 5 MB download" would hide it.
+test("warpUpdateCostLines: the cost shown before confirming names every price of the swap (T9c)", () => {
+	const text = releaseMod.warpUpdateCostLines();
+	const lines = Array.isArray(text) ? text : [text];
+	const joined = lines.join("\n");
+	assert.match(joined, /two enrollments/, "the two enrollments are named");
+	assert.match(joined, /3-5 s/, "the 3-5 s without service are named");
+	assert.match(joined, /new egress addresses/, "the new egress addresses are named");
+	assert.match(joined, /every parked entry stops matching a live exit/, "the parked entries are named");
+	assert.match(joined, /(nothing is deleted|never deleted)/i, "and that they are never deleted");
+	assert.match(joined, /shared/, "the proxy is named as shared");
+	assert.match(joined, /(another Pi).*(loses service)/i, "so another Pi using it loses service too");
+	assert.ok(
+		lines.filter((line) => line.trim()).length >= 5,
+		"the cost is more than one aggregate sentence",
+	);
+});
+
+// Nothing to install means nothing to ask and nothing to download. An
+// unreadable release is its own answer, never "there is an update".
+test("updateWarpBinary: up-to-date never confirms, and an unreadable release is its own answer (T9c)", async () => {
+	const current = updateFakes({ installedTag: "0.5.0" });
+	const result = await releaseMod.updateWarpBinary(current.deps);
+	assert.equal(result.status, "up-to-date");
+	assert.equal(result.tag, "v0.5.0");
+	assert.equal(current.calls.confirm, 0, "no consent is asked when there is nothing to install");
+	assert.equal(current.calls.download, 0, "nothing is downloaded");
+	assert.equal(current.calls.swap, 0);
+
+	const unreadable = updateFakes({ latestTag: async () => null });
+	const unknown = await releaseMod.updateWarpBinary(unreadable.deps);
+	assert.equal(unknown.status, "unknown", "an unreadable release is not an update");
+	assert.match(unknown.reason, /release/i, "it names the release it could not read");
+	assert.equal(unreadable.calls.confirm, 0, "an unknown release never asks for consent");
+	assert.equal(unreadable.calls.download, 0, "an unknown release downloads nothing");
+	assert.equal(unreadable.calls.writeRecord, 0);
+});
+
+// A no at the confirm is a complete answer: nothing is fetched, nothing is
+// touched, and no record claims an install that never happened.
+test("updateWarpBinary: a declined confirmation downloads nothing and changes nothing (T9c)", async () => {
+	const fakes = updateFakes({ confirmAnswer: false });
+	const result = await releaseMod.updateWarpBinary(fakes.deps);
+	assert.equal(result.status, "declined");
+	assert.equal(fakes.calls.confirm, 1, "consent is asked exactly once");
+	assert.equal(fakes.calls.download, 0, "a declined update downloads nothing");
+	assert.equal(fakes.calls.swap, 0, "a declined update swaps nothing");
+	assert.equal(fakes.calls.readRunningCommit, 0);
+	assert.equal(fakes.calls.writeRecord, 0, "no record is written");
+	assert.deepEqual(fakes.written, []);
+});
+
+// A download that returns nothing must leave the install exactly as it was and
+// say so plainly: the proxy is still running the binary it already had.
+test("updateWarpBinary: a failed download changes nothing and says so (T9c)", async () => {
+	const fakes = updateFakes({ downloadFails: true });
+	const result = await releaseMod.updateWarpBinary(fakes.deps);
+	assert.equal(result.status, "failed");
+	assert.match(result.reason, /nothing was changed/i, "it says nothing was changed");
+	assert.equal(fakes.calls.download, 1);
+	assert.equal(fakes.calls.swap, 0, "no swap runs on a download that never landed");
+	assert.equal(fakes.calls.readRunningCommit, 0);
+	assert.equal(fakes.calls.writeRecord, 0, "no record is written for an install that failed");
+	assert.deepEqual(fakes.written, []);
+});
+
+// A swap that restored the previous binary reports the rollback with its own
+// reason. One that failed without restoring has to say both facts plainly.
+test("updateWarpBinary: a rolled-back swap reports the rollback with its reason (T9c)", async () => {
+	const rolledBack = updateFakes({
+		swapResult: { ok: false, rolledBack: true, reason: "the new binary never answered /health" },
+	});
+	const result = await releaseMod.updateWarpBinary(rolledBack.deps);
+	assert.equal(result.status, "rolled-back");
+	assert.equal(result.reason, "the new binary never answered /health", "the swap's own reason is kept");
+	assert.equal(rolledBack.calls.swap, 1);
+	assert.equal(rolledBack.calls.readRunningCommit, 0, "a rolled-back swap never claims a commit");
+	assert.equal(rolledBack.calls.writeRecord, 0, "a rolled-back swap writes no record");
+	assert.deepEqual(rolledBack.written, []);
+
+	const notRestored = updateFakes({
+		swapResult: { ok: false, rolledBack: false, reason: "the relay would not stop" },
+	});
+	const failed = await releaseMod.updateWarpBinary(notRestored.deps);
+	assert.equal(failed.status, "failed");
+	assert.match(failed.reason, /did not prove itself/, "it says the install did not prove itself");
+	assert.match(failed.reason, /(was not restored|not restored)/, "and that the old binary was not restored");
+	assert.equal(notRestored.calls.writeRecord, 0);
+	assert.deepEqual(notRestored.written, []);
+});
+
+// Success is not the swap returning ok: it is the proxy reporting the commit it
+// runs, and that commit is what the record keeps. A null commit is not success.
+test("updateWarpBinary: success writes the record with the commit read from the proxy, and a null commit writes nothing (T9c)", async () => {
+	const fakes = updateFakes();
+	const result = await releaseMod.updateWarpBinary(fakes.deps);
+	assert.equal(result.status, "updated");
+	assert.equal(result.tag, "v0.5.0");
+	assert.equal(result.commit, "9f1c2ab");
+	assert.deepEqual(
+		fakes.written,
+		[{ tag: "v0.5.0", commit: "9f1c2ab" }],
+		"the record carries the installed tag and the commit the proxy reported",
+	);
+	assert.equal(fakes.calls.writeRecord, 1);
+	assert.deepEqual(
+		fakes.swaps,
+		[{ path: "/tmp/pi-free-bridge-relay", tag: "v0.5.0" }],
+		"the swap gets the downloaded path and the tag",
+	);
+
+	const anonymous = updateFakes({ runningCommit: null });
+	const failed = await releaseMod.updateWarpBinary(anonymous.deps);
+	assert.equal(failed.status, "failed", "a build that does not identify itself is not a success");
+	assert.match(failed.reason, /identif/i, "it says the new build did not identify itself");
+	assert.equal(anonymous.calls.writeRecord, 0, "no record is written without a commit");
+	assert.deepEqual(anonymous.written, []);
+});

@@ -1692,6 +1692,104 @@ export function warpBuildNotice({ running, installed }: { running: string | null
 	return `the proxy runs ${running}, the installed build is ${installed} — /warp update`;
 }
 
+/** T9c: what an update really costs, in the exact words shown before consent.
+ *  The download is the cheap part: stopping the proxy costs two enrollments, a
+ *  few seconds without service, new egress addresses, and the matching of every
+ *  parked entry — the entries survive, they just stop lining up with a live exit.
+ *  And the proxy is shared, so another Pi behind it pays the same seconds. */
+export function warpUpdateCostLines(): string[] {
+	return [
+		"Updating the proxy costs more than the download:",
+		"",
+		"  · two enrollments — the new process registers with the exit service twice before it serves.",
+		"  · 3-5 s with no service at all, between the stop and the moment the new process answers.",
+		"  · new egress addresses — the tunnel comes up from a different pair than the one before.",
+		"  · every parked entry stops matching a live exit. Nothing is deleted: the entries stay",
+		"    exactly where they are, they just stop lining up with an exit that can serve them.",
+		"",
+		"  The proxy is shared: if another Pi talks through it, it loses service during the swap too.",
+	];
+}
+
+export type UpdateWarpBinaryDeps = {
+	/** The tag of the newest published release, or null when it cannot be read. */
+	latestTag: () => Promise<string | null>;
+	/** What this extension installed last, from its record. */
+	installedRecord: () => { tag: string; commit: string } | undefined;
+	confirm: () => Promise<boolean>;
+	/** The verified path of the new binary, or undefined when nothing landed. */
+	download: () => Promise<string | undefined>;
+	swap: (downloaded: string, tag: string) => Promise<{ ok: boolean; rolledBack: boolean; reason?: string }>;
+	/** The commit the running proxy reports for itself, or null when it has none. */
+	readRunningCommit: () => Promise<string | null>;
+	writeRecord: (record: { tag: string; commit: string }) => void;
+};
+
+export type UpdateWarpBinaryResult = {
+	status: "up-to-date" | "unknown" | "declined" | "updated" | "rolled-back" | "failed";
+	tag?: string;
+	commit?: string;
+	reason?: string;
+};
+
+/** T9c: the update, in the only order that is safe. The decision first, because
+ *  an update nobody needs must not even ask for consent; consent before the
+ *  download, because the download is the only step that touches the network;
+ *  the swap after it, because a bad download must never leave the proxy down;
+ *  and the record last, because the only commit worth recording is the one the
+ *  running proxy reports — a swap that returns ok but no identity proved
+ *  nothing. Every effect is a dependency so this can be measured without a
+ *  network, a binary or a running proxy. */
+export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<UpdateWarpBinaryResult> {
+	const latestTag = await deps.latestTag();
+	const installed = deps.installedRecord();
+	const decision = warpUpdateDecision({ latestTag, installedTag: installed?.tag ?? null });
+
+	if (decision === "unknown") {
+		return {
+			status: "unknown",
+			reason: "the release could not be read: with no published tag there is nothing to install and nothing to claim",
+		};
+	}
+	if (decision === "up-to-date") {
+		return { status: "up-to-date", tag: latestTag ?? undefined, commit: installed?.commit || undefined };
+	}
+
+	const tag = String(latestTag).trim();
+	if (!(await deps.confirm())) return { status: "declined", tag };
+
+	const downloaded = await deps.download();
+	if (!downloaded) {
+		return {
+			status: "failed",
+			tag,
+			reason: "the download failed and nothing was changed: the proxy keeps the binary it already had",
+		};
+	}
+
+	const swapped = await deps.swap(downloaded, tag);
+	if (!swapped.ok) {
+		const reason = swapped.reason ?? "no reason was reported";
+		if (swapped.rolledBack) return { status: "rolled-back", tag, reason };
+		return {
+			status: "failed",
+			tag,
+			reason: `${reason}: the install did not prove itself and the old binary was not restored`,
+		};
+	}
+
+	const commit = await deps.readRunningCommit();
+	if (!commit) {
+		return {
+			status: "failed",
+			tag,
+			reason: "the new build was installed but did not identify itself, so what runs cannot be verified — no record was written",
+		};
+	}
+	deps.writeRecord({ tag, commit });
+	return { status: "updated", tag, commit };
+}
+
 /** T9c: is there anything to install? A release publishes its tag and its
  *  assets, never the commit it was built from, and the binary's own `-version`
  *  prints the version constant from the source (v0.2.3 today), not the tag. So
