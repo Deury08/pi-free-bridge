@@ -1483,11 +1483,30 @@ export function warpDeclaredExits(body) {
  *  already reads that endpoint right before choosing an exit, so the declaration
  *  costs nothing there — no probe, no extra hop, and an old binary sees exactly
  *  the traffic it sees today. */
+/** Pure: the proxy's build identity from a `/health` body (S29). Three states,
+ *  never two: an identifiable commit; a proxy that answered without one (the Go
+ *  default is the literal `unknown`, which is absence of identity, not a
+ *  commit); and `undefined` when the body carried no `build` object at all,
+ *  which the caller publishes as `null`. Collapsing "no identity" into "no
+ *  answer" would make the relay claim it never heard from a proxy that did
+ *  answer. */
+export function warpBuildFact(body) {
+	const build = body && typeof body === "object" ? body.build : undefined;
+	if (!build || typeof build !== "object" || Array.isArray(build)) return undefined;
+	const commit = typeof build.commit === "string" ? build.commit.trim() : "";
+	const builtAt = typeof build.built_at === "string" ? build.built_at.trim() : "";
+	return {
+		commit: commit && commit !== "unknown" ? commit : null,
+		builtAt: builtAt || null,
+	};
+}
+
 function recordWarpCapability(proxy, body, now) {
 	warpExitsProbe = {
 		proxy,
 		at: now,
 		value: warpDeclaredExits(body) ? "structured" : "legacy",
+		build: warpBuildFact(body),
 	};
 }
 
@@ -1513,6 +1532,18 @@ export async function warpExitsCapability(config, now = Date.now()) {
 		return "unknown";
 	}
 	return warpExitsProbe?.proxy === proxy ? warpExitsProbe.value : "unknown";
+}
+
+/** The proxy's build identity, from the same cached `/health` read the capability
+ *  question already performs (S29). No extra request: the probe carries the build
+ *  when it recorded one. `null` means no answer yet or a body without `build`;
+ *  `{commit: null}` means the proxy answered but cannot say what it is. */
+export async function warpBuildIdentity(config, now = Date.now()) {
+	const proxy = String(config?.warpProxy ?? "").trim().replace(/\/+$/, "");
+	if (!proxy) return null;
+	await warpExitsCapability(config, now);
+	if (!warpExitsProbe || warpExitsProbe.proxy !== proxy) return null;
+	return warpExitsProbe.build ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -3285,6 +3316,7 @@ export async function handle(req, res, config) {
 		// S11: the capability decides everything below, and it is cached for a
 		// minute, so a diagnostic read rarely asks the proxy anything at all.
 		const warpExits = await warpExitsCapability(config);
+		const warpBuild = await warpBuildIdentity(config);
 		// Only a proxy that publishes the structured route is asked for the list: an
 		// older binary has none, and asking it twice for nothing is a wasted hop.
 		const exitsDetail = warpExits === "structured" ? await readWarpExitsDetail(config) : undefined;
@@ -3339,6 +3371,9 @@ export async function handle(req, res, config) {
 			// S11: what the proxy can actually answer. `legacy` means it has no
 			// `/exits`, so nothing is preferred and nothing claims to be.
 			warpExits: warpExits,
+			// S29: which proxy build is answering, so "installed but not running"
+			// becomes observable instead of inferred. null = no answer.
+			warpBuild: warpBuild,
 			// S9: how many of the listed exits carry an egress address the ledger can
 			// key. A stale address still counts here — the exit exists, it is only not
 			// preferable — so this number is not the routing switch.

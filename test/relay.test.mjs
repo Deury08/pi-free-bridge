@@ -4803,6 +4803,7 @@ import {
 	pruneQuotaLedger,
 	proxyUrlWithExit,
 	quotaEgressKey,
+	warpBuildFact,
 	quotaLedgerHealth,
 	quotaLedgerPath,
 	quotaPrefix64,
@@ -6477,3 +6478,55 @@ test("every file download in index.ts streams through readDownloadBody", () => {
 	);
 });
 
+// T9a / S29: the proxy's build identity is a fact the relay republishes, so
+// "which binary is running" stops being a guess. Three states, never two:
+// identifiable, answered without identity (the Go default is "unknown"), and
+// no answer at all.
+test("warpBuildFact: a build that names its commit is reported as an identity (S29)", () => {
+	assert.deepEqual(
+		warpBuildFact({ build: { commit: "b04459a", built_at: "2026-11-14T14:35:36Z" } }),
+		{ commit: "b04459a", builtAt: "2026-11-14T14:35:36Z" },
+	);
+});
+
+test("warpBuildFact: the Go default \"unknown\" is absence of identity, not a commit (S29)", () => {
+	assert.deepEqual(warpBuildFact({ build: { commit: "unknown", built_at: "unknown" } }), {
+		commit: null,
+		builtAt: "unknown",
+	});
+	assert.deepEqual(warpBuildFact({ build: {} }), { commit: null, builtAt: null });
+});
+
+test("warpBuildFact: a body without a build key yields nothing, which /health publishes as null (S29)", () => {
+	assert.equal(warpBuildFact({ ok: true, exits: [] }), undefined);
+	assert.equal(warpBuildFact(undefined), undefined);
+	assert.equal(warpBuildFact({ build: "b04459a" }), undefined);
+});
+
+test("/health republishes the proxy's build identity, and null when it has none (S29)", async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => healthJson({ ok: true, capabilities: { exits: true }, build: { commit: "b04459a", built_at: "2026-11-14T14:35:36Z" } });
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await handle({ method: "GET", url: "/health", headers: {}, on() {} }, res, { ...FORWARD_CONFIG, warpMode: "off" });
+		const body = JSON.parse(res.body());
+		assert.deepEqual(body.warpBuild, { commit: "b04459a", builtAt: "2026-11-14T14:35:36Z" });
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+
+	// A proxy that answers without a build object publishes null: the relay has
+	// no identity to report, and inventing one would defeat the whole point.
+	globalThis.fetch = async () => healthJson({ ok: true, capabilities: { exits: true } });
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await handle({ method: "GET", url: "/health", headers: {}, on() {} }, res, { ...FORWARD_CONFIG, warpMode: "off" });
+		const body = JSON.parse(res.body());
+		assert.ok(Object.prototype.hasOwnProperty.call(body, "warpBuild"), "warpBuild must be present, not absent");
+		assert.equal(body.warpBuild, null);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
