@@ -13,16 +13,18 @@
 import {
 	appendFileSync,
 	existsSync,
+	mkdirSync,
 	readFileSync,
 	readdirSync,
 	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
+	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // ---------------------------------------------------------------------------
@@ -589,13 +591,16 @@ export function egressHeaders(config) {
 	return headers;
 }
 
-function egressFetch(config, pathname, { body }, egress) {
+function egressFetch(config, pathname, { body, proxyUrl } = {}, egress) {
 	const opts = {
 		method: "POST",
 		headers: egressHeaders(config),
 		body,
 	};
-	if (egress === "warp") opts.proxy = config.warpProxy;
+	// S3: an override names one exit (the credential is the only channel that
+	// survives CONNECT, L5). Every caller that passes no override gets exactly the
+	// proxy URL it got before, byte for byte — an older binary sees no difference.
+	if (egress === "warp") opts.proxy = proxyUrl ?? config.warpProxy;
 	return fetch(toUpstreamUrl(config.upstream, pathname), opts);
 }
 
@@ -1023,8 +1028,9 @@ let warpSwapEnabledOverride = true;
 // decision on its own: the ladder does not rotate without a target.
 let tunnelExit = undefined;
 // S16/S17: when the LOCAL egress gets a 429, that IP spent its day. The header
-// says when it resets, so local stops being offered first until then. In memory
-// only — a restart re-learns it with one request that costs no quota (S4).
+// says when it resets, so local stops being offered first until then. This is
+// the fast path a request reads; the ledger file carries the same park across a
+// restart, so a fresh process does not offer the burnt IP again (S10).
 let localParkedUntil = 0;
 
 // How many responses we are DELIVERING right now over the warp tunnel — not how
@@ -1045,6 +1051,634 @@ let deliveringWarpStreams = 0;
 const DRAIN_VALVE_MS = 120_000;
 const DRAIN_POLL_MS = 50;
 let drainValveMs = DRAIN_VALVE_MS;
+
+// ---------------------------------------------------------------------------
+// Quota ledger, keyed by egress IP (S5, S10, S12)
+// ---------------------------------------------------------------------------
+//
+// A gate 429 means one egress IP spent its day, and the reset it carries is an
+// absolute moment. Remembering that per IP — not per exit, not per session — is
+// what lets two live WARP exits take turns instead of burning the same quota
+// twice, and it has to survive a restart: a fresh process that forgot the park
+// spends its first request on an IP the gate already refused (S10).
+//
+// The file is keyed by the egress IP. `prefix64` is derived here, from the
+// address, and never asked of the proxy, which has no /64 notion on the MASQUE
+// pool (S5, S13). The local egress has no IP of its own, so it is remembered
+// under its own name.
+
+/** The only ledger version this module reads or writes. Any other version is
+ *  not ours to interpret, so the file degrades to empty instead of half-reading. */
+export const QUOTA_LEDGER_VERSION = 1;
+
+/** The ledger key of the local egress. It has no egress IP, and the park it
+ *  carries is exactly the one S10 keeps across restarts. */
+export const LOCAL_EGRESS_KEY = "local";
+
+const IPV4_LITERAL = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+/** The four octets of an IPv4 literal, or `undefined`. Octets are read as
+ *  numbers, so a leading zero cannot make two spellings of one address. */
+function ipv4Quads(text) {
+	const match = IPV4_LITERAL.exec(text);
+	if (!match) return undefined;
+	const quads = match.slice(1).map((part) => Number.parseInt(part, 10));
+	return quads.every((quad) => quad >= 0 && quad <= 255) ? quads : undefined;
+}
+
+/** One half of an IPv6 literal, as its 16-bit groups. A trailing dotted quad is
+ *  an IPv4-mapped address and counts as the last two groups. */
+function ipv6Half(text) {
+	if (text === "") return [];
+	const groups = text.split(":");
+	const halves = [];
+	for (let index = 0; index < groups.length; index += 1) {
+		const group = groups[index];
+		if (group.includes(".")) {
+			if (index !== groups.length - 1) return undefined;
+			const quads = ipv4Quads(group);
+			if (!quads) return undefined;
+			halves.push((quads[0] << 8) | quads[1], (quads[2] << 8) | quads[3]);
+			continue;
+		}
+		if (!/^[0-9a-f]{1,4}$/i.test(group)) return undefined;
+		halves.push(Number.parseInt(group, 16));
+	}
+	return halves;
+}
+
+/** The eight 16-bit groups of an IPv6 literal, or `undefined`. `::` stands for
+ *  the run of zero groups that fills the address to eight, and it may appear
+ *  once: twice is not an address. */
+function ipv6Groups(text) {
+	if (!text.includes(":")) return undefined;
+	const halves = text.split("::");
+	if (halves.length > 2) return undefined;
+	const head = ipv6Half(halves[0]);
+	if (!head) return undefined;
+	if (halves.length === 1) return head.length === 8 ? head : undefined;
+	const tail = ipv6Half(halves[1]);
+	if (!tail) return undefined;
+	const fill = 8 - head.length - tail.length;
+	if (fill < 1) return undefined;
+	return [...head, ...new Array(fill).fill(0), ...tail];
+}
+
+/** The canonical spelling of an IPv6 address: lowercase, no leading zeros, and
+ *  the longest run of zero groups compressed to `::` (RFC 5952). One address
+ *  must not become two ledger keys. */
+function formatIpv6(groups) {
+	let start = -1;
+	let length = 0;
+	for (let index = 0; index < groups.length; ) {
+		if (groups[index] !== 0) {
+			index += 1;
+			continue;
+		}
+		let end = index;
+		while (end < groups.length && groups[end] === 0) end += 1;
+		if (end - index > length) {
+			start = index;
+			length = end - index;
+		}
+		index = end;
+	}
+	const hex = groups.map((group) => group.toString(16));
+	if (length < 2) return hex.join(":");
+	return `${hex.slice(0, start).join(":")}::${hex.slice(start + length).join(":")}`;
+}
+
+/** Pure: the ledger key for one egress. A plausible IPv4/IPv6 literal normalises
+ *  to one stable spelling; anything else — a hostname, a pool label, garbage —
+ *  has no key, because a key nothing can match later is worse than no entry. */
+export function quotaEgressKey(ip) {
+	const text = typeof ip === "string" ? ip.trim().replace(/^\[|\]$/g, "").toLowerCase() : "";
+	if (!text) return undefined;
+	const quads = ipv4Quads(text);
+	if (quads) return quads.join(".");
+	const groups = ipv6Groups(text);
+	return groups ? formatIpv6(groups) : undefined;
+}
+
+/** Pure: the /64 an egress sits in, derived from its address (S5, S13). IPv4 has
+ *  no /64, so its literal comes back unchanged; an address that is not an
+ *  address has no prefix at all. The proxy is never asked: the MASQUE pool has
+ *  no /64 to report. */
+export function quotaPrefix64(ip) {
+	const key = quotaEgressKey(ip);
+	if (!key) return undefined;
+	if (ipv4Quads(key)) return key;
+	const prefix = ipv6Groups(key)
+		.slice(0, 4)
+		.map((group) => group.toString(16).padStart(4, "0"));
+	return `${prefix.join(":")}::/64`;
+}
+
+function emptyQuotaLedger() {
+	return { version: QUOTA_LEDGER_VERSION, egresses: {} };
+}
+
+/** One entry in the shape the file carries. An entry without a numeric
+ *  `parked_until` cannot be judged against a clock, so it is dropped: a park
+ *  nobody can compare is not a park. */
+function normalizeQuotaEntry(entry) {
+	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+	if (typeof entry.parked_until !== "number" || !Number.isFinite(entry.parked_until)) return undefined;
+	const text = (value) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
+	const time = (value) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+	return {
+		prefix64: text(entry.prefix64),
+		exit_id: text(entry.exit_id),
+		parked_until: entry.parked_until,
+		observed_at: time(entry.observed_at),
+		reason: text(entry.reason),
+		hits: Number.isInteger(entry.hits) && entry.hits > 0 ? entry.hits : 1,
+	};
+}
+
+/** Pure: the ledger a file holds. Every way a file can be wrong — malformed
+ *  JSON, not an object, another version, an `egresses` that is not an object —
+ *  reads as the empty ledger, and nothing here ever throws: the ledger is a cache
+ *  of what the gate refused, and losing it must not fail a request. */
+export function parseQuotaLedger(text) {
+	let parsed;
+	try {
+		parsed = JSON.parse(typeof text === "string" ? text : "");
+	} catch {
+		return emptyQuotaLedger();
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return emptyQuotaLedger();
+	if (parsed.version !== QUOTA_LEDGER_VERSION) return emptyQuotaLedger();
+	const source = parsed.egresses;
+	if (!source || typeof source !== "object" || Array.isArray(source)) return emptyQuotaLedger();
+	const egresses = {};
+	for (const [key, entry] of Object.entries(source)) {
+		const normalized = normalizeQuotaEntry(entry);
+		if (normalized) egresses[key] = normalized;
+	}
+	return { version: QUOTA_LEDGER_VERSION, egresses };
+}
+
+/** Pure: the file's text. Keys are sorted, so two runs over the same ledger
+ *  write the same bytes and a rewrite stays reviewable. */
+export function serializeQuotaLedger(ledger) {
+	const source = ledger && typeof ledger === "object" && ledger.egresses ? ledger.egresses : {};
+	const sorted = {};
+	for (const key of Object.keys(source).sort()) sorted[key] = source[key];
+	return `${JSON.stringify({ version: QUOTA_LEDGER_VERSION, egresses: sorted })}\n`;
+}
+
+/** Pure: the key an egress is remembered under. The local egress is the one
+ *  egress with no IP, so it is the one key that is not an address. */
+function ledgerKeyFor(ip) {
+	const text = typeof ip === "string" ? ip.trim().toLowerCase() : "";
+	if (text === LOCAL_EGRESS_KEY) return LOCAL_EGRESS_KEY;
+	return quotaEgressKey(ip);
+}
+
+/** Pure: the ledger with one park upserted, never a mutation of the input.
+ *  `hits` counts how often the same egress was parked, so a repeated 429 on one
+ *  address reads as a history instead of a single last value. An egress whose
+ *  key cannot be derived parks nothing: without a key there is nothing a later
+ *  request could match. */
+export function parkQuotaEgress(ledger, { ip, exitId, parkedUntil, reason, now = Date.now() } = {}) {
+	const key = ledgerKeyFor(ip);
+	if (!key) return ledger;
+	if (typeof parkedUntil !== "number" || !Number.isFinite(parkedUntil)) return ledger;
+	const egresses = { ...(ledger && typeof ledger.egresses === "object" && ledger.egresses ? ledger.egresses : {}) };
+	const previous = egresses[key];
+	egresses[key] = {
+		prefix64: quotaPrefix64(key),
+		exit_id: typeof exitId === "string" && exitId.trim() ? exitId.trim() : undefined,
+		parked_until: parkedUntil,
+		observed_at: now,
+		reason: typeof reason === "string" && reason ? reason : undefined,
+		hits: (Number.isInteger(previous?.hits) && previous.hits > 0 ? previous.hits : 0) + 1,
+	};
+	return { version: QUOTA_LEDGER_VERSION, egresses };
+}
+
+/** Pure: the ledger without the parks that already expired. Expiry is a clock
+ *  comparison, not a deletion event, so pruning only ever rewrites the file the
+ *  next write was going to write anyway. */
+export function pruneQuotaLedger(ledger, now = Date.now()) {
+	const source = ledger && typeof ledger.egresses === "object" && ledger.egresses ? ledger.egresses : {};
+	const egresses = {};
+	for (const [key, entry] of Object.entries(source)) {
+		const normalized = normalizeQuotaEntry(entry);
+		if (normalized && normalized.parked_until > now) egresses[key] = normalized;
+	}
+	return { version: QUOTA_LEDGER_VERSION, egresses };
+}
+
+/** Pure: is this egress parked right now? An address that cannot be keyed is
+ *  never parked, and the local egress is asked about by its own key. */
+export function isEgressParked(ledger, ip, now = Date.now()) {
+	const key = ledgerKeyFor(ip);
+	const entry = key && ledger && ledger.egresses ? ledger.egresses[key] : undefined;
+	return Boolean(entry && typeof entry.parked_until === "number" && entry.parked_until > now);
+}
+
+/** Pure: the moment the nearest park ends, or 0 when nothing is parked. It is
+ *  the one number that says how long waiting beats rotating (S9). */
+export function nearestQuotaReset(ledger, now = Date.now()) {
+	let nearest = 0;
+	for (const entry of Object.values(ledger && ledger.egresses ? ledger.egresses : {})) {
+		const until = entry && typeof entry.parked_until === "number" ? entry.parked_until : 0;
+		if (until > now && (nearest === 0 || until < nearest)) nearest = until;
+	}
+	return nearest;
+}
+
+/** Pure: what `/health` publishes about the ledger. `nearestResetInMs` is a
+ *  remaining window, like `localParkedForMs`, because that is the number a human
+ *  reads; 0 means nothing is parked (S12). */
+export function quotaLedgerHealth(ledger, now = Date.now()) {
+	const parked = Object.values(ledger && ledger.egresses ? ledger.egresses : {}).filter(
+		(entry) => entry && typeof entry.parked_until === "number" && entry.parked_until > now,
+	).length;
+	const reset = nearestQuotaReset(ledger, now);
+	return { parked, nearestResetInMs: reset > 0 ? Math.max(0, reset - now) : 0 };
+}
+
+/** Pure: the proxy URL that names one exit. The credential is the only channel
+ *  that survives CONNECT (measured, L5), and its username is the exit id with an
+ *  empty password. Everything else about the URL survives byte for byte, and an
+ *  id that is empty or carries anything outside `[A-Za-z0-9_-]` hands back the
+ *  original string: an id the proxy cannot parse must never reach it (S3, L5). */
+export function proxyUrlWithExit(proxyUrl, exitId) {
+	const url = typeof proxyUrl === "string" ? proxyUrl.trim() : "";
+	// No trimming: an id with whitespace in it is not a valid id to normalise into
+	// one, it is an id the proxy cannot have issued.
+	const id = typeof exitId === "string" ? exitId : "";
+	if (!url || !/^[A-Za-z0-9_-]+$/.test(id)) return proxyUrl;
+	const match = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/?#]*)([\s\S]*)$/.exec(url);
+	if (!match) return proxyUrl;
+	try {
+		new URL(url);
+	} catch {
+		return proxyUrl;
+	}
+	// The authority may already carry a userinfo; the exit id replaces it, since two
+	// credentials on one CONNECT is not a thing.
+	const hostport = match[2].slice(match[2].lastIndexOf("@") + 1);
+	if (!hostport) return proxyUrl;
+	return `${match[1]}${id}:@${hostport}${match[3]}`;
+}
+
+/** Pure: the first exit that is not parked, or `undefined` when every exit is
+ *  parked or none carries an address the ledger can key. This is S9's rule —
+ *  while a clean exit exists, rotating burns an enrollment for nothing — kept
+ *  pure, so the caller decides what to do with the answer. */
+export function chooseWarpExit(entries, ledger, now = Date.now()) {
+	for (const entry of Array.isArray(entries) ? entries : []) {
+		if (!entry || typeof entry !== "object") continue;
+		const id = typeof entry.id === "string" ? entry.id.trim() : "";
+		if (!id) continue;
+		// An exit with no address of its own cannot be proven clean, and a park on it
+		// could not be matched later: it is skipped rather than guessed around.
+		if (!ledgerKeyFor(entry.ip)) continue;
+		if (isEgressParked(ledger, entry.ip, now)) continue;
+		return id;
+	}
+	return undefined;
+}
+
+/** The ledger file: `RELAY_QUOTA_PATH` when the operator set one, otherwise the
+ *  agent directory Pi already uses for its own state. */
+export function quotaLedgerPath(env = process.env) {
+	const override = String(env.RELAY_QUOTA_PATH ?? "").trim();
+	if (override) return override;
+	return join(homedir(), ".pi", "agent", "pi-free-bridge-quota.json");
+}
+
+// The ledger as this process knows it: read once at startup and replaced by
+// every write, so answering a request never costs a disk read. `quotaLedgerFile`
+// is resolved on first use and kept, so `/health` reports the path the writes
+// actually land on.
+let quotaLedger = emptyQuotaLedger();
+let quotaLedgerFile;
+
+function activeQuotaLedgerPath() {
+	if (!quotaLedgerFile) quotaLedgerFile = quotaLedgerPath();
+	return quotaLedgerFile;
+}
+
+/** Read the ledger from disk. A missing, unreadable or foreign file is the empty
+ *  ledger: this is a cache of what the gate refused, and losing it must never
+ *  fail a request. */
+export function readQuotaLedger(path = activeQuotaLedgerPath()) {
+	try {
+		return parseQuotaLedger(readFileSync(path, "utf8"));
+	} catch {
+		return emptyQuotaLedger();
+	}
+}
+
+/** Write the ledger atomically and prune it on the way out: an expired park is
+ *  not worth carrying forward, and a write is the only moment the file is
+ *  rewritten. Best-effort by contract — a full disk or a read-only home logs one
+ *  line and returns, because it must never fail the turn that parked (S10). */
+export function writeQuotaLedger(ledger, path = activeQuotaLedgerPath(), now = Date.now()) {
+	const pruned = pruneQuotaLedger(ledger, now);
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		const temp = `${path}.tmp`;
+		writeFileSync(temp, serializeQuotaLedger(pruned));
+		renameSync(temp, path);
+	} catch (err) {
+		const reason = err && err.message ? err.message : String(err);
+		process.stderr.write(
+			`pi-free-bridge relay: could not write the quota ledger (${reason}) — keeping it in memory\n`,
+		);
+	}
+	return pruned;
+}
+
+/** Startup (S10): load the ledger, drop what already expired, and adopt the local
+ *  park it carries. Without that last step a restart un-parks a burnt local IP
+ *  and spends one request learning what the previous process already knew. */
+export function loadQuotaLedgerAtStartup(path = activeQuotaLedgerPath(), now = Date.now()) {
+	quotaLedgerFile = path;
+	quotaLedger = pruneQuotaLedger(readQuotaLedger(path), now);
+	const local = quotaLedger.egresses[LOCAL_EGRESS_KEY];
+	if (local) localParkedUntil = local.parked_until;
+	return quotaLedger;
+}
+
+/** Record one park in the ledger and persist it. The in-memory ledger is the
+ *  answer requests read, and the file is what the next process reads back. */
+function rememberQuotaPark({ ip, exitId, parkedUntil, reason, now = Date.now() }) {
+	quotaLedger = writeQuotaLedger(
+		parkQuotaEgress(quotaLedger, { ip, exitId, parkedUntil, reason, now }),
+		activeQuotaLedgerPath(),
+		now,
+	);
+	return quotaLedger;
+}
+
+// ---------------------------------------------------------------------------
+// Proxy capability detection (S11)
+// ---------------------------------------------------------------------------
+//
+// The relay hides its per-request choice in the proxy credential, which only
+// means something to a proxy that reads it. An older binary has no
+// `GET /exits` — and therefore no exit to prefer — so the relay must not claim it
+// routes, and `/health` reports the truth instead of a preference that nothing
+// honours.
+//
+// The capability is DECLARED, never probed. Probing `/exits` on a binary without
+// that route lands in the proxy's catch-all, and the catch-all defect (D7) charges
+// the request to an exit: 30 minutes out of rotation for one diagnostic read. The
+// owner's live binary has that defect today, so a probe is not a harmless question.
+// `/health` is a real route on every build, so that is where the question is asked.
+
+/** The probe's own bound. It rides on `/health`, which a human waits for, so it
+ *  may never outlive a second's patience. */
+const WARP_EXITS_TIMEOUT_MS = 2_000;
+/** One minute: a proxy is restarted by a human, not by the second, and a probe
+ *  per `/health` would be a request to the proxy for every diagnostic read. */
+const WARP_EXITS_TTL_MS = 60_000;
+
+let warpExitsProbe;
+
+/** Pure: does this `/health` body declare the structured exits route? The proxy
+ *  states it additively as `"capabilities": {"exits": true}`, and the shape is
+ *  nested so it can grow (`capabilities.swap`, `capabilities.prefer`) without flat
+ *  name collisions. An older binary does not carry the key at all — absence, never
+ *  `false`, because absence cannot be faked by a build that lacks the route. */
+export function warpDeclaredExits(body) {
+	if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+	const capabilities = body.capabilities;
+	return Boolean(capabilities && typeof capabilities === "object" && capabilities.exits === true);
+}
+
+/** Record what a `/health` read said about the capability. The request path
+ *  already reads that endpoint right before choosing an exit, so the declaration
+ *  costs nothing there — no probe, no extra hop, and an old binary sees exactly
+ *  the traffic it sees today. */
+function recordWarpCapability(proxy, body, now) {
+	warpExitsProbe = {
+		proxy,
+		at: now,
+		value: warpDeclaredExits(body) ? "structured" : "legacy",
+	};
+}
+
+/** The proxy's own declaration, from the last `/health` read. No credential is
+ *  sent: this is the question that decides whether a credential would mean
+ *  anything. `legacy` is a proxy that answered without declaring the route,
+ *  `unknown` is no evidence either way — nothing read yet, or a proxy that did
+ *  not answer at all. On a cold cache it reads `/health`, which is a real route
+ *  on every build; it never asks for `/exits`, because a binary without that
+ *  route sends the probe into its catch-all and the catch-all defect charges the
+ *  request to an exit (D7, D9). */
+export async function warpExitsCapability(config, now = Date.now()) {
+	const proxy = String(config?.warpProxy ?? "").trim().replace(/\/+$/, "");
+	if (!proxy) return "unknown";
+	const cached = warpExitsProbe;
+	if (cached && cached.proxy === proxy && now - cached.at < WARP_EXITS_TTL_MS) return cached.value;
+
+	const snapshot = await readWarpSnapshot(config, now);
+	if (snapshot === undefined) {
+		// No answer is not a verdict: cache the absence so a dead proxy is asked
+		// once per window instead of once per diagnostic read.
+		warpExitsProbe = { proxy, at: now, value: "unknown" };
+		return "unknown";
+	}
+	return warpExitsProbe?.proxy === proxy ? warpExitsProbe.value : "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Preferred routing: one exit per attempt, from the proxied facts (S2, S3, S9)
+// ---------------------------------------------------------------------------
+//
+// `warp-minimal` publishes the pool as facts (`GET /exits`) and takes the
+// preference as a verb (the proxy credential, L5). The relay is the only side
+// that knows which egress IP the gate refused, so the choice is made here and
+// the proxy is asked for nothing but the list.
+//
+// Two properties shape the code below. A request may never pay an extra HTTP hop
+// for a decision the previous request just made, hence the 5s cache. And a
+// preference that nothing honours is worse than none (S11), hence the guard on
+// the capability probe: an older binary is never sent a credential.
+//
+// `state` is ELIGIBILITY, not liveness: the proxy derives it from `stateLocked()`
+// (enrolled, tunnel not nil, no cooldown, not draining, no open stream), and no
+// health check runs on that path — a silently dead tunnel still reports
+// `healthy`. The only liveness signal the relay holds is `observed_at`: a dead
+// tunnel stops renewing its trace, and the address it publishes ages. So state
+// decides whether an exit may be used at all, and freshness decides which one is
+// used first.
+
+/** The states that make an exit eligible at all. Everything else — `draining`,
+ *  `cooldown`, `starting` — is the proxy saying it cannot serve now. */
+const ELIGIBLE_WARP_EXIT_STATES = new Set(["healthy", "in_use"]);
+
+/** The detail read is shared by every request inside this window. */
+const WARP_EXITS_DETAIL_TTL_MS = 5_000;
+
+/** Pure: how stale an `observed_at` may be before the relay stops vouching for
+ *  the address (S9). The proxy caches the trace 45s per exit, so anything older
+ *  than that may be a recycled value; past two minutes the relay simply cannot
+ *  answer for the address, which is the liveness gate — not a freshness hint.
+ *  Such an exit still EXISTS, it is only not preferable. */
+export const WARP_EXIT_STALE_MS = 120_000;
+
+// `{ proxy, at, entries }` of the last read, `entries` being `undefined` when
+// the read failed. A failure is cached too: a proxy that just refused is asked
+// once per window, not once per request.
+let warpExitsDetailCache;
+// The exit the last attempt actually NAMED in the proxy credential, or
+// `undefined` when nothing was preferred. `/health` publishes it (S12).
+let preferredExitId;
+
+/** Pure: `observed_at` is absolute epoch SECONDS while `Date.now()` is
+ *  milliseconds, so this is the only place the two are ever put on one scale.
+ *  `0` means "never observed", which is not 1970 and not stale: it is absent. */
+export function warpExitObservedAtMs(value) {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+	return value * 1000;
+}
+
+/** Pure: how many listed exits carry an egress address the ledger can key. A
+ *  stale address still counts: the exit exists, it is only not preferable. */
+export function countWarpExitAddresses(entries) {
+	let count = 0;
+	for (const entry of Array.isArray(entries) ? entries : []) {
+		if (entry && quotaEgressKey(entry.ip)) count += 1;
+	}
+	return count;
+}
+
+/** Pure: may this exit serve the next request (S9)? `state` is eligibility
+ *  only; the liveness signal is `observed_at`, and it is the proxy's own promise
+ *  that the address was reachable recently enough to vouch for. `ip` is the
+ *  egress address, never the device endpoint, and the two live exits sit in
+ *  different /64s — nothing here assumes otherwise. */
+export function isWarpExitChoosable(entry, now = Date.now()) {
+	if (!entry || typeof entry !== "object") return false;
+	if (!ELIGIBLE_WARP_EXIT_STATES.has(entry.state)) return false;
+	if (!quotaEgressKey(entry.ip)) return false;
+	const observed = warpExitObservedAtMs(entry.observed_at);
+	if (observed === undefined) return false;
+	return now - observed <= WARP_EXIT_STALE_MS;
+}
+
+/** The first eligible exit no park covers, freshest address first (S9). Freshness
+ *  orders the candidates because `healthy` does not promise a live tunnel: a
+ *  dead one keeps its state and stops renewing its trace, so the freshest stamp
+ *  is the only evidence of life the relay has. A park is the stronger evidence —
+ *  the gate itself refused that address — so it is applied AFTER the ordering:
+ *  a parked fresh exit hands the attempt to the next one instead of overriding
+ *  the park. */
+function cleanWarpExit(eligible, ledger, now) {
+	const freshestFirst = eligible.slice().sort((a, b) => b.observed_at - a.observed_at);
+	const id = chooseWarpExit(freshestFirst, ledger, now);
+	return id === undefined ? undefined : freshestFirst.find((entry) => entry.id === id);
+}
+
+/** Pure: the exit this attempt should prefer, or `undefined` for "prefer
+ *  nothing". The filter is this module's policy: eligible state, keyable address
+ *  and a live enough observation. The parked-address rule is `chooseWarpExit`,
+ *  the one place parks are honoured (S9). */
+export function preferredWarpExit(entries, ledger, now = Date.now()) {
+	const eligible = (Array.isArray(entries) ? entries : []).filter((entry) =>
+		isWarpExitChoosable(entry, now),
+	);
+	return cleanWarpExit(eligible, ledger, now);
+}
+
+/** Pure: the exits array of a `/exits` body. Anything that is not an array is
+ *  not the contract, and an entry without an id is not an exit; every other
+ *  field stays optional, because the proxy omits `ip`/`family`/`observed_at` for
+ *  an exit whose trace never resolved (L12) and serves the last known `ip` with
+ *  an old `observed_at` once it stops resolving. */
+export function parseWarpExits(body) {
+	if (!Array.isArray(body)) return undefined;
+	const entries = [];
+	for (const entry of body) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const id = typeof entry.id === "string" ? entry.id.trim() : "";
+		if (!id) continue;
+		entries.push({
+			id,
+			state: typeof entry.state === "string" ? entry.state.trim().toLowerCase() : undefined,
+			ip: typeof entry.ip === "string" && entry.ip.trim() ? entry.ip.trim() : undefined,
+			observed_at: typeof entry.observed_at === "number" ? entry.observed_at : undefined,
+		});
+	}
+	return entries;
+}
+
+/** GET `<proxy>/exits`, parsed, cached for five seconds. A non-200, an
+ *  unparseable body and a non-array all read as `undefined`: no evidence about
+ *  the pool, which is the same answer a request gives when nothing is clean. */
+export async function readWarpExitsDetail(config, now = Date.now()) {
+	const proxy = String(config?.warpProxy ?? "").trim().replace(/\/+$/, "");
+	if (!proxy) return undefined;
+	const cached = warpExitsDetailCache;
+	if (cached && cached.proxy === proxy && now - cached.at < WARP_EXITS_DETAIL_TTL_MS) return cached.entries;
+
+	let entries;
+	try {
+		const res = await fetch(`${proxy}/exits`, {
+			method: "GET",
+			signal: AbortSignal.timeout(WARP_EXITS_TIMEOUT_MS),
+		});
+		if (res.status === 200) {
+			try {
+				entries = parseWarpExits(await res.json());
+			} catch {
+				entries = undefined;
+			}
+		}
+	} catch {
+		entries = undefined;
+	}
+	warpExitsDetailCache = { proxy, at: now, entries };
+	return entries;
+}
+
+/** The exit this attempt prefers, or `undefined` to keep today's request. An
+ *  older proxy is never even asked for the list: a credential it cannot read is
+ *  a preference nothing honours (S11). */
+async function preferredExitForAttempt(config, now) {
+	if ((await warpExitsCapability(config, now)) !== "structured") return undefined;
+	return preferredWarpExit(await readWarpExitsDetail(config, now), quotaLedger, now);
+}
+
+/** S4/S7: remember the address a 429 is attributable to. The attribution is the
+ *  attempt itself: it carried this exit's credential, so the address that served
+ *  it is known without guessing. Two things must both hold — a `retry-after`
+ *  that parses (S6) and a cause the relay can justify (S7). An unknown session id
+ *  fails exactly like a spent quota, so a `session_suspect` 429 burns nothing. */
+function parkWarpExitOn429(config, exit, response, now = Date.now()) {
+	if (!exit) return;
+	const parkedMs = parkDurationMs(response.headers.get("retry-after"));
+	if (!parkedMs) return;
+	// The same inputs `/health` passes: one verdict, one meaning.
+	const verdict = classifyGate429({
+		sessionSource: config.sessionSource,
+		warp429Streak,
+		parkedSeconds: Math.max(0, Math.ceil((localParkedUntil - now) / 1000)),
+	});
+	if (verdict.cause === "session_suspect") {
+		logWarpEvent("warp_park_skipped", { reason: verdict.cause, exit: exit.id });
+		return;
+	}
+	rememberQuotaPark({
+		ip: exit.ip,
+		exitId: exit.id,
+		parkedUntil: now + parkedMs,
+		reason: "gate_429",
+		now,
+	});
+	process.stderr.write(
+		`pi-free-bridge relay: warp exit ${exit.id} parked for ${Math.round(parkedMs / 1000)}s after its own 429\n`,
+	);
+	logWarpEvent("warp_parked", { exit: exit.id, parkedMs, ip: quotaEgressKey(exit.ip), cause: verdict.cause });
+}
 
 // ---------------------------------------------------------------------------
 // Warp event log (S1, S2)
@@ -1288,6 +1922,11 @@ export function resetWarpStateForTests() {
 	lastEgress = undefined;
 	localParkedUntil = 0;
 	deliveringWarpStreams = 0;
+	quotaLedger = emptyQuotaLedger();
+	quotaLedgerFile = undefined;
+	warpExitsProbe = undefined;
+	warpExitsDetailCache = undefined;
+	preferredExitId = undefined;
 }
 
 /** Test-only: the state `/health` reports, without standing a server up. */
@@ -1305,6 +1944,7 @@ export function warpStateForTests() {
 		lastEgress,
 		localParkedUntil,
 		deliveringWarpStreams,
+		preferredExitId,
 	};
 }
 
@@ -1564,13 +2204,18 @@ export async function rotateWarpExit(config, client) {
  *  keeps the counters because attribution and the sweep's per-step usable count
  *  need more than exit names; `healthFromSnapshot` reduces it to what the
  *  rotation's confirmation helper compares. */
-async function readWarpSnapshot(config) {
+async function readWarpSnapshot(config, now = Date.now()) {
 	try {
 		const res = await fetch(warpHealthUrl(config.warpProxy, config.warpHealthPath), {
 			signal: AbortSignal.timeout(2_000),
 		});
 		if (!res.ok) return undefined;
-		return warpExitSnapshot(await res.json());
+		const body = await res.json();
+		// S11: this read is also the capability read. The proxy declares whether it
+		// has the structured exits route, and the relay never probes for it.
+		const proxy = String(config.warpProxy ?? "").trim().replace(/\/+$/, "");
+		if (proxy) recordWarpCapability(proxy, body, now);
+		return warpExitSnapshot(body);
 	} catch {
 		return undefined;
 	}
@@ -2074,11 +2719,33 @@ export async function forward(req, res, pathname, config) {
 		for (const egress of order) {
 			egressUsed = egress;
 			let candidate;
+			// S2/S3: the exit THIS attempt prefers and the proxy URL that names it.
+			// Both stay unset unless a credential actually went out, so an attempt with
+			// no preference is byte-identical to the one before this feature.
+			let attemptExit;
+			let attemptProxy;
 			try {
 				// S6: attribution needs the counters from BEFORE this attempt, because
 				// `served` is monotonic and only its movement says a tunnel opened.
 				const warpBefore = egress === "warp" ? await readWarpSnapshot(config) : undefined;
-				candidate = await egressFetch(config, pathname, { body: JSON.stringify(body) }, egress);
+				if (egress === "warp") {
+					const chosen = await preferredExitForAttempt(config, Date.now());
+					const withExit = chosen ? proxyUrlWithExit(config.warpProxy, chosen.id) : undefined;
+					// `proxyUrlWithExit` hands the original URL back for an id it cannot spell
+					// as a credential, and an unchanged URL means nothing was preferred.
+					if (chosen && withExit !== config.warpProxy) {
+						attemptExit = chosen;
+						attemptProxy = withExit;
+						preferredExitId = chosen.id;
+						logWarpEvent("warp_exit_preferred", { exit: chosen.id, ip: quotaEgressKey(chosen.ip) });
+					}
+				}
+				candidate = await egressFetch(
+					config,
+					pathname,
+					{ body: JSON.stringify(body), proxyUrl: attemptProxy },
+					egress,
+				);
 				// relay-warp-auto-recycle: count OBSERVED warp responses, not only
 				// the delivered one — a warp 429 that falls back to a local
 				// success must still extend the streak.
@@ -2086,6 +2753,9 @@ export async function forward(req, res, pathname, config) {
 					warp429Streak = bumpWarp429Streak(warp429Streak, candidate.status, "warp");
 					if (candidate.status === 429) {
 						logWarpEvent("warp_429", { streak: warp429Streak, delivering: deliveringWarpStreams });
+						// S4: an attempt that named an exit makes this 429 attributable to an
+						// egress address, so the park can be remembered by IP.
+						parkWarpExitOn429(config, attemptExit, candidate);
 						await noteWarpAttribution(config, warpBefore);
 					}
 					// S10: the trigger is the whole request, not the last egress — in
@@ -2101,7 +2771,16 @@ export async function forward(req, res, pathname, config) {
 				if (egress === "local" && candidate.status === 429) {
 					const parked = parkDurationMs(candidate.headers.get("retry-after"));
 					if (parked) {
-						localParkedUntil = Date.now() + parked;
+						const now = Date.now();
+						localParkedUntil = now + parked;
+						// S10: the same park goes to the ledger file, so a restart does not offer
+						// the burnt IP first again. The write is best-effort and never throws.
+						rememberQuotaPark({
+							ip: LOCAL_EGRESS_KEY,
+							parkedUntil: localParkedUntil,
+							reason: "gate_429",
+							now,
+						});
 						process.stderr.write(
 							`pi-free-bridge relay: local egress parked for ${Math.round(parked / 1000)}s after its own 429\n`,
 						);
@@ -2351,6 +3030,12 @@ export async function handle(req, res, config) {
 	}
 
 	if (req.method === "GET" && pathname === "/health") {
+		// S11: the capability decides everything below, and it is cached for a
+		// minute, so a diagnostic read rarely asks the proxy anything at all.
+		const warpExits = await warpExitsCapability(config);
+		// Only a proxy that publishes the structured route is asked for the list: an
+		// older binary has none, and asking it twice for nothing is a wasted hop.
+		const exitsDetail = warpExits === "structured" ? await readWarpExitsDetail(config) : undefined;
 		// S33: the marker stays `service` + `ok`; the extra fields let the
 		// extension report which id is actually on the wire.
 		sendJson(res, 200, {
@@ -2387,6 +3072,26 @@ export async function handle(req, res, config) {
 			// remaining window rather than a timestamp, because that is the number
 			// a human reading /health actually wants.
 			localParkedForMs: Math.max(0, localParkedUntil - Date.now()),
+			// S12: the ledger in one glance — how many egresses are parked right now,
+			// how long until the nearest one frees up, and the file it lives in.
+			quotaLedger: {
+				...quotaLedgerHealth(quotaLedger, Date.now()),
+				path: activeQuotaLedgerPath(),
+			},
+			// S11: what the proxy can actually answer. `legacy` means it has no
+			// `/exits`, so nothing is preferred and nothing claims to be.
+			warpExits: warpExits,
+			// S9: how many of the listed exits carry an egress address the ledger can
+			// key. A stale address still counts here — the exit exists, it is only not
+			// preferable — so this number is not the routing switch.
+			warpExitsDetail: { usable: countWarpExitAddresses(exitsDetail) },
+			// S12: true only when the proxy can honour a credential AND at least one
+			// exit was choosable for it on the last observation. Inert is reported as
+			// inert instead of as a routing that does not exist.
+			preferredRouting: warpExits === "structured" && preferredWarpExit(exitsDetail, quotaLedger, Date.now()) !== undefined,
+			// The exit the last attempt actually named, so "preferred" can be read
+			// apart from "preferable".
+			preferredExit: preferredExitId ?? null,
 			lastEgress: lastEgress,
 			pid: process.pid,
 		});
@@ -2427,6 +3132,10 @@ async function startServer() {
 		);
 		process.exit(1);
 	}
+
+	// S10: the ledger is read once, before any request, so a restart re-parks what
+	// the previous process already burnt instead of spending a request on it.
+	loadQuotaLedgerAtStartup();
 
 	// relay-warp-hot-reload: when RELAY_WARP_MODE is a real env override the
 	// mode is absolute (source "env") and the relay stays static, by design.
