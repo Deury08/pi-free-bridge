@@ -1686,10 +1686,10 @@ export function parseWarpBuildVersion(text: string): string | null {
  *  update would advise a downgrade, so it says nothing instead of misleading. */
 export function warpBuildNotice({ running, installed }: { running: string | null; installed: string | null }): string | null {
 	if (!running) {
-		return "warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update";
+		return "warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /free-bridge-warp-update";
 	}
 	if (!installed || installed === running) return null;
-	return `the proxy runs ${running}, the installed build is ${installed} — /warp update`;
+	return `the proxy runs ${running}, the installed build is ${installed} — /free-bridge-warp-update`;
 }
 
 /** T9c: what an update really costs, in the exact words shown before consent.
@@ -3616,7 +3616,7 @@ export default async function (pi: ExtensionAPI) {
 		if (runningBin && !sameDir(dirname(runningBin), WARP_INSTALL_DIR)) {
 			ctx.ui.notify(
 				[
-					"pi-free-bridge warp update",
+					"free-bridge-warp-update",
 					`  runs from: ${runningBin}`,
 					`  replaces:  ${binPath}`,
 					"",
@@ -3750,7 +3750,7 @@ export default async function (pi: ExtensionAPI) {
 			}
 		}
 
-		const lines = ["pi-free-bridge warp update", `  target:  ${describeWarpTarget(target)}`];
+		const lines = ["free-bridge-warp-update", `  target:  ${describeWarpTarget(target)}`];
 
 		if (!result) {
 			lines.push(`  the update stopped on an error: ${thrown ?? "no result was reported"}.`, ...restoreNote());
@@ -3889,6 +3889,32 @@ export default async function (pi: ExtensionAPI) {
 		// binary; only when no binary exists is the download offered (yes/no).
 		// Nothing is downloaded at Pi startup.
 		await ensureWarpWithPrompt(ctx);
+
+		// T9b: the one place the build-drift notice is shown. It runs after
+		// ensureWarpWithPrompt, so the proxy has answered and its build is a fact
+		// rather than a guess; the installed side is the record the update command
+		// wrote, so nothing is spawned to ask a binary its version. Silence when the
+		// two agree, when the record is missing, or when the lookup fails: a notice
+		// that cannot name a real drift is noise, and an error here must never
+		// stop the menu.
+		try {
+			const drift = await warpBuildDrift({
+				fetchProxyBuild: async () => {
+					const response = await fetch(warpTarget.healthUrl);
+					if (!response.ok) return null;
+					const body = (await response.json()) as { build?: { commit?: unknown } };
+					// Go publishes the literal "unknown" for a build with no injected
+					// commit (S25: the proxy states facts). That is not an identity, so it
+					// must not become the "running" side of a comparison.
+					const commit = body.build?.commit;
+					return typeof commit === "string" && commit !== "unknown" ? commit : null;
+				},
+				readInstalledBuild: () => readWarpInstallRecord()?.commit ?? null,
+			});
+			if (drift) ctx.ui.notify(drift, "warning");
+		} catch {
+			// No answer is not a drift.
+		}
 
 		// Menú rápido: cambiar el modo sin tener que escribirlo completo.
 		// Usa ctx.ui.select (opciones seleccionables) cuando Pi lo expone,
