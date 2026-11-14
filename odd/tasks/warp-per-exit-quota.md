@@ -229,6 +229,7 @@ routes traffic using evidence that does not hold.
 | D9 | **My own capability probe was the same trap.** `warpExitsCapability` sent `GET <proxy>/exits`; against a binary without that route the request lands in the catch-all and, with D7's bug, costs an exit 30 minutes. Caught before it was ever pointed at the live proxy; replaced by a declared capability in `/health` (S11), so the relay sends no probe at all. | reading the probe against the peer's D7 diagnosis | a test asserting no request to `/exits` unless the capability is declared | fixed by S11 |
 | D4 | `::ffff:1.2.3.4` canonicalises to the IPv6 form instead of collapsing to IPv4. Harmless for a real trace, unhandled if one ever appears. | a manual check of the canonicaliser | none | accepted, documented |
 | D5 | Two concurrent traces on different exits were never measured against a live pool. The design is safe by construction (a mutex per exit, separate QUIC sessions) but it is unverified. | the peer's own report | none | open, low risk |
+| D12 | `/health.quotaLedger.parked` is computed from the in-memory ledger, which is pruned **only when it is written**. Between a reset expiring and the next park, the counter can report more parked egresses than there really are, while routing stays correct because `isEgressParked` compares against the reset at decision time. A counter that over-reports invites distrust of the file that is telling the truth. | the user asking whether the file really clears itself | a test on the reported count after a reset has passed with no write in between | open; queued behind T7 (same files) |
 
 D6 is the one that matters: D1 and D2 are fixed in the wiring, D5 is a measurement
 gap, D3 never existed, but D6 means the field the relay sees is weaker than its
@@ -456,6 +457,13 @@ retries on its own, and the client sees a single terminal 429. **The cost I stat
 when asking was wrong**: I said one enrollment, and `RecycleAll` spends two (L24). The
 choice was made on the correct direction — free rung first, one paid rotation at
 most — but the price is double what the user was told.
+
+L26 (user, verbatim): «tambien en un archivo ponemos las ips quemadas y las borramos
+cuando esten libres asi durante el dia no volvemos a chocar con la misma piedra». This is
+already the design: the ledger is a file keyed by canonical egress IP, pruned on write
+and on load, and consulted at decision time, so it is shared by every session and
+survives a restart. What it did surface is D12: the reported count is pruned only on
+write, so the number can lag the truth even though routing does not.
 
 L25 (user, verbatim): «obio esta escalera va a usar lo qeu implementamos anteriormente si
 un de esas ips las quemamos y aun no estan libres no las usamos y si son todas reclicle y
