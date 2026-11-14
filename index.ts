@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1668,6 +1668,397 @@ function resolveWarpBin(): string | undefined {
  *
  *  Startup rule: probe first. Only when a LOOPBACK target does not answer is a
  *  local binary launched — a remote target is never spawned, only reported. */
+/** T9b / S29: the identity a binary prints for itself. Its `-version` line ends
+ *  in the commit in parentheses, and the Go default is the literal `unknown` —
+ *  which is absence of identity, never a commit to compare against. */
+export function parseWarpBuildVersion(text: string): string | null {
+	if (typeof text !== "string") return null;
+	const match = /\(([^()]*)\)\s*$/.exec(text.trim());
+	if (!match) return null;
+	const commit = match[1].trim();
+	return commit && commit !== "unknown" ? commit : null;
+}
+
+/** T9b / S30c, S30d: one line of policy for "installed versus running". Silence
+ *  when there is nothing to do, otherwise a sentence that names the action — a
+ *  diagnostic that names no command is noise. The case this deliberately cannot
+ *  speak about is an installed file older than the running process: advising an
+ *  update would advise a downgrade, so it says nothing instead of misleading. */
+export function warpBuildNotice({ running, installed }: { running: string | null; installed: string | null }): string | null {
+	if (!running) {
+		return "warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update";
+	}
+	if (!installed || installed === running) return null;
+	return `the proxy runs ${running}, the installed build is ${installed} — /warp update`;
+}
+
+/** T9c: what an update really costs, in the exact words shown before consent.
+ *  The download is the cheap part: stopping the proxy costs two enrollments, a
+ *  few seconds without service, new egress addresses, and the matching of every
+ *  parked entry — the entries survive, they just stop lining up with a live exit.
+ *  And the proxy is shared, so another Pi behind it pays the same seconds. */
+export function warpUpdateCostLines(): string[] {
+	return [
+		"Updating the proxy costs more than the download:",
+		"",
+		"  · two enrollments — the new process registers with the exit service twice before it serves.",
+		"  · 3-5 s with no service at all, between the stop and the moment the new process answers.",
+		"  · new egress addresses — the tunnel comes up from a different pair than the one before.",
+		"  · every parked entry stops matching a live exit. Nothing is deleted: the entries stay",
+		"    exactly where they are, they just stop lining up with an exit that can serve them.",
+		"",
+		"  The proxy is shared: if another Pi talks through it, it loses service during the swap too.",
+	];
+}
+
+export type UpdateWarpBinaryDeps = {
+	/** The tag of the newest published release, or null when it cannot be read. */
+	latestTag: () => Promise<string | null>;
+	/** What this extension installed last, from its record. */
+	installedRecord: () => { tag: string; commit: string } | undefined;
+	confirm: () => Promise<boolean>;
+	/** The verified path of the new binary, or undefined when nothing landed. */
+	download: () => Promise<string | undefined>;
+	swap: (downloaded: string, tag: string) => Promise<{ ok: boolean; rolledBack: boolean; reason?: string }>;
+	/** The commit the running proxy reports for itself, or null when it has none. */
+	readRunningCommit: () => Promise<string | null>;
+	writeRecord: (record: { tag: string; commit: string }) => void;
+};
+
+export type UpdateWarpBinaryResult = {
+	status: "up-to-date" | "unknown" | "declined" | "updated" | "rolled-back" | "failed";
+	tag?: string;
+	commit?: string;
+	reason?: string;
+};
+
+/** T9c: the update, in the only order that is safe. The decision first, because
+ *  an update nobody needs must not even ask for consent; consent before the
+ *  download, because the download is the only step that touches the network;
+ *  the swap after it, because a bad download must never leave the proxy down;
+ *  and the record last, because the only commit worth recording is the one the
+ *  running proxy reports — a swap that returns ok but no identity proved
+ *  nothing. Every effect is a dependency so this can be measured without a
+ *  network, a binary or a running proxy. */
+export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<UpdateWarpBinaryResult> {
+	const latestTag = await deps.latestTag();
+	const installed = deps.installedRecord();
+	const decision = warpUpdateDecision({ latestTag, installedTag: installed?.tag ?? null });
+
+	if (decision === "unknown") {
+		return {
+			status: "unknown",
+			reason: "the release could not be read: with no published tag there is nothing to install and nothing to claim",
+		};
+	}
+	if (decision === "up-to-date") {
+		return { status: "up-to-date", tag: latestTag ?? undefined, commit: installed?.commit || undefined };
+	}
+
+	const tag = String(latestTag).trim();
+	if (!(await deps.confirm())) return { status: "declined", tag };
+
+	const downloaded = await deps.download();
+	if (!downloaded) {
+		return {
+			status: "failed",
+			tag,
+			reason: "the download failed and nothing was changed: the proxy keeps the binary it already had",
+		};
+	}
+
+	const swapped = await deps.swap(downloaded, tag);
+	if (!swapped.ok) {
+		const reason = swapped.reason ?? "no reason was reported";
+		if (swapped.rolledBack) return { status: "rolled-back", tag, reason };
+		return {
+			status: "failed",
+			tag,
+			reason: `${reason}: the install did not prove itself and the old binary was not restored`,
+		};
+	}
+
+	const commit = await deps.readRunningCommit();
+	if (!commit) {
+		return {
+			status: "failed",
+			tag,
+			reason: "the new build was installed but did not identify itself, so what runs cannot be verified — no record was written",
+		};
+	}
+	deps.writeRecord({ tag, commit });
+	return { status: "updated", tag, commit };
+}
+
+/** T9c: is there anything to install? A release publishes its tag and its
+ *  assets, never the commit it was built from, and the binary's own `-version`
+ *  prints the version constant from the source (v0.2.3 today), not the tag. So
+ *  "already up to date" cannot be inferred from the download; it is read from
+ *  the record this extension writes after a successful install. `unknown` is its
+ *  own answer: no latest tag read means no claim either way. */
+export function warpUpdateDecision({ latestTag, installedTag }: { latestTag: string | null; installedTag: string | null }): "up-to-date" | "update" | "unknown" {
+	const normalize = (tag: string | null): string => (typeof tag === "string" ? tag.trim().replace(/^v/i, "").toLowerCase() : "");
+	const latest = normalize(latestTag);
+	if (!latest) return "unknown";
+	const installed = normalize(installedTag);
+	return installed === latest ? "up-to-date" : "update";
+}
+
+/** T9b: the two observations the notice needs, injected so the decision can be
+ *  tested without a proxy or a spawn. A dependency that fails is "no answer",
+ *  never an exception: this runs at an entry point and must not break it. */
+export async function warpBuildDrift(deps: {
+	fetchProxyBuild: () => Promise<string | null>;
+	readInstalledBuild: () => string | null;
+}): Promise<string | null> {
+	let running: string | null = null;
+	try {
+		running = await deps.fetchProxyBuild();
+	} catch {
+		running = null;
+	}
+	let installed: string | null = null;
+	try {
+		installed = deps.readInstalledBuild();
+	} catch {
+		installed = null;
+	}
+	return warpBuildNotice({ running, installed });
+}
+
+/** D11: the proxy's own process record, kept beside its binary. It is the only
+ *  thing that knows which pid belongs to us after the session that spawned it is
+ *  gone: the proxy is detached on purpose, and its `/health` has no pid. */
+function warpProcessPath(): string {
+	return join(WARP_INSTALL_DIR, "warp-process.json");
+}
+
+export function recordWarpProcess(pid: number | undefined, bin: string, now = Date.now()): void {
+	if (typeof pid !== "number" || !Number.isFinite(pid)) return;
+	try {
+		mkdirSync(WARP_INSTALL_DIR, { recursive: true });
+		writeFileSync(warpProcessPath(), `${JSON.stringify({ pid, bin, spawned_at: now })}\n`, "utf-8");
+	} catch {
+		// A record that cannot be written must not break starting the proxy.
+	}
+}
+
+export function readWarpProcess(): { pid: number; bin: string; spawned_at: number } | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(warpProcessPath(), "utf-8"));
+		if (!raw || typeof raw !== "object") return undefined;
+		if (typeof raw.pid !== "number" || !Number.isFinite(raw.pid) || raw.pid <= 0) return undefined;
+		return {
+			pid: raw.pid,
+			bin: typeof raw.bin === "string" ? raw.bin : "",
+			spawned_at: typeof raw.spawned_at === "number" ? raw.spawned_at : 0,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/** T9c: what this extension last installed, kept beside the binary like the
+ *  process record. A release publishes its tag and its assets, never the commit
+ *  inside it, and the binary prints the source's version constant — so "is the
+ *  release newer than what I installed?" is a fact only this file can answer.
+ *  Nothing reads it yet: the update path that will is a separate change. */
+export function warpInstallRecordPath(): string {
+	return join(WARP_INSTALL_DIR, "warp-install.json");
+}
+
+/** A tag that is not a non-empty string means no record, so the `tag` check is
+ *  the whole shape rule; the other two fields degrade to empty values. */
+export type WarpInstallRecord = { tag: string; commit: string; installed_at: number };
+
+export function writeWarpInstallRecord({ tag, commit }: { tag: string; commit: string }, path = warpInstallRecordPath()): void {
+	const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(temp, `${JSON.stringify({ tag, commit, installed_at: Date.now() })}\n`, "utf-8");
+		renameSync(temp, path);
+	} catch {
+		// A lost record costs one unnecessary install; a thrown error would cost
+		// the update that just succeeded. Leave no half-written temp behind either.
+		try {
+			rmSync(temp, { force: true });
+		} catch {
+			// Nothing more to do: the record is lost and that is survivable.
+		}
+	}
+}
+
+export function readWarpInstallRecord(path = warpInstallRecordPath()): WarpInstallRecord | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(path, "utf-8"));
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+		if (typeof raw.tag !== "string" || !raw.tag.trim()) return undefined;
+		return {
+			tag: raw.tag,
+			commit: typeof raw.commit === "string" ? raw.commit : "",
+			installed_at: typeof raw.installed_at === "number" ? raw.installed_at : 0,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+export type StopWarpDeps = {
+	/** The proxy's `/health` body, or undefined when nothing answers. */
+	probe: () => Promise<unknown>;
+	recorded: () => { pid: number; bin: string } | undefined;
+	/** The executable behind a pid when the platform exposes it; undefined when
+	 *  it cannot be read, which is not the same as a mismatch. */
+	exeOf: (pid: number) => string | undefined;
+	kill: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
+	sleep: (ms: number) => Promise<void>;
+	attempts?: number;
+};
+
+/** D11: stop the proxy we started, and refuse to guess. Four refusals are more
+ *  useful than one wrong kill: nothing answering means nothing to stop; no
+ *  record means no pid we can claim; an executable that does not match the
+ *  recorded binary means the pid was reused, so it is not ours; and a process
+ *  that survives SIGKILL is reported instead of being assumed dead. */
+export async function stopWarpProxy(deps: StopWarpDeps): Promise<"stopped" | "nothing-to-stop" | "unknown-pid" | "refused" | "unverified"> {
+	const alive = async (): Promise<boolean> => {
+		try {
+			return Boolean(await deps.probe());
+		} catch {
+			return false;
+		}
+	};
+	if (!(await alive())) return "nothing-to-stop";
+	const record = deps.recorded();
+	if (!record) return "unknown-pid";
+	let exe: string | undefined;
+	try {
+		exe = deps.exeOf(record.pid);
+	} catch {
+		exe = undefined;
+	}
+	if (exe && record.bin && exe !== record.bin) return "refused";
+
+	const attempts = deps.attempts ?? 20;
+	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+		try {
+			deps.kill(record.pid, signal);
+		} catch {
+			// already gone, or not ours to signal: the probe decides below
+		}
+		for (let i = 0; i < attempts; i++) {
+			if (!(await alive())) return "stopped";
+			await deps.sleep(150);
+		}
+	}
+	return "unverified";
+}
+
+/** D11: the executable behind a pid, when the kernel exposes it. Linux only;
+ *  everywhere else this answers undefined, which the stop policy reads as "cannot
+ *  check" and never as a mismatch. */
+function exeBehindPid(pid: number): string | undefined {
+	try {
+		return readlinkSync(`/proc/${pid}/exe`);
+	} catch {
+		return undefined;
+	}
+}
+
+/** D11: the only place the proxy is stopped is the menu switching WARP off (and
+ *  an update, which stops it to replace the binary). Closing the relay leaves it
+ *  running on purpose: stopping it costs two enrollments, new addresses and the
+ *  matching of every parked entry. */
+async function stopWarpFromMenu(healthUrl: string): Promise<"stopped" | "nothing-to-stop" | "unknown-pid" | "refused" | "unverified"> {
+	return stopWarpProxy({
+		probe: async () => {
+			try {
+				const res = await fetch(healthUrl, { signal: AbortSignal.timeout(1500) });
+				return res.ok ? await res.json() : undefined;
+			} catch {
+				return undefined;
+			}
+		},
+		recorded: () => readWarpProcess(),
+		exeOf: exeBehindPid,
+		kill: (pid, signal) => process.kill(pid, signal),
+		sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+	});
+}
+
+/** The five answers the stop policy can give, named once so the swap gate and
+ *  the stop itself cannot drift apart. */
+export type WarpStopResult = "stopped" | "nothing-to-stop" | "unknown-pid" | "refused" | "unverified";
+
+/** D11: a swap replaces the binary underneath the proxy, so it may go ahead only
+ *  when the old process is provably gone. "nothing-to-stop" is fine — there is
+ *  nothing to replace underneath. The three refusals are not: an unstopped proxy
+ *  still serving an old binary is exactly the wrong kill this policy forbids. */
+export async function warpStopForSwap(healthUrl: string, stop: (url: string) => Promise<WarpStopResult> = stopWarpFromMenu): Promise<boolean> {
+	try {
+		const result = await stop(healthUrl);
+		return result === "stopped" || result === "nothing-to-stop";
+	} catch {
+		// A stop that threw proved nothing, so it is not permission to replace.
+		return false;
+	}
+}
+
+/** How long the poll waits between probes. Together with the attempt count this
+ *  is the whole deadline: no probe can extend it. */
+const WARP_RESTART_POLL_MS = 250;
+
+export type StartAndVerifyDeps = {
+	start: () => Promise<unknown>;
+	/** The proxy's `/health` body, or undefined when nothing answers. */
+	probe: () => Promise<unknown>;
+	sleep: (ms: number) => Promise<void>;
+	attempts?: number;
+};
+
+/** D11 / S30c: relaunch the proxy, then wait for the new binary to prove itself
+ *  with `warpReadyFact`. The wait is a fixed number of probes, never an open
+ *  loop, so an old build that keeps serving fails the swap instead of hanging
+ *  the update. Never throws: the caller has to be able to report the failure. */
+export async function warpStartAndVerify(deps: StartAndVerifyDeps): Promise<boolean> {
+	try {
+		await deps.start();
+	} catch {
+		// Nothing was launched, so there is nothing that could turn ready.
+		return false;
+	}
+	const attempts = deps.attempts ?? 20;
+	for (let i = 0; i < attempts; i++) {
+		try {
+			if (warpReadyFact(await deps.probe())) return true;
+		} catch {
+			// A probe that fails is a proxy that is not ready yet, nothing more.
+		}
+		if (i < attempts - 1) {
+			try {
+				await deps.sleep(WARP_RESTART_POLL_MS);
+			} catch {
+				// A failed wait still leaves the remaining attempts to spend.
+			}
+		}
+	}
+	return false;
+}
+
+/** D11 / S30c: the new binary is in place only if the answering proxy proves it:
+ *  an identity, the exit capability, and at least one exit with an address. A
+ *  restart that leaves the old build serving fails here, which is the whole
+ *  point of checking. */
+export function warpReadyFact(body: unknown): boolean {
+	const b = body as { build?: { commit?: unknown }; capabilities?: { exits?: unknown }; exits?: unknown } | undefined;
+	if (!b || typeof b !== "object") return false;
+	const commit = b.build && typeof b.build.commit === "string" ? b.build.commit.trim() : "";
+	if (!commit || commit === "unknown") return false;
+	if (!b.capabilities || b.capabilities.exits !== true) return false;
+	const exits = Array.isArray(b.exits) ? b.exits : [];
+	return exits.some((exit) => Boolean(exit) && typeof exit === "object" && Boolean((exit as { ip?: unknown }).ip));
+}
+
 export async function ensureWarp(): Promise<boolean> {
 	const target = resolveWarpTarget();
 
@@ -1694,6 +2085,10 @@ export async function ensureWarp(): Promise<boolean> {
 			windowsHide: true,
 		});
 		child.once("error", () => undefined); // surface via probe failure
+		// D11: remember what was started, so a later update can stop exactly this
+		// process instead of hunting a pid by name or leaving it serving an old
+		// binary while a new one sits on disk.
+		recordWarpProcess(child.pid, bin);
 		child.unref();
 
 		// (e) Probe again up to 6 attempts.
@@ -1706,6 +2101,143 @@ export async function ensureWarp(): Promise<boolean> {
 		}
 		return false;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Download progress
+// ---------------------------------------------------------------------------
+//
+// Every file this extension downloads says how far along it is. The honest
+// constraint is that a percentage is a claim about the whole file: it is shown
+// only when the server said how big the body is (`content-length`), never
+// guessed — not from the release API's `size`, not from an assumption that a
+// finished stream was the whole file. A body read is all-or-nothing: a stream
+// that fails midway rejects, so the caller's existing failure path runs and no
+// truncated archive or binary can be written, verified or renamed into place.
+
+/** Same base the install prompts already use for an asset size (`(1.9 MB)`),
+ *  so the live readout and the consent prompt never disagree. */
+const DOWNLOAD_BYTES_PER_MB = 1048576;
+
+/** How long a progress line may go unrepeated when the percentage does not
+ *  move. One notification per chunk would flood Pi's UI and slow the very
+ *  download it describes. */
+const DOWNLOAD_PROGRESS_INTERVAL_MS = 100;
+
+/** A byte count the way the install prompts state one: `1.9 MB`. */
+export function formatDownloadSize(bytes: number): string {
+	return `${(Math.max(0, bytes) / DOWNLOAD_BYTES_PER_MB).toFixed(1)} MB`;
+}
+
+/** Percentage of a known total received so far, or undefined when there is no
+ *  usable total. A missing, zero, negative or non-finite total has no
+ *  percentage: dividing by it would invent a 0% or 100% the server never
+ *  promised. Clamped at 100 for a server that overruns its own header. */
+export function downloadPercent(received: number, total: number | undefined): number | undefined {
+	if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) return undefined;
+	if (!Number.isFinite(received) || received <= 0) return 0;
+	return Math.min(100, Math.floor((received / total) * 100));
+}
+
+/** The one line the user reads while a download runs:
+ *
+ *   Downloading warp-minimal v0.5.0… 47% (1.9 MB / 4.0 MB)
+ *   Downloading relay.js v0.6.0… 1.9 MB (size unknown)
+ *
+ *  `label` is the wording the caller already announces; the numbers and the
+ *  percentage are appended to it rather than replacing it. */
+export function formatDownloadProgress(input: {
+	label: string;
+	received: number;
+	total?: number;
+}): string {
+	const percent = downloadPercent(input.received, input.total);
+	if (percent === undefined) {
+		return `${input.label} ${formatDownloadSize(input.received)} (size unknown)`;
+	}
+	return `${input.label} ${percent}% (${formatDownloadSize(input.received)} / ${formatDownloadSize(input.total as number)})`;
+}
+
+/** `content-length` as a byte count, or undefined when the server did not send
+ *  a usable one — a chunked response, a garbage header, a zero total. */
+export function contentLengthFrom(
+	headers: { get(name: string): string | null } | null | undefined,
+): number | undefined {
+	const raw = headers?.get("content-length");
+	if (raw === null || raw === undefined) return undefined;
+	const value = Number(raw.trim());
+	if (!Number.isFinite(value) || value <= 0) return undefined;
+	return Math.trunc(value);
+}
+
+export type DownloadProgressReporter = (received: number, force?: boolean) => void;
+
+/** Throttled progress emitter: at most one line per interval, plus one for
+ *  every whole percentage point that moves, plus one when the caller forces it
+ *  (the final line, so the readout ends on the real byte count). `now` and
+ *  `intervalMs` are injectable so the throttle is testable without sleeping. */
+export function createDownloadReporter(input: {
+	label: string;
+	total?: number;
+	report: (line: string) => void;
+	now?: () => number;
+	intervalMs?: number;
+}): DownloadProgressReporter {
+	const now = input.now ?? Date.now;
+	const intervalMs = input.intervalMs ?? DOWNLOAD_PROGRESS_INTERVAL_MS;
+	let lastAt: number | undefined;
+	let lastPercent: number | undefined;
+	return (received, force = false) => {
+		const at = now();
+		const percent = downloadPercent(received, input.total);
+		if (!force && lastAt !== undefined) {
+			const moved = percent !== undefined && percent !== lastPercent;
+			if (!moved && at - lastAt < intervalMs) return;
+		}
+		lastAt = at;
+		lastPercent = percent;
+		input.report(formatDownloadProgress({ label: input.label, received, total: input.total }));
+	};
+}
+
+/** Stream a response body, reporting progress as bytes arrive, and resolve with
+ *  the complete body. Never resolves with a partial body: a stream that errors
+ *  midway rejects, so a drop in the middle of a download surfaces as a failed
+ *  download rather than a short one. */
+export async function readDownloadBody(input: {
+	body: ReadableStream<Uint8Array> | null;
+	label: string;
+	total?: number;
+	report?: (line: string) => void;
+	now?: () => number;
+	intervalMs?: number;
+}): Promise<Buffer> {
+	if (!input.body) throw new Error(`download of ${input.label} returned no body`);
+	const notify = input.report
+		? createDownloadReporter({
+				label: input.label,
+				total: input.total,
+				report: input.report,
+				now: input.now,
+				intervalMs: input.intervalMs,
+			})
+		: undefined;
+
+	const reader = input.body.getReader();
+	const chunks: Buffer[] = [];
+	let received = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		if (!value || value.byteLength === 0) continue;
+		chunks.push(Buffer.from(value));
+		received += value.byteLength;
+		notify?.(received);
+	}
+	// Only a fully read body reaches this line, so the last thing the user sees
+	// before the success message is the complete size.
+	notify?.(received, true);
+	return Buffer.concat(chunks);
 }
 
 // ---------------------------------------------------------------------------
@@ -1772,15 +2304,25 @@ async function findWarpAsset(): Promise<{ tag: string; url: string; name: string
  *  undefined with the failure logged. `status` reports each stage to Pi's
  *  notifications (ctx.ui.notify). Extraction uses the system `tar`
  *  (bsdtar), which ships with Windows 10+, macOS and Linux and handles the
- *  zip archives too. */
+ *  zip archives too.
+ *
+ *  `stage` is for the update path, and it is not a convenience: a proxy that is
+ *  already running executes the file at the canonical name, so writing the new
+ *  bytes over it either fails (Windows will not replace a running image) or
+ *  destroys the only known-good rollback source (elsewhere). Staging leaves the
+ *  verified bytes under a third name beside `current` and `current.prev`, and
+ *  the swap renames them into place after the proxy stopped. Same volume by
+ *  construction, so the rename never has to copy. */
 async function installWarpBinary(
 	asset: { tag: string; url: string; name: string; size: number },
 	status?: (message: string) => void,
+	options: { stage?: boolean } = {},
 ): Promise<string | undefined> {
 	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-warp-"));
 	try {
 		const archivePath = join(tmpDir, asset.name);
-		status?.(`Downloading warp-minimal ${asset.tag}…`);
+		const label = `Downloading warp-minimal ${asset.tag}…`;
+		status?.(label);
 		const res = await fetch(asset.url, {
 			headers: { "user-agent": "pi-free-bridge" },
 			signal: AbortSignal.timeout(60000),
@@ -1789,7 +2331,12 @@ async function installWarpBinary(
 			console.error(`pi-free-bridge: warp-minimal download failed — HTTP ${res.status}`);
 			return undefined;
 		}
-		writeFileSync(archivePath, Buffer.from(await res.arrayBuffer()));
+		// The bytes only reach `archivePath` once the whole body arrived, so a drop
+		// in the middle leaves nothing behind for the checksum or tar step to read.
+		writeFileSync(
+			archivePath,
+			await readDownloadBody({ body: res.body, label, total: contentLengthFrom(res.headers), report: status }),
+		);
 
 		const csUrl = asset.url.slice(0, asset.url.length - asset.name.length) + "checksums.txt";
 		const csRes = await fetch(csUrl, {
@@ -1816,7 +2363,11 @@ async function installWarpBinary(
 			return undefined;
 		}
 
-		status?.(`Installing to ${WARP_INSTALL_DIR}…`);
+		status?.(
+			options.stage
+				? `Staging the verified binary in ${WARP_INSTALL_DIR}…`
+				: `Installing to ${WARP_INSTALL_DIR}…`,
+		);
 		mkdirSync(WARP_INSTALL_DIR, { recursive: true });
 		const { execFileSync } = await import("node:child_process");
 		// bsdtar handles the zip archives; GNU tar in a Git-Bash PATH does not.
@@ -1845,10 +2396,12 @@ async function installWarpBinary(
 			console.error(`pi-free-bridge: did not find ${exeName} inside ${asset.name}`);
 			return undefined;
 		}
-		const target = join(WARP_INSTALL_DIR, exeName);
+		const target = options.stage ? `${join(WARP_INSTALL_DIR, exeName)}.tmp` : join(WARP_INSTALL_DIR, exeName);
+		if (options.stage) rmSync(target, { force: true });
 		copyFileSync(extracted, target);
 		if (process.platform !== "win32") chmodSync(target, 0o755);
-		writeBridgeConfig({ warpBin: target });
+		// The config names the binary that runs; a staged file is not it yet.
+		if (!options.stage) writeBridgeConfig({ warpBin: target });
 		return target;
 	} catch (err) {
 		const message = `warp-minimal install failed: ${(err as Error).message}`;
@@ -2264,7 +2817,8 @@ async function installRelayBinary(
 ): Promise<string | undefined> {
 	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
 	try {
-		status?.(`Downloading ${release.asset.name} ${release.tag}…`);
+		const label = `Downloading ${release.asset.name} ${release.tag}…`;
+		status?.(label);
 		const res = await fetch(release.asset.url, {
 			headers: { "user-agent": "pi-free-bridge" },
 			signal: AbortSignal.timeout(120000),
@@ -2273,7 +2827,14 @@ async function installRelayBinary(
 			console.error(`pi-free-bridge: relay download failed — HTTP ${res.status}`);
 			return undefined;
 		}
-		const bytes = Buffer.from(await res.arrayBuffer());
+		// Complete-or-throw: a half-read body rejects here, lands in the catch below
+		// and is reported as a failure, leaving the staged path unwritten.
+		const bytes = await readDownloadBody({
+			body: res.body,
+			label,
+			total: contentLengthFrom(res.headers),
+			report: status,
+		});
 
 		status?.("Verifying the published SHA256SUMS…");
 		const sumsRes = await fetch(release.checksumsUrl, {
@@ -3020,6 +3581,227 @@ export default async function (pi: ExtensionAPI) {
 		ctx.ui.notify(lines.join("\n"), body.ok ? "info" : "error");
 	}
 
+	/** The one command that updates warp-minimal — and therefore the only path
+	 *  that stops the proxy to replace its binary. The decision, the consent order
+	 *  and the rollback live in `updateWarpBinary` and `swapRelayBinary`; this body
+	 *  supplies their real deps and turns the outcome into one message per status.
+	 *
+	 *  Two refusals come first, because both would cost more than saying no: a
+	 *  session with no UI cannot show the cost before stopping the proxy, and a
+	 *  proxy started from a path outside WARP_INSTALL_DIR keeps executing bytes
+	 *  this command would never replace. */
+	async function runWarpUpdate(ctx: MenuCtx): Promise<void> {
+		if (!ctx.hasUI) {
+			ctx.ui.notify(
+				[
+					"pi-free-bridge: this command replaces the proxy binary, and replacing it",
+					"STOPS the proxy on purpose: the file is swapped underneath the process",
+					"that is serving right now. That needs a confirmation, and this session has",
+					"no UI to ask in.",
+					"",
+					"Run /free-bridge-warp-update from an interactive Pi session.",
+				].join("\n"),
+				"warning",
+			);
+			return;
+		}
+
+		const target = resolveWarpTarget();
+		const exeName = process.platform === "win32" ? "warp-minimal.exe" : "warp-minimal";
+		const binPath = warpInstallPath();
+		const runningBin = resolveWarpBin();
+		const sameDir = (left: string, right: string): boolean =>
+			left.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() ===
+			right.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+		if (runningBin && !sameDir(dirname(runningBin), WARP_INSTALL_DIR)) {
+			ctx.ui.notify(
+				[
+					"pi-free-bridge warp update",
+					`  runs from: ${runningBin}`,
+					`  replaces:  ${binPath}`,
+					"",
+					"The running proxy is not the binary this command owns, so swapping the file",
+					"here would leave the old process serving the old build. Point warpBin (in",
+					`${BRIDGE_CONFIG_PATH}) or PI_FREE_BRIDGE_WARP_BIN at ${binPath}, then run it again.`,
+				].join("\n"),
+				"warning",
+			);
+			return;
+		}
+
+		// Facts the outcome message needs and `UpdateWarpBinaryResult` cannot carry:
+		// whether the swap was even reached, whether the proxy stopped, and whether
+		// the new binary landed. Each one changes what "the old binary" means.
+		let asset: { tag: string; url: string; name: string; size: number } | undefined;
+		let staged: string | undefined;
+		let swapAttempted = false;
+		let stoppedForSwap: boolean | undefined;
+		let swapOk = false;
+
+		const proxyHealth = async (): Promise<unknown> => {
+			try {
+				const res = await fetch(target.healthUrl, { signal: AbortSignal.timeout(1500) });
+				return res.ok ? await res.json() : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+		const timeoutSeconds = Math.round(RELAY_SWAP_TIMEOUT_MS / 1000);
+
+		/** Where the old binary stands after an attempt that installed no verified
+		 *  build. Never a bare verdict: every branch names a file. */
+		const restoreNote = (): string[] => {
+			if (!swapAttempted) return [`  nothing was swapped: ${binPath} is the binary it already was.`];
+			if (stoppedForSwap === false) return [`  the proxy could not be stopped, so ${binPath} was not replaced.`];
+			if (swapOk) return [`  the new binary is at ${binPath}; the previous one is kept as ${binPath}.prev.`];
+			return [`  the previous binary was not restored: ${binPath} does not hold it.`];
+		};
+
+		let result: UpdateWarpBinaryResult | undefined;
+		let thrown: string | undefined;
+		try {
+			result = await updateWarpBinary({
+				latestTag: async () => {
+					asset = await findWarpAsset();
+					return asset?.tag ?? null;
+				},
+				installedRecord: () => {
+					const record = readWarpInstallRecord();
+					return record ? { tag: record.tag, commit: record.commit } : undefined;
+				},
+				confirm: async () => {
+					const lines = [
+						`${asset?.tag ?? "the latest release"} — warp-minimal from github.com/Deury08/warp-minimal`,
+						`  installs to ${binPath}`,
+						"  the published sha256 is verified before anything is executed",
+						"",
+						"This is the only path that stops the proxy: the binary is replaced",
+						"underneath the process serving right now, and it stays down until the",
+						"new one answers /health.",
+						"",
+						...warpUpdateCostLines(),
+					];
+					return ctx.ui.confirm("pi-free-bridge: update warp-minimal", lines.join("\n"));
+				},
+				download: async () => {
+					// One release read for the whole update: the tag the decision used and
+					// the asset that is downloaded must be the same release.
+					const release = asset ?? (await findWarpAsset());
+					if (!release) return undefined;
+					staged = await installWarpBinary(release, (message) => ctx.ui.notify(message, "info"), {
+						stage: true,
+					});
+					return staged;
+				},
+				swap: async (downloaded, tag) => {
+					swapAttempted = true;
+					const swapped = await swapRelayBinary({
+						dir: WARP_INSTALL_DIR,
+						name: exeName,
+						downloaded,
+						version: String(tag).replace(/^v/, "") || "unknown",
+						timeoutMs: RELAY_SWAP_TIMEOUT_MS,
+						stopRelay: async () => {
+							stoppedForSwap = await warpStopForSwap(target.healthUrl);
+							return stoppedForSwap;
+						},
+						startRelay: () =>
+							warpStartAndVerify({
+								start: () => ensureWarp(),
+								probe: proxyHealth,
+								sleep: (ms) => new Promise<void>((done) => setTimeout(done, ms)),
+							}),
+						askContinue: async () => {
+							if (!ctx.hasUI) return "none";
+							const wait = await ctx.ui.confirm(
+								"pi-free-bridge: the new proxy did not answer",
+								[
+									`The new warp-minimal is installed but did not answer /health in ${timeoutSeconds}s.`,
+									`  target: ${target.healthUrl}`,
+									"",
+									`Wait the same ${timeoutSeconds}s again, or go back to the previous binary?`,
+									"If you do not answer, the previous binary comes back on its own.",
+								].join("\n"),
+							);
+							return wait ? "wait" : "rollback";
+						},
+					});
+					swapOk = swapped.ok;
+					return { ok: swapped.ok, rolledBack: swapped.rolledBack, reason: swapped.reason };
+				},
+				readRunningCommit: async () => {
+					const body = (await proxyHealth()) as { build?: { commit?: unknown } } | undefined;
+					const commit = body?.build && typeof body.build.commit === "string" ? body.build.commit.trim() : "";
+					return commit && commit !== "unknown" ? commit : null;
+				},
+				writeRecord: ({ tag, commit }) => writeWarpInstallRecord({ tag, commit }),
+			});
+		} catch (err) {
+			thrown = (err as Error)?.message || String(err);
+		} finally {
+			// A staged download is either renamed into place by the swap or left behind
+			// by a swap that never ran; it must not linger as a third name.
+			if (staged) {
+				try {
+					rmSync(staged, { force: true });
+				} catch {
+					// A leftover staged file costs disk, not correctness.
+				}
+			}
+		}
+
+		const lines = ["pi-free-bridge warp update", `  target:  ${describeWarpTarget(target)}`];
+
+		if (!result) {
+			lines.push(`  the update stopped on an error: ${thrown ?? "no result was reported"}.`, ...restoreNote());
+			ctx.ui.notify(lines.join("\n"), "error");
+			return;
+		}
+
+		switch (result.status) {
+			case "up-to-date":
+				lines.push(
+					`  ${result.tag} is already the release this extension installed${
+						result.commit ? ` (commit ${result.commit})` : ""
+					}: nothing was downloaded.`,
+				);
+				break;
+			case "unknown":
+				lines.push(
+					"  the Deury08/warp-minimal release could not be read, so nothing was",
+					"  downloaded and nothing was touched: the proxy keeps the binary it has.",
+					"  Run this command again once GitHub answers.",
+				);
+				break;
+			case "declined":
+				lines.push("  you answered no: nothing was downloaded and nothing was stopped.");
+				break;
+			case "updated":
+				lines.push(
+					`  ${result.tag} is installed, and ${target.healthUrl} answers /health`,
+					`  with commit ${result.commit}: this extension recorded what now runs.`,
+				);
+				break;
+			case "rolled-back":
+				lines.push(
+					`  the new build did not prove itself: ${result.reason}.`,
+					`  the previous binary was put back at ${binPath}; the build that failed was deleted.`,
+				);
+				break;
+			case "failed":
+				lines.push(`  ${result.reason}.`, ...restoreNote());
+				break;
+		}
+
+		const level =
+			result.status === "failed"
+				? "error"
+				: result.status === "unknown" || result.status === "rolled-back"
+					? "warning"
+					: "info";
+		ctx.ui.notify(lines.join("\n"), level);
+	}
+
 	/** Menu item 2: what the relay is doing right now. */
 	async function showRelayStatus(ctx: MenuCtx): Promise<void> {
 		const health = await fetchRelayHealth(RELAY_PORT);
@@ -3175,11 +3957,19 @@ export default async function (pi: ExtensionAPI) {
 		}
 
 		writeBridgeConfig({ warpEnabled: chosen });
+		// D11: nothing stops the proxy automatically. It is shared between sessions, so
+		// a session that quits cannot know whether another one is using it; the cost
+		// of leaving it alive is zero, and the cost of guessing wrong is another Pi's
+		// service. The only stop is an explicit act: replacing the binary.
+		const stopNote =
+			chosen === "off"
+				? " The proxy keeps running: nothing stops it automatically, and switching back on stays instant."
+				: "";
 		// relay-warp-hot-reload: no relay restart. The relay re-reads the config
 		// file on every request, so the new mode applies on the next request with
 		// the same process (pid survives the switch).
 		ctx.ui.notify(
-			`WARP mode set to ${chosen} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
+			`WARP mode set to ${chosen} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.${stopNote}`,
 			"info",
 		);
 	}
@@ -3319,6 +4109,14 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("free-bridge-warp-update", {
+		description:
+			"Update warp-minimal to the latest release — the only command that stops the proxy to replace its binary",
+		handler: async (_args: string, ctx) => {
+			await runWarpUpdate(ctx as MenuCtx);
+		},
+	});
+
 	pi.registerCommand("free-bridge-doctor", {
 		description: "Diagnose and repair why the free OpenCode models are missing from the picker",
 		handler: async (_args: string, ctx) => {
@@ -3383,3 +4181,4 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 }
+

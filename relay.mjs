@@ -1299,15 +1299,41 @@ export function nearestQuotaReset(ledger, now = Date.now()) {
 	return nearest;
 }
 
+/** D10: the variable the clash message tells you to set is the variable the
+ *  relay actually reads. `PI_FREE_BRIDGE_RELAY_PORT` was named in the advice
+ *  while only `PORT` was ever read, so following the advice changed nothing.
+ *  `PORT` stays supported for the existing spawn path. */
+export function resolveListenPort(env = process.env) {
+	const raw = env.PI_FREE_BRIDGE_RELAY_PORT ?? env.PORT ?? "";
+	return Number.parseInt(String(raw).trim(), 10);
+}
+
 /** Pure: what `/health` publishes about the ledger. `nearestResetInMs` is a
  *  remaining window, like `localParkedForMs`, because that is the number a human
- *  reads; 0 means nothing is parked (S12). */
-export function quotaLedgerHealth(ledger, now = Date.now()) {
-	const parked = Object.values(ledger && ledger.egresses ? ledger.egresses : {}).filter(
+ *  reads; 0 means nothing is parked (S12).
+ *
+ *  D14: a park is a guard, not a tombstone. A restart hands the pool new egress
+ *  addresses, so an entry can name an exit that is gone — but addresses are
+ *  reused, so that entry still protects the address if it comes back, and it is
+ *  never pruned. What the count alone cannot say is how many guards can fire
+ *  against the pool as it stands, so `parkedLive` says exactly that. `null` when
+ *  the pool did not answer, because not knowing is not the same as knowing there
+ *  are none; an empty pool answers with 0. */
+export function quotaLedgerHealth(ledger, exits, now = Date.now()) {
+	const parkedEntries = Object.values(ledger && ledger.egresses ? ledger.egresses : {}).filter(
 		(entry) => entry && typeof entry.parked_until === "number" && entry.parked_until > now,
-	).length;
+	);
 	const reset = nearestQuotaReset(ledger, now);
-	return { parked, nearestResetInMs: reset > 0 ? Math.max(0, reset - now) : 0 };
+	let parkedLive = null;
+	if (Array.isArray(exits)) {
+		const live = new Set(exits.map((exit) => exit && exit.id).filter(Boolean));
+		parkedLive = parkedEntries.filter((entry) => live.has(entry.exit_id)).length;
+	}
+	return {
+		parked: parkedEntries.length,
+		parkedLive,
+		nearestResetInMs: reset > 0 ? Math.max(0, reset - now) : 0,
+	};
 }
 
 /** Pure: the proxy URL that names one exit. The credential is the only channel
@@ -1466,11 +1492,30 @@ export function warpDeclaredExits(body) {
  *  already reads that endpoint right before choosing an exit, so the declaration
  *  costs nothing there — no probe, no extra hop, and an old binary sees exactly
  *  the traffic it sees today. */
+/** Pure: the proxy's build identity from a `/health` body (S29). Three states,
+ *  never two: an identifiable commit; a proxy that answered without one (the Go
+ *  default is the literal `unknown`, which is absence of identity, not a
+ *  commit); and `undefined` when the body carried no `build` object at all,
+ *  which the caller publishes as `null`. Collapsing "no identity" into "no
+ *  answer" would make the relay claim it never heard from a proxy that did
+ *  answer. */
+export function warpBuildFact(body) {
+	const build = body && typeof body === "object" ? body.build : undefined;
+	if (!build || typeof build !== "object" || Array.isArray(build)) return undefined;
+	const commit = typeof build.commit === "string" ? build.commit.trim() : "";
+	const builtAt = typeof build.built_at === "string" ? build.built_at.trim() : "";
+	return {
+		commit: commit && commit !== "unknown" ? commit : null,
+		builtAt: builtAt || null,
+	};
+}
+
 function recordWarpCapability(proxy, body, now) {
 	warpExitsProbe = {
 		proxy,
 		at: now,
 		value: warpDeclaredExits(body) ? "structured" : "legacy",
+		build: warpBuildFact(body),
 	};
 }
 
@@ -1496,6 +1541,18 @@ export async function warpExitsCapability(config, now = Date.now()) {
 		return "unknown";
 	}
 	return warpExitsProbe?.proxy === proxy ? warpExitsProbe.value : "unknown";
+}
+
+/** The proxy's build identity, from the same cached `/health` read the capability
+ *  question already performs (S29). No extra request: the probe carries the build
+ *  when it recorded one. `null` means no answer yet or a body without `build`;
+ *  `{commit: null}` means the proxy answered but cannot say what it is. */
+export async function warpBuildIdentity(config, now = Date.now()) {
+	const proxy = String(config?.warpProxy ?? "").trim().replace(/\/+$/, "");
+	if (!proxy) return null;
+	await warpExitsCapability(config, now);
+	if (!warpExitsProbe || warpExitsProbe.proxy !== proxy) return null;
+	return warpExitsProbe.build ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -3268,6 +3325,7 @@ export async function handle(req, res, config) {
 		// S11: the capability decides everything below, and it is cached for a
 		// minute, so a diagnostic read rarely asks the proxy anything at all.
 		const warpExits = await warpExitsCapability(config);
+		const warpBuild = await warpBuildIdentity(config);
 		// Only a proxy that publishes the structured route is asked for the list: an
 		// older binary has none, and asking it twice for nothing is a wasted hop.
 		const exitsDetail = warpExits === "structured" ? await readWarpExitsDetail(config) : undefined;
@@ -3314,12 +3372,17 @@ export async function handle(req, res, config) {
 			// S12: the ledger in one glance — how many egresses are parked right now,
 			// how long until the nearest one frees up, and the file it lives in.
 			quotaLedger: {
-				...quotaLedgerHealth(quotaLedger, Date.now()),
+				// D14: the pool as it stands, so the count can say how many parks
+				// still correspond to a live exit. Undefined leaves it null.
+				...quotaLedgerHealth(quotaLedger, exitsDetail, Date.now()),
 				path: activeQuotaLedgerPath(),
 			},
 			// S11: what the proxy can actually answer. `legacy` means it has no
 			// `/exits`, so nothing is preferred and nothing claims to be.
 			warpExits: warpExits,
+			// S29: which proxy build is answering, so "installed but not running"
+			// becomes observable instead of inferred. null = no answer.
+			warpBuild: warpBuild,
 			// S9: how many of the listed exits carry an egress address the ledger can
 			// key. A stale address still counts here — the exit exists, it is only not
 			// preferable — so this number is not the routing switch.
@@ -3358,7 +3421,7 @@ export async function handle(req, res, config) {
 }
 
 async function startServer() {
-	const parsedPort = Number.parseInt(process.env.PORT ?? "", 10);
+	const parsedPort = resolveListenPort();
 	const port = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort < 65536 ? parsedPort : DEFAULT_PORT;
 
 	// S31: resolve the session before listening, so a missing id is a clear

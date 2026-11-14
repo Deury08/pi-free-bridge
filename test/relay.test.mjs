@@ -3936,7 +3936,7 @@ test("the installed binary keeps its plain name; the previous one is .prev (S1)"
 	assert.equal(String(current) + ".prev", "/opt/bin/relay-linux-x64.prev");
 });
 
-test("the extension registers exactly three commands, no aliases, no argument form", async () => {
+test("the extension registers exactly four commands, no aliases, no argument form", async () => {
 	// The catalog fetch is skipped so this test never depends on the network.
 	process.env.PI_FREE_BRIDGE_SKIP_CATALOG = "1";
 	// S1: the whole point of the change is the autocomplete list, so the list
@@ -3954,7 +3954,7 @@ test("the extension registers exactly three commands, no aliases, no argument fo
 
 	assert.deepEqual(
 		registered.map((entry) => entry.name),
-		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-warp-update", "free-bridge-doctor"],
 	);
 
 	const menu = registered.find((entry) => entry.name === "free-bridge");
@@ -4022,9 +4022,62 @@ test("commands register even when model discovery finds nothing at all", () => {
 
 	assert.deepEqual(
 		registered,
-		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-warp-update", "free-bridge-doctor"],
 		"zero models must not cost the user the menu",
 	);
+});
+
+test("free-bridge-warp-update says what it does and refuses to run blind", (t) => {
+	// The command is the one entry point that replaces the proxy binary, so its
+	// autocomplete line has to name the release it fetches and the stop it costs.
+	// Asserted through the registration a fake `pi` captures, never a source grep:
+	// this is exactly what Pi shows when the user types `/free-bridge`. A child
+	// process is used because the factory guards double registration on
+	// globalThis, so the in-process test above already consumed it.
+	const home = mkdtempSync(join(tmpdir(), "pfb-warp-update-"));
+	t.after(() => rmSync(home, { recursive: true, force: true }));
+	const marker = "@@WARP-UPDATE@@";
+	const script = `
+		const { default: factory } = await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});
+		const commands = {};
+		await factory({
+			registerCommand: (name, options) => { commands[name] = options; },
+			registerProvider: () => {},
+			registerTool: () => {},
+			on: () => {},
+			config: {},
+			ui: { notify() {} },
+		});
+		const seen = [];
+		const ctx = { hasUI: false, ui: { notify: (text, kind) => seen.push({ text, kind }) } };
+		await commands["free-bridge-warp-update"].handler("", ctx);
+		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify({
+			names: Object.keys(commands),
+			description: commands["free-bridge-warp-update"].description,
+			hasHandler: typeof commands["free-bridge-warp-update"].handler === "function",
+			seen,
+		}));
+	`;
+	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "1" },
+		encoding: "utf-8",
+	});
+	const captured = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+
+	assert.equal(captured.names.includes("free-bridge-warp-update"), true, "the update command is registered");
+	assert.equal(
+		captured.description,
+		"Update warp-minimal to the latest release — the only command that stops the proxy to replace its binary",
+	);
+	assert.equal(captured.hasHandler, true, "the command is actually runnable");
+
+	// Without a UI nobody can read the cost or answer the confirmation, so the
+	// handler must refuse and say why instead of stopping the proxy blind.
+	assert.equal(captured.seen.length, 1, "the refusal answers exactly once");
+	assert.equal(captured.seen[0].kind, "warning");
+	assert.match(captured.seen[0].text, /STOPS the proxy/, "it says the stop it would cost");
+	assert.match(captured.seen[0].text, /no UI to ask in/, "it names the reason it cannot ask");
+	assert.match(captured.seen[0].text, /free-bridge-warp-update from an interactive Pi/, "and where to run it instead");
 });
 
 test("the install item exists only for machines without Bun", () => {
@@ -4803,6 +4856,7 @@ import {
 	pruneQuotaLedger,
 	proxyUrlWithExit,
 	quotaEgressKey,
+	warpBuildFact,
 	quotaLedgerHealth,
 	quotaLedgerPath,
 	quotaPrefix64,
@@ -5079,8 +5133,72 @@ test("quotaLedgerHealth: the two numbers /health publishes (S12)", () => {
 			},
 		}),
 	);
-	assert.deepEqual(quotaLedgerHealth(ledger, LEDGER_NOW), { parked: 2, nearestResetInMs: 30_000 });
-	assert.deepEqual(quotaLedgerHealth(parseQuotaLedger(""), LEDGER_NOW), { parked: 0, nearestResetInMs: 0 });
+	// D14: the same two numbers must survive the pool argument being absent.
+	assert.deepEqual(quotaLedgerHealth(ledger, undefined, LEDGER_NOW), {
+		parked: 2,
+		parkedLive: null,
+		nearestResetInMs: 30_000,
+	});
+	assert.deepEqual(quotaLedgerHealth(parseQuotaLedger(""), undefined, LEDGER_NOW), {
+		parked: 0,
+		parkedLive: null,
+		nearestResetInMs: 0,
+	});
+});
+
+// D12: the ledger is pruned only when it is written, so in the window between a
+// reset expiring and the next park the in-memory ledger still carries the stale
+// entry. What /health reports has to be the clock's answer, not the file's: no
+// write happens here, so the only thing that can keep `parked` honest is the
+// read-time filter.
+test("quotaLedgerHealth: an expired park stops counting before any write prunes it (D12)", () => {
+	const ledger = parseQuotaLedger(
+		JSON.stringify({
+			version: 1,
+			egresses: {
+				[V4_A]: { parked_until: LEDGER_NOW - 1_000, exit_id: "warp-a" },
+				[V4_B]: { parked_until: LEDGER_NOW - 60_000, exit_id: "warp-b" },
+				[LOCAL_EGRESS_KEY]: { parked_until: LEDGER_NOW - 90_000 },
+			},
+		}),
+	);
+	// The window D12 names: every entry already expired, and nothing has written.
+	assert.equal(Object.keys(ledger.egresses).length, 3, "the expired parks are still in the in-memory ledger");
+	assert.deepEqual(quotaLedgerHealth(ledger, [{ id: "warp-a" }, { id: "warp-b" }], LEDGER_NOW), {
+		parked: 0,
+		parkedLive: 0,
+		nearestResetInMs: 0,
+	});
+});
+
+// D14: a park is a guard, not a tombstone — a burnt address still protects a
+// live exit if the address came back. So nothing is pruned; the health line only
+// says how many of the guards can fire against the pool as it stands right now.
+const D14_LEDGER = parseQuotaLedger(
+	JSON.stringify({
+		version: 1,
+		egresses: {
+			[V4_A]: { parked_until: LEDGER_NOW + 90_000, exit_id: "warp-a" },
+			[V4_B]: { parked_until: LEDGER_NOW + 30_000, exit_id: "warp-gone" },
+			[LOCAL_EGRESS_KEY]: { parked_until: LEDGER_NOW + 60_000 },
+		},
+	}),
+);
+
+test("quotaLedgerHealth: parkedLive counts the guards whose exit is still in the pool (D14)", () => {
+	const health = quotaLedgerHealth(D14_LEDGER, [{ id: "warp-a" }, { id: "warp-b" }], LEDGER_NOW);
+	assert.equal(health.parked, 3);
+	assert.equal(health.parkedLive, 1, "two of the three guards name an exit that is not in the pool");
+});
+
+test("quotaLedgerHealth: a pool that did not answer says null, never zero (D14)", () => {
+	assert.equal(quotaLedgerHealth(D14_LEDGER, undefined, LEDGER_NOW).parkedLive, null);
+});
+
+test("quotaLedgerHealth: a pool that answered with no exits says zero, which is not null (D14)", () => {
+	const parkedBefore = JSON.stringify(D14_LEDGER);
+	assert.equal(quotaLedgerHealth(D14_LEDGER, [], LEDGER_NOW).parkedLive, 0);
+	assert.equal(JSON.stringify(D14_LEDGER), parkedBefore, "reading health must not mutate the ledger");
 });
 
 test("proxyUrlWithExit: the exit id rides as the credential, empty password (S3, L5)", () => {
@@ -5453,8 +5571,16 @@ test("/health reports the ledger and keeps preferredRouting false (S12)", async 
 			});
 			const body = JSON.parse(res.body());
 
-			assert.deepEqual(Object.keys(body.quotaLedger).sort(), ["nearestResetInMs", "parked", "path"]);
+			assert.deepEqual(Object.keys(body.quotaLedger).sort(), [
+				"nearestResetInMs",
+				"parked",
+				"parkedLive",
+				"path",
+			]);
 			assert.equal(body.quotaLedger.parked, 2);
+			// D14: with warp off there is no pool to ask, so the guard count is
+			// null — an unanswered pool is not an empty one.
+			assert.equal(body.quotaLedger.parkedLive, null);
 			assert.ok(
 				body.quotaLedger.nearestResetInMs > 0 && body.quotaLedger.nearestResetInMs <= 60_000,
 				`nearest reset ${body.quotaLedger.nearestResetInMs}ms`,
@@ -6236,4 +6362,742 @@ test("/health publishes the free round and its terminal 429 (S23)", async () => 
 			resetWarpStateForTests();
 		}
 	});
+});
+
+// ---------------------------------------------------------------------------
+// Download progress (odd/tasks/download-progress.md).
+//
+// Every file the extension downloads must say how far along it is, but a
+// percentage is a claim about the whole file: it is shown only when the server
+// sent a content-length, never guessed from a release-API size, and never
+// faked as 0% or 100% when the length is missing or unusable. Bodies are read
+// through local streams here — nothing touches the network.
+// ---------------------------------------------------------------------------
+
+/** A response body that hands back `chunks` and then ends. */
+function bodyOf(chunks) {
+	return new ReadableStream({
+		start(controller) {
+			for (const chunk of chunks) controller.enqueue(new Uint8Array(chunk));
+			controller.close();
+		},
+	});
+}
+
+/** A response body that delivers `first` and then fails, like a dropped
+ *  connection halfway through a download. */
+function brokenBodyOf(first, error) {
+	let pulls = 0;
+	return new ReadableStream({
+		pull(controller) {
+			if (pulls++ === 0) {
+				controller.enqueue(new Uint8Array(first));
+				return;
+			}
+			controller.error(error);
+		},
+	});
+}
+
+test("formatDownloadProgress: a known content-length states the percentage and both sizes", () => {
+	// 2_000_000 of 4_194_304 bytes is 47%: the readout is the line the user
+	// reads while the warp archive lands, not a log entry.
+	const line = releaseMod.formatDownloadProgress({
+		label: "Downloading warp-minimal v0.5.0…",
+		received: 2000000,
+		total: 4 * 1048576,
+	});
+	assert.equal(line, "Downloading warp-minimal v0.5.0… 47% (1.9 MB / 4.0 MB)");
+});
+
+test("formatDownloadProgress: an unknown length reports bytes only and claims no percentage", () => {
+	// A chunked response carries no content-length. Printing 0% or 100% would be
+	// inventing a fact the server never sent.
+	const line = releaseMod.formatDownloadProgress({
+		label: "Downloading relay.js v0.6.0…",
+		received: 2000000,
+		total: undefined,
+	});
+	assert.equal(line, "Downloading relay.js v0.6.0… 1.9 MB (size unknown)");
+	assert.doesNotMatch(line, /%/, "no percentage may appear without a known total");
+});
+
+test("formatDownloadProgress: a zero-length body claims neither 0% nor 100%", () => {
+	const line = releaseMod.formatDownloadProgress({
+		label: "Downloading relay.js v0.6.0…",
+		received: 0,
+		total: 0,
+	});
+	assert.equal(line, "Downloading relay.js v0.6.0… 0.0 MB (size unknown)");
+	assert.doesNotMatch(line, /%/, "a 0-byte total is unusable, so it is not a percentage");
+});
+
+test("downloadPercent: arithmetic, clamping, and no percentage for an unusable total", () => {
+	assert.equal(releaseMod.downloadPercent(0, 4194304), 0);
+	assert.equal(releaseMod.downloadPercent(2097152, 4194304), 50);
+	assert.equal(releaseMod.downloadPercent(4194304, 4194304), 100);
+	assert.equal(releaseMod.downloadPercent(999, 1000), 99, "a partial byte never rounds up to complete");
+	assert.equal(releaseMod.downloadPercent(5000, 1000), 100, "a server that overruns its own total is capped");
+
+	for (const total of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+		assert.equal(
+			releaseMod.downloadPercent(100, total),
+			undefined,
+			`total ${String(total)} is not a known size, so it has no percentage`,
+		);
+	}
+});
+
+test("contentLengthFrom: reads a usable content-length and refuses everything else", () => {
+	const headers = (value) => ({ get: (name) => (name.toLowerCase() === "content-length" ? value : null) });
+	assert.equal(releaseMod.contentLengthFrom(headers("4194304")), 4194304);
+	assert.equal(releaseMod.contentLengthFrom(headers(" 4194304 ")), 4194304);
+	assert.equal(releaseMod.contentLengthFrom(headers(null)), undefined, "absent: chunked transfer");
+	assert.equal(releaseMod.contentLengthFrom(headers("0")), undefined, "a zero total cannot carry a percentage");
+	assert.equal(releaseMod.contentLengthFrom(headers("-")), undefined);
+	assert.equal(releaseMod.contentLengthFrom(headers("12abc")), undefined);
+	assert.equal(releaseMod.contentLengthFrom(undefined), undefined);
+});
+
+test("createDownloadReporter: one line per percentage point or per 100 ms, never per chunk", () => {
+	const lines = [];
+	const clock = { at: 0 };
+	const report = (line) => lines.push(line);
+
+	// With no content-length only the clock can gate the update.
+	const unknown = releaseMod.createDownloadReporter({
+		label: "Downloading relay.js v0.6.0…",
+		total: undefined,
+		report,
+		now: () => clock.at,
+	});
+	unknown(1048576);
+	assert.deepEqual(lines, ["Downloading relay.js v0.6.0… 1.0 MB (size unknown)"]);
+	clock.at = 40;
+	unknown(2097152);
+	clock.at = 99;
+	unknown(3145728);
+	assert.equal(lines.length, 1, "chunks arriving inside the window are not reported one by one");
+	clock.at = 100;
+	unknown(4194304);
+	assert.equal(lines.length, 2, "100 ms elapsed, so the next chunk is reported");
+
+	// With a known total a whole percentage point moves the readout immediately.
+	lines.length = 0;
+	const known = releaseMod.createDownloadReporter({
+		label: "Downloading warp-minimal v0.5.0…",
+		total: 1000,
+		report,
+		now: () => clock.at,
+	});
+	known(0);
+	assert.equal(lines[0], "Downloading warp-minimal v0.5.0… 0% (0.0 MB / 0.0 MB)");
+	known(5);
+	assert.equal(lines.length, 1, "the same percentage inside the window is suppressed");
+	clock.at = 101;
+	known(10);
+	assert.equal(lines.length, 2, "a new percentage point is reported without waiting");
+	assert.match(lines[1], / 1% \(/);
+
+	// The caller forces the last line so the readout ends on the real byte count.
+	clock.at = 102;
+	known(1000, true);
+	assert.match(lines[2], / 100% \(/);
+});
+
+test("readDownloadBody: streams every byte and ends on the finished size", async () => {
+	const lines = [];
+	const bytes = await releaseMod.readDownloadBody({
+		body: bodyOf([[1, 2, 3], [4, 5], [6]]),
+		label: "Downloading warp-minimal v0.5.0…",
+		total: 6,
+		report: (line) => lines.push(line),
+		now: () => 0,
+	});
+	assert.deepEqual([...bytes], [1, 2, 3, 4, 5, 6], "the body arrives intact");
+	assert.match(lines.at(-1), / 100% \(/, "the last line states the download finished");
+});
+
+test("readDownloadBody: a stream that fails midway rejects and never looks complete", async () => {
+	const lines = [];
+	await assert.rejects(
+		releaseMod.readDownloadBody({
+			body: brokenBodyOf([1, 2, 3], new Error("connection reset")),
+			label: "Downloading relay.js v0.6.0…",
+			total: 10,
+			report: (line) => lines.push(line),
+			now: () => 0,
+		}),
+		/connection reset/,
+		"a half-read body is a failed download, not a short one",
+	);
+	assert.ok(
+		lines.every((line) => !/ 100% /.test(line)),
+		"nothing claims the partial body was the whole file",
+	);
+});
+
+test("readDownloadBody: a response with no body is a failed download", async () => {
+	await assert.rejects(
+		releaseMod.readDownloadBody({ body: null, label: "Downloading relay.js v0.6.0…", total: undefined }),
+		/no body/,
+	);
+});
+
+test("every file download in index.ts streams through readDownloadBody", () => {
+	// Two install sites (warp-minimal, relay) download a binary off the network.
+	// Buffering one of them with `arrayBuffer()` would silently lose its progress.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(source, /arrayBuffer\(\)/, "no download may buffer a body without progress");
+	assert.equal(
+		(source.match(/await readDownloadBody\(/g) ?? []).length,
+		2,
+		"both install sites report progress",
+	);
+});
+
+// T9a / S29: the proxy's build identity is a fact the relay republishes, so
+// "which binary is running" stops being a guess. Three states, never two:
+// identifiable, answered without identity (the Go default is "unknown"), and
+// no answer at all.
+test("warpBuildFact: a build that names its commit is reported as an identity (S29)", () => {
+	assert.deepEqual(
+		warpBuildFact({ build: { commit: "b04459a", built_at: "2026-11-14T14:35:36Z" } }),
+		{ commit: "b04459a", builtAt: "2026-11-14T14:35:36Z" },
+	);
+});
+
+test("warpBuildFact: the Go default \"unknown\" is absence of identity, not a commit (S29)", () => {
+	assert.deepEqual(warpBuildFact({ build: { commit: "unknown", built_at: "unknown" } }), {
+		commit: null,
+		builtAt: "unknown",
+	});
+	assert.deepEqual(warpBuildFact({ build: {} }), { commit: null, builtAt: null });
+});
+
+test("warpBuildFact: a body without a build key yields nothing, which /health publishes as null (S29)", () => {
+	assert.equal(warpBuildFact({ ok: true, exits: [] }), undefined);
+	assert.equal(warpBuildFact(undefined), undefined);
+	assert.equal(warpBuildFact({ build: "b04459a" }), undefined);
+});
+
+test("/health republishes the proxy's build identity, and null when it has none (S29)", async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => healthJson({ ok: true, capabilities: { exits: true }, build: { commit: "b04459a", built_at: "2026-11-14T14:35:36Z" } });
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await handle({ method: "GET", url: "/health", headers: {}, on() {} }, res, { ...FORWARD_CONFIG, warpMode: "off" });
+		const body = JSON.parse(res.body());
+		assert.deepEqual(body.warpBuild, { commit: "b04459a", builtAt: "2026-11-14T14:35:36Z" });
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+
+	// A proxy that answers without a build object publishes null: the relay has
+	// no identity to report, and inventing one would defeat the whole point.
+	globalThis.fetch = async () => healthJson({ ok: true, capabilities: { exits: true } });
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await handle({ method: "GET", url: "/health", headers: {}, on() {} }, res, { ...FORWARD_CONFIG, warpMode: "off" });
+		const body = JSON.parse(res.body());
+		assert.ok(Object.prototype.hasOwnProperty.call(body, "warpBuild"), "warpBuild must be present, not absent");
+		assert.equal(body.warpBuild, null);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+// T9b / S29, S30c, S30d: the running proxy must be able to say which build it is,
+// and when it cannot, the notice has to name the action. Every case below is one
+// line of policy: silence when there is nothing to do, one actionable sentence
+// otherwise, and never a diagnostic without a command.
+test("parseWarpBuildVersion: the commit in parentheses is the identity (T9b)", () => {
+	assert.equal(releaseMod.parseWarpBuildVersion("warp-minimal v0.2.3 (b04459a)"), "b04459a");
+	assert.equal(releaseMod.parseWarpBuildVersion("  warp-minimal v0.2.3 (b04459a)\n"), "b04459a");
+});
+
+test("parseWarpBuildVersion: (unknown) is absence of identity, not a commit (T9b)", () => {
+	assert.equal(releaseMod.parseWarpBuildVersion("warp-minimal v0.2.3 (unknown)"), null);
+	assert.equal(releaseMod.parseWarpBuildVersion("warp-minimal v0.2.3"), null);
+	assert.equal(releaseMod.parseWarpBuildVersion(""), null);
+});
+
+test("warpBuildNotice: equal builds say nothing at all (T9b)", () => {
+	assert.equal(releaseMod.warpBuildNotice({ running: "b04459a", installed: "b04459a" }), null);
+});
+
+test("warpBuildNotice: an unidentifiable proxy names the update, which is what installs identity (T9b)", () => {
+	assert.equal(
+		releaseMod.warpBuildNotice({ running: null, installed: null }),
+		"warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update",
+	);
+	assert.equal(
+		releaseMod.warpBuildNotice({ running: null, installed: "b04459a" }),
+		"warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update",
+	);
+});
+
+test("warpBuildNotice: a different build on disk names both commits (T9b)", () => {
+	assert.equal(
+		releaseMod.warpBuildNotice({ running: "b04459a", installed: "9a1c2f0" }),
+		"the proxy runs b04459a, the installed build is 9a1c2f0 — /warp update",
+	);
+});
+
+test("warpBuildNotice: an installed build older than the running one is not an update (T9b)", () => {
+	// The running proxy can name itself and the file on disk cannot: the file is
+	// the older artifact, so "update" would be advice to downgrade.
+	assert.equal(releaseMod.warpBuildNotice({ running: "b04459a", installed: null }), null);
+});
+
+test("warpBuildDrift: a dependency that fails is no answer, never a broken entry point (T9b)", async () => {
+	const notice = await releaseMod.warpBuildDrift({
+		fetchProxyBuild: async () => {
+			throw new Error("connect ECONNREFUSED");
+		},
+		readInstalledBuild: () => {
+			throw new Error("spawn failed");
+		},
+	});
+	assert.match(notice ?? "", /does not publish its identity/);
+});
+
+test("warpBuildDrift: matching builds produce no notice at all (T9b)", async () => {
+	const notice = await releaseMod.warpBuildDrift({
+		fetchProxyBuild: async () => "b04459a",
+		readInstalledBuild: () => "b04459a",
+	});
+	assert.equal(notice, null);
+});
+
+// T9c: a release publishes its tag, never the commit inside it, and the binary
+// prints the source's version constant rather than the tag — so "up to date" is
+// read from the install record, not guessed from the download.
+test("warpUpdateDecision: the same tag decides nothing is to be installed (T9c)", () => {
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: "v0.4.0" }), "up-to-date");
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: "0.4.0" }), "up-to-date");
+});
+
+test("warpUpdateDecision: a different or missing record means install (T9c)", () => {
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: "v0.3.1" }), "update");
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: null }), "update");
+});
+
+test("warpUpdateDecision: no latest tag is unknown, which is not 'update' (T9c)", () => {
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: null, installedTag: "v0.4.0" }), "unknown");
+	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "  ", installedTag: "v0.4.0" }), "unknown");
+});
+
+// T9c: the record is the fact `warpUpdateDecision` needs. Every test below passes
+// an explicit path, so the real install directory is never read or written.
+test("warpInstallRecord: a written record round trips tag, commit and timestamp (T9c)", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-install-record-"));
+	try {
+		const path = join(dir, "warp-install.json");
+		const before = Date.now();
+		releaseMod.writeWarpInstallRecord({ tag: "v0.4.0", commit: "b04459a" }, path);
+		const read = releaseMod.readWarpInstallRecord(path);
+		assert.deepEqual({ tag: read.tag, commit: read.commit }, { tag: "v0.4.0", commit: "b04459a" });
+		assert.ok(typeof read.installed_at === "number", "installed_at is a number");
+		assert.ok(read.installed_at >= before && read.installed_at <= Date.now(), "installed_at is the write time");
+		// Atomic write: the record is the only file left, no temp file beside it.
+		assert.deepEqual(readdirSync(dir), ["warp-install.json"]);
+		assert.equal(
+			releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: releaseMod.readWarpInstallRecord(path).tag }),
+			"up-to-date",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("warpInstallRecord: a missing file is no record at all (T9c)", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-install-record-"));
+	try {
+		assert.equal(releaseMod.readWarpInstallRecord(join(dir, "warp-install.json")), undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("warpInstallRecord: an unparseable or wrong-shape file is no record either (T9c)", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-install-record-"));
+	try {
+		const path = join(dir, "warp-install.json");
+		writeFileSync(path, "not json at all", "utf-8");
+		assert.equal(releaseMod.readWarpInstallRecord(path), undefined, "unparseable");
+		for (const bad of [
+			"null",
+			"[]",
+			JSON.stringify({ commit: "b04459a", installed_at: 1 }),
+			JSON.stringify({ tag: "", commit: "b04459a", installed_at: 1 }),
+			JSON.stringify({ tag: "   ", commit: "b04459a", installed_at: 1 }),
+			JSON.stringify({ tag: 42, commit: "b04459a", installed_at: 1 }),
+		]) {
+			writeFileSync(path, bad, "utf-8");
+			assert.equal(releaseMod.readWarpInstallRecord(path), undefined, `wrong shape: ${bad}`);
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+
+// D10: the port the relay listens on and the variable its clash message names
+// must be the same one, otherwise following the advice cannot change anything.
+test("D10: the listen port reads the variable the error message names", async () => {
+	const { resolveListenPort } = await import("../relay.mjs");
+	assert.equal(resolveListenPort({ PI_FREE_BRIDGE_RELAY_PORT: "9123", PORT: "8788" }), 9123);
+	assert.equal(resolveListenPort({ PORT: "8788" }), 8788, "PORT stays supported for the spawn path");
+	assert.ok(Number.isNaN(resolveListenPort({})), "no port named is not a port");
+});
+
+// D11: stopping the proxy is the only moment it may die, so every refusal has to
+// be louder than a wrong kill. The four answers below are the whole policy.
+const stopDeps = (over = {}) => ({
+	probe: async () => ({ ok: true }),
+	recorded: () => ({ pid: 4242, bin: "/x/warp-minimal" }),
+	exeOf: () => "/x/warp-minimal",
+	kill: () => undefined,
+	sleep: async () => undefined,
+	attempts: 2,
+	...over,
+});
+
+test("stopWarpProxy: nothing answering means nothing to stop, and nothing is killed (D11)", async () => {
+	let killed = 0;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			probe: async () => undefined,
+			kill: () => {
+				killed += 1;
+			},
+		}),
+	);
+	assert.equal(result, "nothing-to-stop");
+	assert.equal(killed, 0);
+});
+
+test("stopWarpProxy: no record means no pid it can claim, so it refuses (D11)", async () => {
+	let killed = 0;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			recorded: () => undefined,
+			kill: () => {
+				killed += 1;
+			},
+		}),
+	);
+	assert.equal(result, "unknown-pid");
+	assert.equal(killed, 0);
+});
+
+test("stopWarpProxy: an executable that is not the recorded binary is a reused pid (D11)", async () => {
+	let killed = 0;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			exeOf: () => "/usr/bin/something-else",
+			kill: () => {
+				killed += 1;
+			},
+		}),
+	);
+	assert.equal(result, "refused");
+	assert.equal(killed, 0);
+});
+
+test("stopWarpProxy: an unreadable executable is not a mismatch, so it does stop (D11)", async () => {
+	const signals = [];
+	let alive = true;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			exeOf: () => undefined,
+			probe: async () => (alive ? { ok: true } : undefined),
+			kill: (_pid, signal) => {
+				signals.push(signal);
+				alive = false;
+			},
+		}),
+	);
+	assert.equal(result, "stopped");
+	assert.deepEqual(signals, ["SIGTERM"]);
+});
+
+test("stopWarpProxy: a process that survives every signal is reported, never assumed dead (D11)", async () => {
+	const result = await releaseMod.stopWarpProxy(stopDeps());
+	assert.equal(result, "unverified");
+});
+
+test("warpReadyFact: a new binary proves itself with identity, capability and an exit (D11)", () => {
+	const good = {
+		build: { commit: "b04459a" },
+		capabilities: { exits: true },
+		exits: [{ id: "warp-1", ip: "2a09::1" }],
+	};
+	assert.equal(releaseMod.warpReadyFact(good), true);
+	assert.equal(releaseMod.warpReadyFact({ ...good, build: { commit: "unknown" } }), false, "a versionless build is not proof");
+	assert.equal(releaseMod.warpReadyFact({ ...good, build: undefined }), false, "the old build serving is exactly what this must catch");
+	assert.equal(releaseMod.warpReadyFact({ ...good, capabilities: { exits: false } }), false);
+	assert.equal(releaseMod.warpReadyFact({ ...good, exits: [] }), false);
+	assert.equal(releaseMod.warpReadyFact({ ...good, exits: [{ id: "warp-1" }] }), false, "an exit without an address is not eligible");
+});
+
+// D11: a swap replaces a binary underneath a running proxy, so it may go ahead
+// only when the old process is provably gone. Only two of the five answers prove
+// that; the three refusals mean the proxy may still be serving, so replacing it
+// would be the wrong kill the stop policy exists to prevent.
+test("warpStopForSwap: only a stop it can prove lets the binary be replaced (D11)", async () => {
+	const expected = {
+		stopped: true,
+		"nothing-to-stop": true,
+		"unknown-pid": false,
+		refused: false,
+		unverified: false,
+	};
+	for (const [result, allowed] of Object.entries(expected)) {
+		let called = 0;
+		let seenUrl;
+		const swapped = await releaseMod.warpStopForSwap("http://127.0.0.1:8789/health", async (url) => {
+			called += 1;
+			seenUrl = url;
+			return result;
+		});
+		assert.equal(swapped, allowed, `${result} allows the swap: ${allowed}`);
+		assert.equal(called, 1, "the stop is asked exactly once");
+		assert.equal(seenUrl, "http://127.0.0.1:8789/health", "the health URL is handed to the stop");
+	}
+});
+
+// D11: the restarted proxy must prove it is the new binary. One not-ready probe
+// is a restart still coming up, not a failure, so the poll must continue.
+test("warpStartAndVerify: the restarted proxy is ready on the second probe (D11)", async () => {
+	const ready = { build: { commit: "b04459a" }, capabilities: { exits: true }, exits: [{ id: "warp-1", ip: "2a09::1" }] };
+	let starts = 0;
+	let probes = 0;
+	let sleeps = 0;
+	const ok = await releaseMod.warpStartAndVerify({
+		start: async () => {
+			starts += 1;
+		},
+		probe: async () => {
+			probes += 1;
+			return probes >= 2 ? ready : { build: { commit: "unknown" }, capabilities: { exits: true }, exits: [] };
+		},
+		sleep: async () => {
+			sleeps += 1;
+		},
+		attempts: 4,
+	});
+	assert.equal(ok, true, "a proxy that turns ready is a successful start");
+	assert.equal(starts, 1, "the proxy is launched once");
+	assert.equal(probes, 2, "the poll stops as soon as the fact is proven");
+	assert.equal(sleeps, 1, "one wait between the two probes");
+});
+
+// D11: a proxy that never proves itself must fail the swap quickly and honestly,
+// bounded by a fixed number of probes, and it must not throw — the update has to
+// report the failure, not die inside it.
+test("warpStartAndVerify: a proxy that never proves itself fails within a bounded number of probes (D11)", async () => {
+	let probes = 0;
+	const ok = await releaseMod.warpStartAndVerify({
+		start: async () => undefined,
+		probe: async () => {
+			probes += 1;
+			return { build: { commit: "unknown" }, capabilities: { exits: false }, exits: [] };
+		},
+		sleep: async () => undefined,
+		attempts: 3,
+	});
+	assert.equal(ok, false, "the old build serving is not a successful start");
+	assert.equal(probes, 3, "the deadline is a fixed number of probes, never an open loop");
+
+	let afterThrow = 0;
+	const survived = await releaseMod.warpStartAndVerify({
+		start: async () => {
+			throw new Error("spawn failed");
+		},
+		probe: async () => {
+			afterThrow += 1;
+			return undefined;
+		},
+		sleep: async () => undefined,
+		attempts: 3,
+	});
+	assert.equal(survived, false, "a launch that throws is a false result, not an exception");
+	assert.equal(afterThrow, 0, "nothing is probed when nothing was launched");
+});
+
+// ---------------------------------------------------------------------------
+// The update orchestration, with every effect injected (T9c).
+//
+// Nothing here downloads, swaps or talks to the proxy: each effect is a fake
+// counted by the helper below, so "nothing was downloaded" is an observed fact
+// rather than a claim. The order is the contract: decision, consent, download,
+// swap, then read the running commit and write the record.
+// ---------------------------------------------------------------------------
+
+const DOWNLOADED_RELAY = "/tmp/pi-free-bridge-relay";
+
+function updateFakes({
+	latestTag = async () => "v0.5.0",
+	installedTag = "v0.4.0",
+	confirmAnswer = true,
+	downloadFails = false,
+	swapResult = { ok: true, rolledBack: false },
+	runningCommit = "9f1c2ab",
+} = {}) {
+	const calls = { latestTag: 0, confirm: 0, download: 0, swap: 0, readRunningCommit: 0, writeRecord: 0 };
+	const written = [];
+	const swaps = [];
+	const deps = {
+		latestTag: async () => {
+			calls.latestTag += 1;
+			return latestTag();
+		},
+		installedRecord: () => (installedTag === null ? undefined : { tag: installedTag, commit: "b04459a" }),
+		confirm: async () => {
+			calls.confirm += 1;
+			return confirmAnswer;
+		},
+		download: async () => {
+			calls.download += 1;
+			return downloadFails ? undefined : DOWNLOADED_RELAY;
+		},
+		swap: async (path, tag) => {
+			calls.swap += 1;
+			swaps.push({ path, tag });
+			return swapResult;
+		},
+		readRunningCommit: async () => {
+			calls.readRunningCommit += 1;
+			return runningCommit;
+		},
+		writeRecord: (record) => {
+			calls.writeRecord += 1;
+			written.push(record);
+		},
+	};
+	return { deps, calls, written, swaps };
+}
+
+// The text shown before the confirm is the whole consent: it has to name the
+// real cost, because "a 5 MB download" would hide it.
+test("warpUpdateCostLines: the cost shown before confirming names every price of the swap (T9c)", () => {
+	const text = releaseMod.warpUpdateCostLines();
+	const lines = Array.isArray(text) ? text : [text];
+	const joined = lines.join("\n");
+	assert.match(joined, /two enrollments/, "the two enrollments are named");
+	assert.match(joined, /3-5 s/, "the 3-5 s without service are named");
+	assert.match(joined, /new egress addresses/, "the new egress addresses are named");
+	assert.match(joined, /every parked entry stops matching a live exit/, "the parked entries are named");
+	assert.match(joined, /(nothing is deleted|never deleted)/i, "and that they are never deleted");
+	assert.match(joined, /shared/, "the proxy is named as shared");
+	assert.match(joined, /(another Pi).*(loses service)/i, "so another Pi using it loses service too");
+	assert.ok(
+		lines.filter((line) => line.trim()).length >= 5,
+		"the cost is more than one aggregate sentence",
+	);
+});
+
+// Nothing to install means nothing to ask and nothing to download. An
+// unreadable release is its own answer, never "there is an update".
+test("updateWarpBinary: up-to-date never confirms, and an unreadable release is its own answer (T9c)", async () => {
+	const current = updateFakes({ installedTag: "0.5.0" });
+	const result = await releaseMod.updateWarpBinary(current.deps);
+	assert.equal(result.status, "up-to-date");
+	assert.equal(result.tag, "v0.5.0");
+	assert.equal(current.calls.confirm, 0, "no consent is asked when there is nothing to install");
+	assert.equal(current.calls.download, 0, "nothing is downloaded");
+	assert.equal(current.calls.swap, 0);
+
+	const unreadable = updateFakes({ latestTag: async () => null });
+	const unknown = await releaseMod.updateWarpBinary(unreadable.deps);
+	assert.equal(unknown.status, "unknown", "an unreadable release is not an update");
+	assert.match(unknown.reason, /release/i, "it names the release it could not read");
+	assert.equal(unreadable.calls.confirm, 0, "an unknown release never asks for consent");
+	assert.equal(unreadable.calls.download, 0, "an unknown release downloads nothing");
+	assert.equal(unreadable.calls.writeRecord, 0);
+});
+
+// A no at the confirm is a complete answer: nothing is fetched, nothing is
+// touched, and no record claims an install that never happened.
+test("updateWarpBinary: a declined confirmation downloads nothing and changes nothing (T9c)", async () => {
+	const fakes = updateFakes({ confirmAnswer: false });
+	const result = await releaseMod.updateWarpBinary(fakes.deps);
+	assert.equal(result.status, "declined");
+	assert.equal(fakes.calls.confirm, 1, "consent is asked exactly once");
+	assert.equal(fakes.calls.download, 0, "a declined update downloads nothing");
+	assert.equal(fakes.calls.swap, 0, "a declined update swaps nothing");
+	assert.equal(fakes.calls.readRunningCommit, 0);
+	assert.equal(fakes.calls.writeRecord, 0, "no record is written");
+	assert.deepEqual(fakes.written, []);
+});
+
+// A download that returns nothing must leave the install exactly as it was and
+// say so plainly: the proxy is still running the binary it already had.
+test("updateWarpBinary: a failed download changes nothing and says so (T9c)", async () => {
+	const fakes = updateFakes({ downloadFails: true });
+	const result = await releaseMod.updateWarpBinary(fakes.deps);
+	assert.equal(result.status, "failed");
+	assert.match(result.reason, /nothing was changed/i, "it says nothing was changed");
+	assert.equal(fakes.calls.download, 1);
+	assert.equal(fakes.calls.swap, 0, "no swap runs on a download that never landed");
+	assert.equal(fakes.calls.readRunningCommit, 0);
+	assert.equal(fakes.calls.writeRecord, 0, "no record is written for an install that failed");
+	assert.deepEqual(fakes.written, []);
+});
+
+// A swap that restored the previous binary reports the rollback with its own
+// reason. One that failed without restoring has to say both facts plainly.
+test("updateWarpBinary: a rolled-back swap reports the rollback with its reason (T9c)", async () => {
+	const rolledBack = updateFakes({
+		swapResult: { ok: false, rolledBack: true, reason: "the new binary never answered /health" },
+	});
+	const result = await releaseMod.updateWarpBinary(rolledBack.deps);
+	assert.equal(result.status, "rolled-back");
+	assert.equal(result.reason, "the new binary never answered /health", "the swap's own reason is kept");
+	assert.equal(rolledBack.calls.swap, 1);
+	assert.equal(rolledBack.calls.readRunningCommit, 0, "a rolled-back swap never claims a commit");
+	assert.equal(rolledBack.calls.writeRecord, 0, "a rolled-back swap writes no record");
+	assert.deepEqual(rolledBack.written, []);
+
+	const notRestored = updateFakes({
+		swapResult: { ok: false, rolledBack: false, reason: "the relay would not stop" },
+	});
+	const failed = await releaseMod.updateWarpBinary(notRestored.deps);
+	assert.equal(failed.status, "failed");
+	assert.match(failed.reason, /did not prove itself/, "it says the install did not prove itself");
+	assert.match(failed.reason, /(was not restored|not restored)/, "and that the old binary was not restored");
+	assert.equal(notRestored.calls.writeRecord, 0);
+	assert.deepEqual(notRestored.written, []);
+});
+
+// Success is not the swap returning ok: it is the proxy reporting the commit it
+// runs, and that commit is what the record keeps. A null commit is not success.
+test("updateWarpBinary: success writes the record with the commit read from the proxy, and a null commit writes nothing (T9c)", async () => {
+	const fakes = updateFakes();
+	const result = await releaseMod.updateWarpBinary(fakes.deps);
+	assert.equal(result.status, "updated");
+	assert.equal(result.tag, "v0.5.0");
+	assert.equal(result.commit, "9f1c2ab");
+	assert.deepEqual(
+		fakes.written,
+		[{ tag: "v0.5.0", commit: "9f1c2ab" }],
+		"the record carries the installed tag and the commit the proxy reported",
+	);
+	assert.equal(fakes.calls.writeRecord, 1);
+	assert.deepEqual(
+		fakes.swaps,
+		[{ path: "/tmp/pi-free-bridge-relay", tag: "v0.5.0" }],
+		"the swap gets the downloaded path and the tag",
+	);
+
+	const anonymous = updateFakes({ runningCommit: null });
+	const failed = await releaseMod.updateWarpBinary(anonymous.deps);
+	assert.equal(failed.status, "failed", "a build that does not identify itself is not a success");
+	assert.match(failed.reason, /identif/i, "it says the new build did not identify itself");
+	assert.equal(anonymous.calls.writeRecord, 0, "no record is written without a commit");
+	assert.deepEqual(anonymous.written, []);
 });
