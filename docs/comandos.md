@@ -25,10 +25,12 @@ lectura: repara la entrada `oc-sdk-zen/*` de `enabledModels` en `settings.json`
 si falta, y lo informa como `scope: repaired` (aplica en el próximo arranque,
 porque Pi lee el scope una sola vez; `PI_FREE_BRIDGE_SELF_REPAIR=0` la desactiva).
 
-## `free-bridge-warp-update`
+## Instalar/actualizar warp (dentro del menú)
 
-El **único** comando que detiene el proxy, porque el binario se reemplaza
-debajo del proceso que sirve. Antes de tocar nada muestra el costo —dos
+No es un comando: vive en `/free-bridge` → **WARP → Instalar/actualizar warp**,
+siempre visible. Descarga siempre la última release publicada y reemplaza el
+archivo, sin preguntar si «ya estás al día». Es la **única** acción que detiene
+el proxy, porque el binario se reemplaza debajo del proceso que sirve. Antes de tocar nada muestra el costo —dos
 enrollments, 3-5 s sin servicio, egress nuevo y cada entrada estacionada
 dejando de coincidir con un exit vivo— y pide confirmación. Si el binario nuevo
 no se identifica, no cuenta como éxito: no se escribe registro.

@@ -3991,7 +3991,7 @@ test("the extension registers exactly four commands, no aliases, no argument for
 
 	assert.deepEqual(
 		registered.map((entry) => entry.name),
-		["free-bridge", "free-bridge-warp-recycle", "free-bridge-warp-update", "free-bridge-doctor"],
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
 	);
 
 	const menu = registered.find((entry) => entry.name === "free-bridge");
@@ -4059,90 +4059,77 @@ test("commands register even when model discovery finds nothing at all", () => {
 
 	assert.deepEqual(
 		registered,
-		["free-bridge", "free-bridge-warp-recycle", "free-bridge-warp-update", "free-bridge-doctor"],
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
 		"zero models must not cost the user the menu",
 	);
 });
 
-test("free-bridge-warp-update says what it does and refuses to run blind", (t) => {
-	// The command is the one entry point that replaces the proxy binary, so its
-	// autocomplete line has to name the release it fetches and the stop it costs.
-	// Asserted through the registration a fake `pi` captures, never a source grep:
-	// this is exactly what Pi shows when the user types `/free-bridge`. A child
-	// process is used because the factory guards double registration on
-	// globalThis, so the in-process test above already consumed it.
-	const home = mkdtempSync(join(tmpdir(), "pfb-warp-update-"));
-	t.after(() => rmSync(home, { recursive: true, force: true }));
-	const marker = "@@WARP-UPDATE@@";
-	const script = `
-		const { default: factory } = await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});
-		const commands = {};
-		await factory({
-			registerCommand: (name, options) => { commands[name] = options; },
-			registerProvider: () => {},
-			registerTool: () => {},
-			on: () => {},
-			config: {},
-			ui: { notify() {} },
-		});
-		const seen = [];
-		const ctx = { hasUI: false, ui: { notify: (text, kind) => seen.push({ text, kind }) } };
-		await commands["free-bridge-warp-update"].handler("", ctx);
-		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify({
-			names: Object.keys(commands),
-			description: commands["free-bridge-warp-update"].description,
-			hasHandler: typeof commands["free-bridge-warp-update"].handler === "function",
-			seen,
-		}));
-	`;
-	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
-		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "1" },
-		encoding: "utf-8",
-	});
-	const captured = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+test("the proxy update lives in the WARP sector, and nowhere else", () => {
+	// The owner asked for it there: replacing a binary is a WARP act, not a
+	// command of its own, and a separate command would be a second, undocumented
+	// way to do the one thing that stops a shared proxy.
+	const { MENU_SECTIONS, MENU_ITEMS, MENU_UPDATE_WARP, MENU_WARP, MENU_RECYCLE, visibleMenuIndices } = releaseMod;
 
-	assert.equal(captured.names.includes("free-bridge-warp-update"), true, "the update command is registered");
-	assert.equal(
-		captured.description,
-		"Update warp-minimal to the latest release — the only command that stops the proxy to replace its binary",
+	const warpSector = MENU_SECTIONS.find((section) => section.label === "WARP");
+	assert.ok(warpSector, "the WARP sector exists");
+	assert.deepEqual(
+		warpSector.actions,
+		[MENU_WARP, MENU_UPDATE_WARP, MENU_RECYCLE],
+		"mode first, then the binary, then the rotation",
 	);
-	assert.equal(captured.hasHandler, true, "the command is actually runnable");
+	assert.equal(
+		MENU_ITEMS[MENU_UPDATE_WARP],
+		"Instalar/actualizar warp",
+		"the label the owner asked for",
+	);
 
-	// Without a UI nobody can read the cost or answer the confirmation, so the
-	// handler must refuse and say why instead of stopping the proxy blind.
-	assert.equal(captured.seen.length, 1, "the refusal answers exactly once");
-	assert.equal(captured.seen[0].kind, "warning");
-	assert.match(captured.seen[0].text, /STOPS the proxy/, "it says the stop it would cost");
-	assert.match(captured.seen[0].text, /no UI to ask in/, "it names the reason it cannot ask");
-	assert.match(captured.seen[0].text, /free-bridge-warp-update from an interactive Pi/, "and where to run it instead");
+	// Always offered: it is the row that creates the binary, so hiding it behind
+	// that binary's absence would make it unreachable when it is needed most.
+	for (const state of [
+		{ bunReady: false, binaryPresent: false, warpReady: false },
+		{ bunReady: true, binaryPresent: false, warpReady: false },
+		{ bunReady: false, binaryPresent: true, warpReady: true },
+	]) {
+		assert.equal(
+			visibleMenuIndices(state).includes(MENU_UPDATE_WARP),
+			true,
+			`visible with ${JSON.stringify(state)}`,
+		);
+	}
+
+	// The four sectors are exactly these, in this order.
+	assert.deepEqual(
+		MENU_SECTIONS.map((section) => section.label),
+		["Relay", "WARP", "Red", "Sesión"],
+	);
 });
 
 test("the install item exists only for machines without Bun", () => {
 	const { visibleMenuIndices, MENU_INSTALL, MENU_ITEMS } = releaseMod;
-	assert.equal(MENU_ITEMS.length, 7);
+	assert.equal(MENU_ITEMS.length, 8);
 
 	// Nothing at all: installing is the only real action.
 	assert.deepEqual(
 		visibleMenuIndices({ bunReady: false, binaryPresent: false, warpReady: false }),
-		[MENU_INSTALL],
+		[MENU_INSTALL, 7],
 		"no Bun and no binary: installing is the only real action",
 	);
 	// A binary without Bun: the row is how it gets installed and updated.
 	assert.deepEqual(
 		visibleMenuIndices({ bunReady: false, binaryPresent: true, warpReady: false }),
-		[0, 1, 2, 4, 5, 6],
+		[0, 1, 2, 4, 5, 6, 7],
 		"a binary still needs the row to update itself, and Bun is absent",
 	);
 	// Bun, with or without a binary: the row means nothing. npm carries the
 	// relay source, and a binary next to Bun is dead weight rather than a path.
 	assert.deepEqual(
 		visibleMenuIndices({ bunReady: true, binaryPresent: false, warpReady: false }),
-		[1, 2, 4, 5, 6],
+		[1, 2, 4, 5, 6, 7],
 		"Bun runs the relay: nothing to install, and npm carries the update",
 	);
 	assert.deepEqual(
 		visibleMenuIndices({ bunReady: true, binaryPresent: true, warpReady: false }),
-		[1, 2, 4, 5, 6],
+		[1, 2, 4, 5, 6, 7],
 		"Bun present hides the row even when an old binary is still on disk",
 	);
 });

@@ -1723,6 +1723,11 @@ export type UpdateWarpBinaryDeps = {
 	/** The commit the running proxy reports for itself, or null when it has none. */
 	readRunningCommit: () => Promise<string | null>;
 	writeRecord: (record: { tag: string; commit: string }) => void;
+	/** The menu installs on request even when the tag matches: what the owner asks
+	 *  for there is the file on disk replaced with the published one, not a
+	 *  comparison. Without it, an update that only reports "up to date" would
+	 *  leave a binary this record disagrees with in place. */
+	force?: boolean;
 };
 
 export type UpdateWarpBinaryResult = {
@@ -1751,7 +1756,7 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 			reason: "the release could not be read: with no published tag there is nothing to install and nothing to claim",
 		};
 	}
-	if (decision === "up-to-date") {
+	if (decision === "up-to-date" && !deps.force) {
 		return { status: "up-to-date", tag: latestTag ?? undefined, commit: installed?.commit || undefined };
 	}
 
@@ -3285,11 +3290,12 @@ function printDryRun(
 export const MENU_ITEMS = [
 	"Instalar / actualizar relay",
 	"Estado del relay",
-	"WARP: on / off",
+	"Modo: on / off",
 	"Reciclar WARP",
-	"Cable: v1 / v2",
+	"Protocolo: v1 / v2",
 	"Modelos",
 	"Refrescar sesión",
+	"Instalar/actualizar warp",
 ] as const;
 
 /** Named menu indices, so the dispatch never depends on a bare number. */
@@ -3300,6 +3306,19 @@ export const MENU_RECYCLE = 3;
 export const MENU_WIRE = 4;
 export const MENU_MODELS = 5;
 export const MENU_REFRESH = 6;
+export const MENU_UPDATE_WARP = 7;
+
+/** The sectors, in the order the owner asked for: relay and warp are the two
+ *  binaries, the wire protocol is how the relay talks upstream, and everything
+ *  about models is the session's own business. Sectorizing is not decoration:
+ *  a flat list mixes "replace a binary" with "refresh a model list", and the
+ *  two have nothing in common except living in the same file. */
+export const MENU_SECTIONS: ReadonlyArray<{ label: string; actions: readonly number[] }> = [
+	{ label: "Relay", actions: [MENU_INSTALL, MENU_STATUS] },
+	{ label: "WARP", actions: [MENU_WARP, MENU_UPDATE_WARP, MENU_RECYCLE] },
+	{ label: "Red", actions: [MENU_WIRE] },
+	{ label: "Sesión", actions: [MENU_MODELS, MENU_REFRESH] },
+];
 
 /** Which items this machine can actually use, in the dictated order.
  *
@@ -3318,6 +3337,14 @@ export function visibleMenuIndices(state: {
 	const runnable = state.bunReady || state.binaryPresent;
 	const visible: number[] = [];
 	for (let index = 0; index < MENU_ITEMS.length; index++) {
+		// Installing the proxy needs neither the relay nor a warp binary to exist:
+		// it is the row that creates the second one, so hiding it behind its own
+		// absence would make it unreachable exactly when it is needed. It is asked
+		// for explicitly, so it always appears.
+		if (index === MENU_UPDATE_WARP) {
+			visible.push(index);
+			continue;
+		}
 		if (index === MENU_INSTALL && state.bunReady) continue;
 		if (index !== MENU_INSTALL && !runnable) continue;
 		if (index === MENU_RECYCLE && !state.warpReady) continue;
@@ -3599,7 +3626,7 @@ export default async function (pi: ExtensionAPI) {
 					"that is serving right now. That needs a confirmation, and this session has",
 					"no UI to ask in.",
 					"",
-					"Run /free-bridge-warp-update from an interactive Pi session.",
+					"Run /free-bridge → WARP → Instalar/actualizar warp from an interactive Pi session.",
 				].join("\n"),
 				"warning",
 			);
@@ -3661,6 +3688,9 @@ export default async function (pi: ExtensionAPI) {
 		let thrown: string | undefined;
 		try {
 			result = await updateWarpBinary({
+				// The menu action means "install the published binary", not "tell me
+				// whether it is newer": the owner asked for the file to be replaced.
+				force: true,
 				latestTag: async () => {
 					asset = await findWarpAsset();
 					return asset?.tag ?? null;
@@ -4073,14 +4103,28 @@ export default async function (pi: ExtensionAPI) {
 		const warpNow = resolveWarpMode();
 		const wireNow = resolveWireMode();
 
-		// `visible` maps a picked row back to its real menu index, so hiding an
-		// item never shifts the dispatch.
-		const visible = visibleMenuIndices({
+		const state = {
 			bunReady: bunReady(),
 			binaryPresent: binaryPresent(),
 			warpReady: warpReady(),
-		});
-		const labels = visible.map((index) => {
+		};
+		const visible = visibleMenuIndices(state);
+		// Two levels: sector, then action. A sector whose every action is hidden is
+		// not offered at all, so the menu never opens on a dead end.
+		const sections = MENU_SECTIONS.map((section) => ({
+			label: section.label,
+			actions: visible.filter((index) => section.actions.includes(index)),
+		})).filter((section) => section.actions.length > 0);
+
+		const pickedSector = await pickMenuItem(
+			ctx,
+			sections.map((section) => section.label),
+		);
+		if (pickedSector === undefined) return;
+		const section = sections[pickedSector];
+		if (!section) return;
+
+		const labels = section.actions.map((index) => {
 			const item = MENU_ITEMS[index];
 			if (index === MENU_WARP) return `${item} — ahora: ${warpNow}`;
 			if (index === MENU_WIRE) return `${item} — ahora: ${wireNow}`;
@@ -4089,7 +4133,7 @@ export default async function (pi: ExtensionAPI) {
 
 		const picked = await pickMenuItem(ctx, labels);
 		if (picked === undefined) return;
-		const index = visible[picked];
+		const index = section.actions[picked];
 
 		switch (index) {
 			case MENU_INSTALL:
@@ -4113,6 +4157,9 @@ export default async function (pi: ExtensionAPI) {
 			case MENU_REFRESH:
 				await refreshLiveModels(ctx);
 				return;
+			case MENU_UPDATE_WARP:
+				await runWarpUpdate(ctx);
+				return;
 			default:
 				return;
 		}
@@ -4132,14 +4179,6 @@ export default async function (pi: ExtensionAPI) {
 			"Rotate the WARP exit right now — manual recovery when a 429 keeps killing turns",
 		handler: async (_args: string, ctx) => {
 			await runWarpRecycle(ctx as MenuCtx);
-		},
-	});
-
-	pi.registerCommand("free-bridge-warp-update", {
-		description:
-			"Update warp-minimal to the latest release — the only command that stops the proxy to replace its binary",
-		handler: async (_args: string, ctx) => {
-			await runWarpUpdate(ctx as MenuCtx);
 		},
 	});
 
