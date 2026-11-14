@@ -3989,31 +3989,95 @@ test("commands register even when model discovery finds nothing at all", () => {
 	);
 });
 
-test("the menu shows only the install item when nothing is installed", () => {
+test("the install item exists only for machines without Bun", () => {
 	const { visibleMenuIndices, MENU_INSTALL, MENU_ITEMS } = releaseMod;
 	assert.equal(MENU_ITEMS.length, 7);
 
+	// Nothing at all: installing is the only real action.
 	assert.deepEqual(
-		visibleMenuIndices({ relayReady: false, warpReady: false }),
+		visibleMenuIndices({ bunReady: false, binaryPresent: false, warpReady: false }),
 		[MENU_INSTALL],
-		"relay not installed: installing is the only real action",
+		"no Bun and no binary: installing is the only real action",
+	);
+	// A binary without Bun: the row is how it gets installed and updated.
+	assert.deepEqual(
+		visibleMenuIndices({ bunReady: false, binaryPresent: true, warpReady: false }),
+		[0, 1, 2, 4, 5, 6],
+		"a binary still needs the row to update itself, and Bun is absent",
+	);
+	// Bun, with or without a binary: the row means nothing. npm carries the
+	// relay source, and a binary next to Bun is dead weight rather than a path.
+	assert.deepEqual(
+		visibleMenuIndices({ bunReady: true, binaryPresent: false, warpReady: false }),
+		[1, 2, 4, 5, 6],
+		"Bun runs the relay: nothing to install, and npm carries the update",
 	);
 	assert.deepEqual(
-		visibleMenuIndices({ relayReady: true, warpReady: false }),
-		[0, 1, 2, 4, 5, 6],
-		"everything except recycle once the relay runs",
+		visibleMenuIndices({ bunReady: true, binaryPresent: true, warpReady: false }),
+		[1, 2, 4, 5, 6],
+		"Bun present hides the row even when an old binary is still on disk",
 	);
-	assert.deepEqual(visibleMenuIndices({ relayReady: true, warpReady: true }), [0, 1, 2, 3, 4, 5, 6]);
 });
 
-test("recycle is hidden without a WARP binary and shown with one", () => {
+test("recycle joins the menu only with a WARP binary, and only when the relay can run", () => {
 	const { visibleMenuIndices, MENU_RECYCLE } = releaseMod;
 	assert.equal(
-		visibleMenuIndices({ relayReady: true, warpReady: false }).includes(MENU_RECYCLE),
-		false,
-		"rotating an exit with no WARP binary can only fail",
+		visibleMenuIndices({ bunReady: true, binaryPresent: false, warpReady: true }).includes(MENU_RECYCLE),
+		true,
+		"Bun runs the relay and a WARP binary exists: rotating is a real action",
 	);
-	assert.equal(visibleMenuIndices({ relayReady: true, warpReady: true }).includes(MENU_RECYCLE), true);
+	assert.equal(
+		visibleMenuIndices({ bunReady: false, binaryPresent: true, warpReady: true }).includes(MENU_RECYCLE),
+		true,
+		"a binary runs the relay and a WARP binary exists",
+	);
+	assert.equal(
+		visibleMenuIndices({ bunReady: false, binaryPresent: false, warpReady: true }).includes(MENU_RECYCLE),
+		false,
+		"nothing runs the relay, so there is no exit to rotate",
+	);
+});
+
+test("the doctor reports instead of throwing, and never names a dead field", () => {
+	// Nothing exercised this handler, so a refactor that deleted the live-ids
+	// snapshot shipped a doctor that crashed on its first line: `live.source`
+	// referenced a binding that no longer existed, and `discovered.skipped` a
+	// field the catalog never had. The command is a public surface — it is what
+	// the README tells a stuck user to run — so it is asserted by its output.
+	const home = mkdtempSync(join(tmpdir(), "pfb-doctor-"));
+	const marker = "@@DOCTOR@@";
+	const script = `
+		const { default: factory } = await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});
+		const commands = {};
+		await factory({
+			registerCommand: (name, cfg) => { commands[name] = cfg; },
+			registerProvider: () => {},
+			registerTool: () => {},
+			on: () => {},
+			config: {},
+			ui: { notify() {} },
+		});
+		const seen = [];
+		const ctx = { hasUI: false, ui: { notify: (text, kind) => seen.push({ text, kind }) } };
+		await commands["free-bridge-doctor"].handler("", ctx);
+		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify(seen));
+	`;
+	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1" },
+		encoding: "utf-8",
+	});
+	const seen = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+
+	assert.equal(seen.length, 1, "the doctor answers once, however the machine is configured");
+	const text = seen[0].text;
+	assert.match(text, /^pi-free-bridge doctor/, "the report identifies itself");
+	assert.match(text, /registered: \d+ free models from /, "it says how many models, and where they came from");
+	assert.match(
+		text,
+		/skipped:\s+(unknown \(the catalog did not report a count\)|\d+ \(not free, per the relay\))/,
+		"the skipped line reads the field the catalog actually publishes",
+	);
+	assert.doesNotMatch(text, /live ids/, "the live-ids line died with the snapshot it read");
 });
 
 test("the provider is published from the relay catalog with refreshModels wired", () => {
@@ -4607,6 +4671,65 @@ test("resolving never writes: declining an install changes nothing (S3.0)", () =
 	});
 	assert.equal(resolved, "/bin/relay-linux-x64", "the prompt names the path that will exist");
 	assert.deepEqual(writes, [], "and nothing on disk changed");
+});
+
+test("Bun wins over a binary, and the binary stays on disk as the fallback", () => {
+	// The compiled binary is relay.mjs with the Bun runtime inside: the same
+	// relay, so nothing about behaviour separates them. What separates them is
+	// how they update — `pi install` refreshes the script that ships in this
+	// package, and nothing refreshes a binary. So the script wins whenever Bun is
+	// there, and the binary that stays on disk is what answers the day Bun is gone.
+	const { resolveRelayCommand } = releaseMod;
+	const dir = "/relay-dir";
+	const canonical = `${dir}/relay-linux-x64`;
+	const everywhere = () => true;
+	const nothing = () => false;
+
+	assert.deepEqual(
+		resolveRelayCommand({
+			dir,
+			exists: everywhere,
+			bunPath: () => "/usr/bin/bun",
+			read: () => ({ relayBin: "/custom/relay-linux-x64" }),
+		}),
+		{ kind: "bun", path: "/usr/bin/bun" },
+		"Bun present: neither a configured nor a canonical binary gets to win",
+	);
+	assert.deepEqual(
+		resolveRelayCommand({
+			dir,
+			exists: (path) => path === "/custom/relay-linux-x64",
+			bunPath: () => undefined,
+			read: () => ({ relayBin: "/custom/relay-linux-x64" }),
+		}),
+		{ kind: "binary", path: "/custom/relay-linux-x64" },
+		"no Bun: a configured binary answers before the canonical name",
+	);
+	assert.deepEqual(
+		resolveRelayCommand({
+			dir,
+			exists: (path) => path === canonical,
+			bunPath: () => undefined,
+			read: () => ({}),
+		}),
+		{ kind: "binary", path: canonical },
+		"no Bun and no config: the canonical name answers",
+	);
+	assert.equal(
+		resolveRelayCommand({
+			dir,
+			exists: (path) => path === "/custom/relay-linux-x64.v0.4.0",
+			bunPath: () => undefined,
+			read: () => ({ relayBin: "/custom/relay-linux-x64.v0.4.0" }),
+		}),
+		undefined,
+		"a versioned leftover is not a command, so the caller reports the S27 error",
+	);
+	assert.equal(
+		resolveRelayCommand({ dir, exists: nothing, bunPath: () => undefined, read: () => ({}) }),
+		undefined,
+		"nothing at all: no command to run",
+	);
 });
 
 test("a versioned leftover is never treated as the relay to start (S3.0)", () => {

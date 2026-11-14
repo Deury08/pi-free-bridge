@@ -64,9 +64,10 @@ local y apunta el provider a `http://127.0.0.1:<puerto>/v1`.
 Pi (Node) → http://127.0.0.1:<puerto>/v1/chat/completions → relay → upstream
 ```
 
-El relay es un binario compilado por sistema operativo, con su runtime adentro:
-no necesita tener Bun instalado. Bun es el camino de respaldo cuando todavía no
-hay binario.
+El relay es el mismo en las dos formas: un binario compilado por sistema
+operativo, con su runtime adentro, o el script `relay.mjs` que viaja en el paquete
+corriendo con Bun. **Si hay Bun, gana Bun**: el binario es el respaldo para una
+máquina sin Bun.
 
 El relay es el único proceso que abre la conexión TLS contra OpenCode. Ahí viven
 los headers del gate, el session id, el bloque `<env>` con `Working directory:`
@@ -77,19 +78,59 @@ reescribir ningún chunk.
 
 En este orden, y se queda con el primero que sirva:
 
-1. `~/.pi/agent/pi-free-bridge.json` → `relayBin`, si apunta a un binario que
-existe y cuyo nombre no lleva versión (un `relayBin` viejo con la versión pegada
-se migra solo al nombre canónico)
-2. el binario canónico de tu sistema en `~/.pi/agent/pi-free-bridge/bin/`:
-`relay-windows-x64.exe`, `relay-linux-x64`, `relay-linux-arm64`,
-`relay-darwin-x64` o `relay-darwin-arm64`
-3. Bun, si todavía no hay binario: `PI_FREE_BRIDGE_BUN`, después `bun` en `PATH`
-(en Windows, `bun.exe`), después `~/.bun/bin/bun.exe`
+1. Bun: `PI_FREE_BRIDGE_BUN`, después `bun` en `PATH` (en Windows, `bun.exe`),
+   después `~/.bun/bin/bun.exe`
+2. `~/.pi/agent/pi-free-bridge.json` → `relayBin`, si apunta a un binario que
+   existe y cuyo nombre no lleva versión (un `relayBin` viejo con la versión
+   pegada se migra solo al nombre canónico)
+3. el binario canónico de tu sistema en `~/.pi/agent/pi-free-bridge/bin/`:
+   `relay-windows-x64.exe`, `relay-linux-x64`, `relay-linux-arm64`,
+   `relay-darwin-x64` o `relay-darwin-arm64`
 
-Si no encuentra ninguno de los tres, el primer request falla y el error dice qué
-hacer: instalar el relay desde el menú, instalar Bun (<https://bun.sh>) o
-apuntarlo con `PI_FREE_BRIDGE_BUN`. `/free-bridge-doctor` muestra la línea
-`bun:` con la ruta resuelta o `MISSING`.
+Bun va primero aunque haya un binario, y aunque `relayBin` lo nombre a mano: las
+dos formas corren el mismo relay, así que lo único que las separa es cómo se
+actualizan. `pi install` refresca el script que viene en el paquete; un binario
+no lo refresca nadie. Con Bun presente, estar al día es un comando.
+
+Si no encuentra ninguno, el primer request falla y el error dice qué hacer:
+instalar el relay desde el menú, instalar Bun (<https://bun.sh>) o apuntarlo con
+`PI_FREE_BRIDGE_BUN`. `/free-bridge-doctor` muestra la línea `bun:` con la ruta
+resuelta o `MISSING`, y `/health` dice cuál está corriendo: `pid` apuntando a
+`relay-linux-x64` es el binario, `bun … relay.mjs` es el script.
+
+### Cuándo el menú ofrece instalar el relay
+
+La regla es una sola: **el ítem existe sólo si Bun no está instalado.**
+
+| Lo que corre | Cómo se actualiza | ¿El menú ofrece el binario? |
+| --- | --- | --- |
+| `bun relay.mjs` | Con `pi install npm:pi-free-bridge@x` — `relay.mjs` viaja en el paquete | No: no hay nada que traer |
+| Binario compilado | Sólo desde «Instalar / actualizar relay». npm nunca lo toca | Sólo si Bun falta en la máquina |
+
+`visibleMenuIndices` recibe tres hechos y no deriva uno del otro: `bunReady`
+—`resolveBunPath()` responde—, `binaryPresent` —hay un binario que el spawn
+aceptaría— y `warpReady`. Con el primero se decide el ítem de instalación; los
+demás ítems necesitan que el relay pueda correr, o sea `bunReady ||
+binaryPresent`; «Reciclar WARP» suma la condición de tener un binario de WARP.
+
+`binaryPresent` ya no copia el orden del spawn: responde otra pregunta —si hay un
+binario en disco que el spawn aceptaría como respaldo—, porque el spawn empieza
+por Bun. Cuenta un `relayBin` configurado que no lleve la versión en el nombre, y
+después el nombre canónico de cualquier asset en
+`~/.pi/agent/pi-free-bridge/bin/`. Un `relayBin` con la versión pegada existe pero
+**no** cuenta, porque el spawn lo rechaza (`isVersionedRelayBinName`).
+
+#### Lo que la regla deja afuera, a propósito
+
+Con Bun instalado la fila desaparece y **el binario que quede en disco no corre**:
+Bun gana el arranque, así que el binario es respaldo inerte. Se deja ahí a
+propósito, para el día que se desinstale Bun: en ese momento el relay vuelve solo
+al binario, sin descargar nada.
+
+La puerta que la regla cierra es otra: quien tenga Bun y quiera **fijar** el
+binario —congelar una versión, o probar un build— no lo consigue desde el menú, y
+poner `relayBin` en el config ya no alcanza, porque Bun le gana igual. Le queda
+bajar el asset desde la página de Releases y sacar Bun del medio.
 
 ### Puerto
 

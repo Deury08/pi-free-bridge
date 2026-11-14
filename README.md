@@ -13,20 +13,43 @@ Tampoco necesitás una API key: el tier gratuito no pide una.
 
 ## Qué instala
 
-Dos piezas:
+Una pieza obligatoria y una opcional:
 
 1. **La extensión de Pi** (este paquete). Es la que registra los modelos y te da
-   el menú.
-2. **El relay**, que se baja aparte. Es un ejecutable de un solo archivo,
-   compilado para tu sistema operativo: Windows x64, Linux x64 y ARM, macOS
-   Intel y Apple Silicon. Lo baja la extensión de la release cuando se lo pedís
-   desde el menú, y te pregunta antes.
+   el menú. Adentro trae `relay.mjs`, el código del relay: son ~107 KB.
+2. **El relay compilado**, opcional. Un ejecutable de un solo archivo, compilado
+   para tu sistema operativo: Windows x64, Linux x64 y ARM, macOS Intel y Apple
+   Silicon. Pesa ~110 MB **porque lleva el runtime de Bun adentro**.
+
+El relay necesita un runtime, y hay dos caminos para tenerlo:
+
+| Si tenés… | Qué usa el relay | ¿Bajás algo? |
+| --- | --- | --- |
+| **Bun** instalado | `bun relay.mjs` — el que vino en el paquete | **No. Nada.** |
+| Ni Bun ni binario | El binario compilado de la release | Sí, ~110 MB, desde el menú |
+
+**Si ya tenés Bun, no instales el relay.** El código ya lo tenés, y las
+actualizaciones del relay viajan con npm — la misma instalación que actualiza la
+extensión:
+
+```bash
+pi install npm:pi-free-bridge@0.6.0
+```
+
+Un binario compilado, en cambio, npm nunca lo toca: se actualiza sólo desde el
+menú. Por eso el menú ofrece «Instalar / actualizar relay» **únicamente si Bun
+no está instalado**. Con Bun presente la opción no existe, y eso incluye el caso
+de un binario que haya quedado en disco: **Bun le gana al arrancar**, así que el
+binario no corre y no hay nada que actualizar. Queda ahí como respaldo, para el
+día que desinstales Bun.
 
 Tres cosas que conviene saber de entrada:
 
 - **Nada se descarga al abrir Pi.** El relay se baja sólo cuando elegís
-  «Instalar / actualizar relay».
-- **Bun no hace falta.** Si ya lo tenés instalado, no molesta.
+  «Instalar / actualizar relay», y esa opción ni aparece si Bun ya resuelve.
+- **Bun no hace falta**, pero si ya lo tenés gana siempre: el relay corre como
+  script, no como binario. Si lo sacás, el binario que quede en `bin/` arranca
+  solo.
 - **Node sí hace falta**, porque Pi es una app de Node. Si Pi te anda, ya está.
 
 ## Cómo se instala
@@ -80,7 +103,7 @@ o, si instalás directo con Pi:
 pi install npm:pi-free-bridge
 ```
 
-![Escribiendo el comando de instalación](Imagenes/01-escribiendo-el-comando-de-instalacion.png)
+![Escribiendo el comando de instalación](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/01-escribiendo-el-comando-de-instalacion.png)
 
 ### 2. Confirmar que quedó instalada
 
@@ -88,30 +111,39 @@ El comando resuelve el paquete desde npm y termina avisando que quedó instalado
 No clona ningún repo: si no ves esa confirmación, no sigas, volvé a correr el
 paso 1.
 
-![Salida del comando después de instalar](Imagenes/02-comando-ejecutado.png)
+![Salida del comando después de instalar](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/02-comando-ejecutado.png)
 
 ### 3. Abrir el menú
 
 Dentro de Pi escribí `/free-bridge`. Con el `/` aparece el autocompletado; Enter
 abre el menú.
 
-![El menú de /free-bridge](Imagenes/03-abriendo-el-menu-de-configuracion.png)
+![El menú de /free-bridge](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/03-abriendo-el-menu-de-configuracion.png)
 
-En una máquina recién instalada el menú muestra **un solo ítem**, «Instalar /
-actualizar relay», porque los demás solo podrían fallar. Los otros seis aparecen
-cuando el relay ya corre, y «Reciclar WARP» se suma recién cuando hay un binario
-de WARP al cual pedirle la rotación.
+En una máquina recién instalada **sin Bun** el menú muestra un solo ítem,
+«Instalar / actualizar relay», porque los demás solo podrían fallar. En cuanto
+el relay corre aparecen los demás, y «Reciclar WARP» se suma recién cuando hay un
+binario de WARP al cual pedirle la rotación.
 
-### 4. Instalar el relay
+Con Bun instalado el menú arranca ya con los seis restantes: la instalación del
+relay no aparece ni antes ni después, porque no hay nada que instalar.
 
-Elegí «Instalar / actualizar relay». Antes de bajar nada te muestra la versión,
-el tamaño, de dónde lo baja y dónde lo instala, y te avisa que **detiene el relay
-que esté corriendo —lo haya arrancado esta extensión o vos—**. Elegí `Yes`: el
-`SHA256SUMS` publicado se verifica solo y, si no coincide, no se reemplaza nada.
+### 4. Instalar el relay — **sólo si no tenés Bun**
 
-![Seleccionando Instalar / actualizar relay](Imagenes/04-seleccionando-instalar-actualizar-relay.png)
+**Si ya tenés Bun instalado, salteá este paso entero.** El menú ni siquiera te
+ofrece «Instalar / actualizar relay», porque no hay nada que instalar: el relay
+ya corre con tu Bun. Los otros seis ítems aparecen igual, y el puente funciona
+sin bajar un solo byte.
 
-![Confirmación de la descarga del binario del relay](Imagenes/05-aceptando-la-descarga-del-binario-del-relay.png)
+Sin Bun, elegí «Instalar / actualizar relay». Antes de bajar nada te muestra la
+versión, el tamaño, de dónde lo baja y dónde lo instala, y te avisa que
+**detiene el relay que esté corriendo —lo haya arrancado esta extensión o vos—**.
+Elegí `Yes`: el `SHA256SUMS` publicado se verifica solo y, si no coincide, no se
+reemplaza nada.
+
+![Seleccionando Instalar / actualizar relay](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/04-seleccionando-instalar-actualizar-relay.png)
+
+![Confirmación de la descarga del binario del relay](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/05-aceptando-la-descarga-del-binario-del-relay.png)
 
 ### 5. Activar WARP (opcional)
 
@@ -120,9 +152,9 @@ Con el relay instalado ya aparecen los demás ítems. Si querés salir por WARP,
 pregunta antes de bajar nada: versión, tamaño, origen y destino. Elegí **`Yes`** y
 el checksum se verifica solo contra el `checksums.txt` del release.
 
-![Encendiendo WARP desde el menú](Imagenes/06-encendiendo-warp.png)
+![Encendiendo WARP desde el menú](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/06-encendiendo-warp.png)
 
-![Confirmación de la descarga de warp-minimal](Imagenes/07-confirmando-la-descarga-de-warp.png)
+![Confirmación de la descarga de warp-minimal](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/07-confirmando-la-descarga-de-warp.png)
 
 ### 6. Elegir el modo de WARP
 
@@ -133,7 +165,7 @@ el checksum se verifica solo contra el `checksums.txt` del release.
 
 El cambio aplica en el próximo pedido, sin reiniciar nada.
 
-![Modo de WARP configurado en el menú](Imagenes/08-configuracion-de-warp.png)
+![Modo de WARP configurado en el menú](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/08-configuracion-de-warp.png)
 
 ### Alternativa: desde el repo clonado
 
@@ -195,8 +227,8 @@ Todo lo que no hace falta para usar el puente —cómo elige el ejecutable, cóm
 resuelve la sesión del servicio, el contrato del gate, los tres modos de WARP
 con su rotación y su recuperación, las variables de entorno, `enabledModels`, la
 tabla completa de síntoma → arreglo, las pruebas y el tripwire— vive aparte, en
-[`docs/tecnico.md`](docs/tecnico.md). Tiene su propio índice.
+[`docs/tecnico.md`](https://github.com/Deury08/pi-free-bridge/blob/master/docs/tecnico.md). Tiene su propio índice.
 
 ## Licencia
 
-MIT — ver [`LICENSE`](LICENSE).
+MIT — ver [`LICENSE`](https://github.com/Deury08/pi-free-bridge/blob/master/LICENSE).
