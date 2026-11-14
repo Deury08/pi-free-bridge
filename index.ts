@@ -1709,6 +1709,143 @@ export async function ensureWarp(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
+// Download progress
+// ---------------------------------------------------------------------------
+//
+// Every file this extension downloads says how far along it is. The honest
+// constraint is that a percentage is a claim about the whole file: it is shown
+// only when the server said how big the body is (`content-length`), never
+// guessed — not from the release API's `size`, not from an assumption that a
+// finished stream was the whole file. A body read is all-or-nothing: a stream
+// that fails midway rejects, so the caller's existing failure path runs and no
+// truncated archive or binary can be written, verified or renamed into place.
+
+/** Same base the install prompts already use for an asset size (`(1.9 MB)`),
+ *  so the live readout and the consent prompt never disagree. */
+const DOWNLOAD_BYTES_PER_MB = 1048576;
+
+/** How long a progress line may go unrepeated when the percentage does not
+ *  move. One notification per chunk would flood Pi's UI and slow the very
+ *  download it describes. */
+const DOWNLOAD_PROGRESS_INTERVAL_MS = 100;
+
+/** A byte count the way the install prompts state one: `1.9 MB`. */
+export function formatDownloadSize(bytes: number): string {
+	return `${(Math.max(0, bytes) / DOWNLOAD_BYTES_PER_MB).toFixed(1)} MB`;
+}
+
+/** Percentage of a known total received so far, or undefined when there is no
+ *  usable total. A missing, zero, negative or non-finite total has no
+ *  percentage: dividing by it would invent a 0% or 100% the server never
+ *  promised. Clamped at 100 for a server that overruns its own header. */
+export function downloadPercent(received: number, total: number | undefined): number | undefined {
+	if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) return undefined;
+	if (!Number.isFinite(received) || received <= 0) return 0;
+	return Math.min(100, Math.floor((received / total) * 100));
+}
+
+/** The one line the user reads while a download runs:
+ *
+ *   Downloading warp-minimal v0.5.0… 47% (1.9 MB / 4.0 MB)
+ *   Downloading relay.js v0.6.0… 1.9 MB (size unknown)
+ *
+ *  `label` is the wording the caller already announces; the numbers and the
+ *  percentage are appended to it rather than replacing it. */
+export function formatDownloadProgress(input: {
+	label: string;
+	received: number;
+	total?: number;
+}): string {
+	const percent = downloadPercent(input.received, input.total);
+	if (percent === undefined) {
+		return `${input.label} ${formatDownloadSize(input.received)} (size unknown)`;
+	}
+	return `${input.label} ${percent}% (${formatDownloadSize(input.received)} / ${formatDownloadSize(input.total as number)})`;
+}
+
+/** `content-length` as a byte count, or undefined when the server did not send
+ *  a usable one — a chunked response, a garbage header, a zero total. */
+export function contentLengthFrom(
+	headers: { get(name: string): string | null } | null | undefined,
+): number | undefined {
+	const raw = headers?.get("content-length");
+	if (raw === null || raw === undefined) return undefined;
+	const value = Number(raw.trim());
+	if (!Number.isFinite(value) || value <= 0) return undefined;
+	return Math.trunc(value);
+}
+
+export type DownloadProgressReporter = (received: number, force?: boolean) => void;
+
+/** Throttled progress emitter: at most one line per interval, plus one for
+ *  every whole percentage point that moves, plus one when the caller forces it
+ *  (the final line, so the readout ends on the real byte count). `now` and
+ *  `intervalMs` are injectable so the throttle is testable without sleeping. */
+export function createDownloadReporter(input: {
+	label: string;
+	total?: number;
+	report: (line: string) => void;
+	now?: () => number;
+	intervalMs?: number;
+}): DownloadProgressReporter {
+	const now = input.now ?? Date.now;
+	const intervalMs = input.intervalMs ?? DOWNLOAD_PROGRESS_INTERVAL_MS;
+	let lastAt: number | undefined;
+	let lastPercent: number | undefined;
+	return (received, force = false) => {
+		const at = now();
+		const percent = downloadPercent(received, input.total);
+		if (!force && lastAt !== undefined) {
+			const moved = percent !== undefined && percent !== lastPercent;
+			if (!moved && at - lastAt < intervalMs) return;
+		}
+		lastAt = at;
+		lastPercent = percent;
+		input.report(formatDownloadProgress({ label: input.label, received, total: input.total }));
+	};
+}
+
+/** Stream a response body, reporting progress as bytes arrive, and resolve with
+ *  the complete body. Never resolves with a partial body: a stream that errors
+ *  midway rejects, so a drop in the middle of a download surfaces as a failed
+ *  download rather than a short one. */
+export async function readDownloadBody(input: {
+	body: ReadableStream<Uint8Array> | null;
+	label: string;
+	total?: number;
+	report?: (line: string) => void;
+	now?: () => number;
+	intervalMs?: number;
+}): Promise<Buffer> {
+	if (!input.body) throw new Error(`download of ${input.label} returned no body`);
+	const notify = input.report
+		? createDownloadReporter({
+				label: input.label,
+				total: input.total,
+				report: input.report,
+				now: input.now,
+				intervalMs: input.intervalMs,
+			})
+		: undefined;
+
+	const reader = input.body.getReader();
+	const chunks: Buffer[] = [];
+	let received = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		if (!value || value.byteLength === 0) continue;
+		chunks.push(Buffer.from(value));
+		received += value.byteLength;
+		notify?.(received);
+	}
+	// Only a fully read body reaches this line, so the last thing the user sees
+	// before the success message is the complete size.
+	notify?.(received, true);
+	return Buffer.concat(chunks);
+}
+
+// ---------------------------------------------------------------------------
 // warp-minimal install (bun-upgrades S4, in-Pi with explicit consent)
 // ---------------------------------------------------------------------------
 //
@@ -1780,7 +1917,8 @@ async function installWarpBinary(
 	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-warp-"));
 	try {
 		const archivePath = join(tmpDir, asset.name);
-		status?.(`Downloading warp-minimal ${asset.tag}…`);
+		const label = `Downloading warp-minimal ${asset.tag}…`;
+		status?.(label);
 		const res = await fetch(asset.url, {
 			headers: { "user-agent": "pi-free-bridge" },
 			signal: AbortSignal.timeout(60000),
@@ -1789,7 +1927,12 @@ async function installWarpBinary(
 			console.error(`pi-free-bridge: warp-minimal download failed — HTTP ${res.status}`);
 			return undefined;
 		}
-		writeFileSync(archivePath, Buffer.from(await res.arrayBuffer()));
+		// The bytes only reach `archivePath` once the whole body arrived, so a drop
+		// in the middle leaves nothing behind for the checksum or tar step to read.
+		writeFileSync(
+			archivePath,
+			await readDownloadBody({ body: res.body, label, total: contentLengthFrom(res.headers), report: status }),
+		);
 
 		const csUrl = asset.url.slice(0, asset.url.length - asset.name.length) + "checksums.txt";
 		const csRes = await fetch(csUrl, {
@@ -2264,7 +2407,8 @@ async function installRelayBinary(
 ): Promise<string | undefined> {
 	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-relay-"));
 	try {
-		status?.(`Downloading ${release.asset.name} ${release.tag}…`);
+		const label = `Downloading ${release.asset.name} ${release.tag}…`;
+		status?.(label);
 		const res = await fetch(release.asset.url, {
 			headers: { "user-agent": "pi-free-bridge" },
 			signal: AbortSignal.timeout(120000),
@@ -2273,7 +2417,14 @@ async function installRelayBinary(
 			console.error(`pi-free-bridge: relay download failed — HTTP ${res.status}`);
 			return undefined;
 		}
-		const bytes = Buffer.from(await res.arrayBuffer());
+		// Complete-or-throw: a half-read body rejects here, lands in the catch below
+		// and is reported as a failure, leaving the staged path unwritten.
+		const bytes = await readDownloadBody({
+			body: res.body,
+			label,
+			total: contentLengthFrom(res.headers),
+			report: status,
+		});
 
 		status?.("Verifying the published SHA256SUMS…");
 		const sumsRes = await fetch(release.checksumsUrl, {

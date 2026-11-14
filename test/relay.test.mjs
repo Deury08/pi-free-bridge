@@ -6237,3 +6237,195 @@ test("/health publishes the free round and its terminal 429 (S23)", async () => 
 		}
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Download progress (odd/tasks/download-progress.md).
+//
+// Every file the extension downloads must say how far along it is, but a
+// percentage is a claim about the whole file: it is shown only when the server
+// sent a content-length, never guessed from a release-API size, and never
+// faked as 0% or 100% when the length is missing or unusable. Bodies are read
+// through local streams here — nothing touches the network.
+// ---------------------------------------------------------------------------
+
+/** A response body that hands back `chunks` and then ends. */
+function bodyOf(chunks) {
+	return new ReadableStream({
+		start(controller) {
+			for (const chunk of chunks) controller.enqueue(new Uint8Array(chunk));
+			controller.close();
+		},
+	});
+}
+
+/** A response body that delivers `first` and then fails, like a dropped
+ *  connection halfway through a download. */
+function brokenBodyOf(first, error) {
+	let pulls = 0;
+	return new ReadableStream({
+		pull(controller) {
+			if (pulls++ === 0) {
+				controller.enqueue(new Uint8Array(first));
+				return;
+			}
+			controller.error(error);
+		},
+	});
+}
+
+test("formatDownloadProgress: a known content-length states the percentage and both sizes", () => {
+	// 2_000_000 of 4_194_304 bytes is 47%: the readout is the line the user
+	// reads while the warp archive lands, not a log entry.
+	const line = releaseMod.formatDownloadProgress({
+		label: "Downloading warp-minimal v0.5.0…",
+		received: 2000000,
+		total: 4 * 1048576,
+	});
+	assert.equal(line, "Downloading warp-minimal v0.5.0… 47% (1.9 MB / 4.0 MB)");
+});
+
+test("formatDownloadProgress: an unknown length reports bytes only and claims no percentage", () => {
+	// A chunked response carries no content-length. Printing 0% or 100% would be
+	// inventing a fact the server never sent.
+	const line = releaseMod.formatDownloadProgress({
+		label: "Downloading relay.js v0.6.0…",
+		received: 2000000,
+		total: undefined,
+	});
+	assert.equal(line, "Downloading relay.js v0.6.0… 1.9 MB (size unknown)");
+	assert.doesNotMatch(line, /%/, "no percentage may appear without a known total");
+});
+
+test("formatDownloadProgress: a zero-length body claims neither 0% nor 100%", () => {
+	const line = releaseMod.formatDownloadProgress({
+		label: "Downloading relay.js v0.6.0…",
+		received: 0,
+		total: 0,
+	});
+	assert.equal(line, "Downloading relay.js v0.6.0… 0.0 MB (size unknown)");
+	assert.doesNotMatch(line, /%/, "a 0-byte total is unusable, so it is not a percentage");
+});
+
+test("downloadPercent: arithmetic, clamping, and no percentage for an unusable total", () => {
+	assert.equal(releaseMod.downloadPercent(0, 4194304), 0);
+	assert.equal(releaseMod.downloadPercent(2097152, 4194304), 50);
+	assert.equal(releaseMod.downloadPercent(4194304, 4194304), 100);
+	assert.equal(releaseMod.downloadPercent(999, 1000), 99, "a partial byte never rounds up to complete");
+	assert.equal(releaseMod.downloadPercent(5000, 1000), 100, "a server that overruns its own total is capped");
+
+	for (const total of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+		assert.equal(
+			releaseMod.downloadPercent(100, total),
+			undefined,
+			`total ${String(total)} is not a known size, so it has no percentage`,
+		);
+	}
+});
+
+test("contentLengthFrom: reads a usable content-length and refuses everything else", () => {
+	const headers = (value) => ({ get: (name) => (name.toLowerCase() === "content-length" ? value : null) });
+	assert.equal(releaseMod.contentLengthFrom(headers("4194304")), 4194304);
+	assert.equal(releaseMod.contentLengthFrom(headers(" 4194304 ")), 4194304);
+	assert.equal(releaseMod.contentLengthFrom(headers(null)), undefined, "absent: chunked transfer");
+	assert.equal(releaseMod.contentLengthFrom(headers("0")), undefined, "a zero total cannot carry a percentage");
+	assert.equal(releaseMod.contentLengthFrom(headers("-")), undefined);
+	assert.equal(releaseMod.contentLengthFrom(headers("12abc")), undefined);
+	assert.equal(releaseMod.contentLengthFrom(undefined), undefined);
+});
+
+test("createDownloadReporter: one line per percentage point or per 100 ms, never per chunk", () => {
+	const lines = [];
+	const clock = { at: 0 };
+	const report = (line) => lines.push(line);
+
+	// With no content-length only the clock can gate the update.
+	const unknown = releaseMod.createDownloadReporter({
+		label: "Downloading relay.js v0.6.0…",
+		total: undefined,
+		report,
+		now: () => clock.at,
+	});
+	unknown(1048576);
+	assert.deepEqual(lines, ["Downloading relay.js v0.6.0… 1.0 MB (size unknown)"]);
+	clock.at = 40;
+	unknown(2097152);
+	clock.at = 99;
+	unknown(3145728);
+	assert.equal(lines.length, 1, "chunks arriving inside the window are not reported one by one");
+	clock.at = 100;
+	unknown(4194304);
+	assert.equal(lines.length, 2, "100 ms elapsed, so the next chunk is reported");
+
+	// With a known total a whole percentage point moves the readout immediately.
+	lines.length = 0;
+	const known = releaseMod.createDownloadReporter({
+		label: "Downloading warp-minimal v0.5.0…",
+		total: 1000,
+		report,
+		now: () => clock.at,
+	});
+	known(0);
+	assert.equal(lines[0], "Downloading warp-minimal v0.5.0… 0% (0.0 MB / 0.0 MB)");
+	known(5);
+	assert.equal(lines.length, 1, "the same percentage inside the window is suppressed");
+	clock.at = 101;
+	known(10);
+	assert.equal(lines.length, 2, "a new percentage point is reported without waiting");
+	assert.match(lines[1], / 1% \(/);
+
+	// The caller forces the last line so the readout ends on the real byte count.
+	clock.at = 102;
+	known(1000, true);
+	assert.match(lines[2], / 100% \(/);
+});
+
+test("readDownloadBody: streams every byte and ends on the finished size", async () => {
+	const lines = [];
+	const bytes = await releaseMod.readDownloadBody({
+		body: bodyOf([[1, 2, 3], [4, 5], [6]]),
+		label: "Downloading warp-minimal v0.5.0…",
+		total: 6,
+		report: (line) => lines.push(line),
+		now: () => 0,
+	});
+	assert.deepEqual([...bytes], [1, 2, 3, 4, 5, 6], "the body arrives intact");
+	assert.match(lines.at(-1), / 100% \(/, "the last line states the download finished");
+});
+
+test("readDownloadBody: a stream that fails midway rejects and never looks complete", async () => {
+	const lines = [];
+	await assert.rejects(
+		releaseMod.readDownloadBody({
+			body: brokenBodyOf([1, 2, 3], new Error("connection reset")),
+			label: "Downloading relay.js v0.6.0…",
+			total: 10,
+			report: (line) => lines.push(line),
+			now: () => 0,
+		}),
+		/connection reset/,
+		"a half-read body is a failed download, not a short one",
+	);
+	assert.ok(
+		lines.every((line) => !/ 100% /.test(line)),
+		"nothing claims the partial body was the whole file",
+	);
+});
+
+test("readDownloadBody: a response with no body is a failed download", async () => {
+	await assert.rejects(
+		releaseMod.readDownloadBody({ body: null, label: "Downloading relay.js v0.6.0…", total: undefined }),
+		/no body/,
+	);
+});
+
+test("every file download in index.ts streams through readDownloadBody", () => {
+	// Two install sites (warp-minimal, relay) download a binary off the network.
+	// Buffering one of them with `arrayBuffer()` would silently lose its progress.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(source, /arrayBuffer\(\)/, "no download may buffer a body without progress");
+	assert.equal(
+		(source.match(/await readDownloadBody\(/g) ?? []).length,
+		2,
+		"both install sites report progress",
+	);
+});
