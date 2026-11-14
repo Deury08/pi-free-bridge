@@ -34,7 +34,9 @@ const API_KEY = "public";
  *  the gate at all. */
 const FALLBACK_USER_AGENT = "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
-/** Optional user config: `{ "sessionId": "ses_…", "liveIds": ["…"] }`. */
+/** Optional user config: `{ "sessionId": "ses_…" }`. `liveIds` used to live
+ *  here as the local half of the registered-set invariant; the catalog is now
+ *  the relay's, so nothing reads it and the field was removed. */
 export const BRIDGE_CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-free-bridge.json");
 
 /** Pi's global settings. Pi scopes the model picker to `enabledModels`, so a
@@ -264,7 +266,6 @@ export function repairEnabledModels(settingsPath: string = SETTINGS_PATH): Enabl
 
 type BridgeConfig = {
 	sessionId?: string;
-	liveIds?: string[];
 	relayPort?: number;
 	/** "off" | "auto" | "on" (bun-upgrades S5); anything else reads as off. */
 	warpEnabled?: string;
@@ -754,26 +755,13 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 		);
 	}
 
-	// A configured binary wins over Bun: it is the standalone runtime the user
-	// installed on purpose. Bun stays the default, so an existing install keeps
-	// behaving exactly as before.
-	const configuredBin = readBridgeConfig().relayBin?.trim();
-	// A versioned leftover may still be on disk after the layout change, and
-	// starting it would run the build the human just replaced. So a version-shaped
-	// name is not a candidate at all: the canonical binary of this platform is, and
-	// only when that is missing do we fall back to Bun.
-	const usableConfigured = configuredBin && !isVersionedRelayBinName(configuredBin) ? configuredBin : undefined;
-	const canonicalBin = (() => {
-		for (const name of Object.values(RELAY_ASSETS)) {
-			const candidate = join(RELAY_INSTALL_DIR, name);
-			if (existsSync(candidate)) return candidate;
-		}
-		return undefined;
-	})();
-	const relayBin =
-		usableConfigured && existsSync(usableConfigured) ? usableConfigured : canonicalBin;
-	const bun = relayBin ? undefined : resolveBunPath();
-	if (!relayBin && !bun) {
+	// Bun wins over a binary on purpose. Both run the same relay — the compiled
+	// binary is `relay.mjs` with the runtime inside — so the only difference that
+	// matters is updating: `pi install` refreshes the script with the package, and
+	// nothing refreshes a binary. A binary that stays on disk is the fallback for
+	// the day Bun is gone, never the preferred runtime.
+	const command = resolveRelayCommand();
+	if (!command) {
 		// S27: never degrade into a silent 429.
 		throw new Error(
 			"pi-free-bridge: the free-tier relay needs either a downloaded binary or bun, and neither was found. " +
@@ -782,9 +770,10 @@ async function startRelay(options: RelayOptions, key: string): Promise<RelayStat
 		);
 	}
 
-	const child = relayBin
-		? spawn(relayBin, [], { stdio: ["pipe", "pipe", "pipe"], env: relayEnv(options) })
-		: spawn(bun as string, [RELAY_SCRIPT], { stdio: ["pipe", "pipe", "pipe"], env: relayEnv(options) });
+	const child =
+		command.kind === "bun"
+			? spawn(command.path, [RELAY_SCRIPT], { stdio: ["pipe", "pipe", "pipe"], env: relayEnv(options) })
+			: spawn(command.path, [], { stdio: ["pipe", "pipe", "pipe"], env: relayEnv(options) });
 
 	try {
 		await waitForListening(child, options.port);
@@ -2375,6 +2364,46 @@ export function isVersionedRelayBinName(path: string): boolean {
 	return false;
 }
 
+/** What the relay is started from: Bun running the bundled script, or a binary. */
+export type RelayCommand = { kind: "bun"; path: string } | { kind: "binary"; path: string };
+
+export type RelayCommandDeps = {
+	dir?: string;
+	read?: () => { relayBin?: string };
+	exists?: (path: string) => boolean;
+	bunPath?: () => string | undefined;
+};
+
+/** Bun wins when it is installed; a binary is the fallback.
+ *
+ *  Both run the same relay — the compiled binary is `relay.mjs` with the Bun
+ *  runtime inside — so nothing behavioural separates them. Updating does: `pi
+ *  install` refreshes the script that ships in this package, and nothing
+ *  refreshes a binary. So a binary kept on disk answers only when Bun is gone; it
+ *  is never preferred over it, even when `relayBin` names it on purpose.
+ *
+ *  A versioned leftover is not a candidate at all: starting it would run the
+ *  build the human just replaced. */
+export function resolveRelayCommand(deps: RelayCommandDeps = {}): RelayCommand | undefined {
+	const dir = deps.dir ?? RELAY_INSTALL_DIR;
+	const read = deps.read ?? readBridgeConfig;
+	const exists = deps.exists ?? existsSync;
+	const bunPath = deps.bunPath ?? resolveBunPath;
+
+	const bun = bunPath();
+	if (bun) return { kind: "bun", path: bun };
+
+	const configured = read().relayBin?.trim();
+	if (configured && !isVersionedRelayBinName(configured) && exists(configured)) {
+		return { kind: "binary", path: configured };
+	}
+	for (const name of Object.values(RELAY_ASSETS)) {
+		const canonical = join(dir, name);
+		if (exists(canonical)) return { kind: "binary", path: canonical };
+	}
+	return undefined;
+}
+
 /** True when a configured `relayBin` names something the layout no longer
  *  produces, or nothing at all. */
 function isStaleRelayBin(configured: string, assetName: string, exists: (path: string) => boolean): boolean {
@@ -2470,6 +2499,10 @@ async function runRelayInstallFlow(ctx: WarpPromptContext): Promise<boolean> {
 			: "Esto DETIENE el relay que está corriendo —lo haya arrancado esta extensión o vos— para que use el binario nuevo.",
 	];
 	if (bun) lines.push("", `Bun ya está disponible (${bun}): si decís que no, nada cambia.`);
+	lines.push(
+		"",
+		"El código del relay se actualiza con npm (pi install npm:pi-free-bridge@x); un binario compilado se actualiza sólo desde este menú.",
+	);
 
 	if (!ctx.hasUI) return false;
 	if (!(await ctx.ui.confirm("pi-free-bridge: instalar / actualizar relay", lines.join("\n")))) {
@@ -2710,16 +2743,22 @@ export const MENU_REFRESH = 6;
 /** Which items this machine can actually use, in the dictated order.
  *
  *  Progressive disclosure, not decoration: an item that can only fail is a
- *  trap. Nothing installed means installing is the only real action, so that
- *  is the entire menu. Recycling an exit needs a WARP binary to route through.
- *
- *  Exported so the gating is testable without a Pi runtime: this is the rule
- *  that used to be unexpressible, because the early return removed the menu
- *  before any of it could run. */
-export function visibleMenuIndices(state: { relayReady: boolean; warpReady: boolean }): number[] {
+ *  trap. The install row exists for the machine that has no other way to run
+ *  the relay, so it appears exactly when Bun is absent. With Bun present the
+ *  relay source already ships in this package and npm carries its updates, so
+ *  downloading a compiled copy changes nothing. Every other row needs a
+ *  runnable relay — a binary, or Bun — and recycling needs a WARP binary to
+ *  route through. */
+export function visibleMenuIndices(state: {
+	bunReady: boolean;
+	binaryPresent: boolean;
+	warpReady: boolean;
+}): number[] {
+	const runnable = state.bunReady || state.binaryPresent;
 	const visible: number[] = [];
 	for (let index = 0; index < MENU_ITEMS.length; index++) {
-		if (index !== MENU_INSTALL && !state.relayReady) continue;
+		if (index === MENU_INSTALL && state.bunReady) continue;
+		if (index !== MENU_INSTALL && !runnable) continue;
 		if (index === MENU_RECYCLE && !state.warpReady) continue;
 		visible.push(index);
 	}
@@ -2836,13 +2875,21 @@ export default async function (pi: ExtensionAPI) {
 	// every registered command, aliases included, costs a completion entry.
 	// -----------------------------------------------------------------------
 
-	/** Is the relay runnable on this machine: an installed binary, or Bun to
-	 *  run the script. This is what decides whether the menu can offer anything
-	 *  beyond installing. */
-	function relayReady(): boolean {
-		const configured = readBridgeConfig().relayBin?.trim();
-		if (configured && existsSync(configured)) return true;
+	/** Is Bun resolvable? It is never a dependency — the relay can come as a
+	 *  compiled binary instead — but when it is there it runs the script this
+	 *  package already ships, with nothing to download. */
+	function bunReady(): boolean {
 		return resolveBunPath() !== undefined;
+	}
+
+	/** Is there a compiled binary the spawn would accept? Same order `startRelay`
+	 *  applies: a configured path that is not a versioned leftover, then the
+	 *  canonical name of any published asset. A version-shaped `relayBin` exists
+	 *  but is refused by the spawn, so it never counts here. */
+	function binaryPresent(): boolean {
+		const configured = readBridgeConfig().relayBin?.trim();
+		if (configured && !isVersionedRelayBinName(configured) && existsSync(configured)) return true;
+		return Object.values(RELAY_ASSETS).some((name) => existsSync(join(RELAY_INSTALL_DIR, name)));
 	}
 
 	/** Is a WARP binary available? Recycling an exit without one is a menu
@@ -3212,7 +3259,11 @@ export default async function (pi: ExtensionAPI) {
 
 		// `visible` maps a picked row back to its real menu index, so hiding an
 		// item never shifts the dispatch.
-		const visible = visibleMenuIndices({ relayReady: relayReady(), warpReady: warpReady() });
+		const visible = visibleMenuIndices({
+			bunReady: bunReady(),
+			binaryPresent: binaryPresent(),
+			warpReady: warpReady(),
+		});
 		const labels = visible.map((index) => {
 			const item = MENU_ITEMS[index];
 			if (index === MENU_WARP) return `${item} — ahora: ${warpNow}`;
@@ -3294,8 +3345,14 @@ export default async function (pi: ExtensionAPI) {
 				`  warp target: ${describeWarpTarget(warpTarget)}`,
 				`  warp health: ${warpTarget.healthUrl}`,
 				`  upstream:   ${UPSTREAM_URL}`,
-				`  live ids:   ${live.source}`,
-				`  skipped:    ${discovered.skipped.length ? discovered.skipped.join(", ") : "none"}`,
+				// The catalog is the only source of ids now: the snapshot and the
+				// config field that used to answer this are gone, so the count the
+				// relay publishes is what the report can state.
+				`  skipped:    ${
+					discovered.skippedCount === undefined
+						? "unknown (the catalog did not report a count)"
+						: `${discovered.skippedCount} (not free, per the relay)`
+				}`,
 			];
 
 			const result = repairEnabledModels();
