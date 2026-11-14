@@ -157,10 +157,14 @@ If any 429 in round 1 classified as `session_suspect` (`classifyGate429`), the
 cause is not the egress: no rotation, the original 429 is delivered. The same
 `warpSwapDecision` that already decides whether a swap is worth its enrollment
 gates round 2, so a long `retry-after` never buys a rotation that cannot help.
-**Round 2 costs two enrollments, not one.** The proxy's `RecycleAll` rotates every
-exit that is not cooling down, in parallel, and each replacement registers a new
-device, so a rotation over two healthy exits spends two enrollments on the same
-rate-limited registration.
+Round 2 buys the cheapest replacement the proxy offers. `POST /swap {"exit": id}`
+replaces **that** exit and only that one — one enrollment, victim chosen by the relay —
+so the ladder sacrifices the exit whose egress was burnt and leaves the other alone.
+`POST /recycle` is the fallback for a proxy that answers it has no `/swap`: it rotates
+every exit that is not cooling down, in parallel, one enrollment each, so it must never
+be the first choice when the targeted verb is available. (Correction to L21/L24: the
+ladder as first specified used `/recycle` and would have spent two enrollments; the
+targeted swap makes round 2 cost one, and only for the exit that actually burnt.)
 
 S22. The client sees **exactly one 429 per request**, and it is the terminal one.
 The delivered response is the original rebuilt byte-exact with `forwardedHeaders`
@@ -188,6 +192,13 @@ episode every burnt address is known, and the only thing the client can act on i
 the freshest `retry-after`, which belongs to the last refusal, not the first. The
 episode is bounded by the pool, not by a number: two exits per round means at most
 four egress attempts when the proxy publishes two, and fewer when it does not (S26).
+
+S26a. Two replacement verbs, and the ladder prefers the narrow one. `POST /swap
+{"exit": id}` replaces exactly the named exit (one enrollment). `POST /recycle`
+replaces every exit not cooling down, in parallel (one enrollment **each**). The
+ladder swaps the burnt exit first and only falls back to the broad verb when the
+proxy reports it has no `/swap`, because the broad verb spends enrollments on exits
+that were never implicated.
 
 S26. The proxy's rotation contract, as measured by the peer (`path:line`, installed
 binary, unchanged by the feature branch): the `POST /recycle` body reports
@@ -458,6 +469,13 @@ retries on its own, and the client sees a single terminal 429. **The cost I stat
 when asking was wrong**: I said one enrollment, and `RecycleAll` spends two (L24). The
 choice was made on the correct direction — free rung first, one paid rotation at
 most — but the price is double what the user was told.
+
+L28 (correction of my own claim, verified at relay.mjs:2366): a per-exit rotation DOES
+exist — `POST /swap {"exit": id}` — and the relay already uses it, passing the id of the
+exit it wants replaced. My earlier table said "per-exit rotation: does not exist", which
+was wrong, and the wrong claim would have made round 2 spend two enrollments through
+`/recycle` instead of one through `/swap`. The warp work I proposed for a per-exit verb
+is therefore unnecessary; only D13 remains as a proxy-side item.
 
 L27 (user, verbatim): «estos cambios no ameritan trabajar mas el el warp?». Answer: the
 ladder itself needs nothing new from the proxy — every fact it reads already exists. Two
