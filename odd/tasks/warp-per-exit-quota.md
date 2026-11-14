@@ -576,3 +576,31 @@ Two gaps the worker declared, recorded rather than buried:
   owner's explicit acceptance. Side effect: fully parked, one client request can spend two
   real attempts against parked exits.
 
+L32 (independent verification of 4a81a14, `gentle-ai-verify`): verdicts **S20 met,
+S22 met, S23 met, S27 partly met, S28 partly met**. Two blockers, both confirmed by
+probe, plus one advisory and one nit.
+
+- **Blocker 1, contradicts S28.** After a paid resend the delivered 429 carries round 1's
+  `retry-after`, not the resend's: `resendWarpOnce` drains the resend response and returns
+  `undefined` (relay.mjs:2500), the caller keeps round 1's refusal (:2749) and rebuilds it
+  (:2407). Measured: round 1 a=7200, b=3600, resend 429 with `retry-after: 120` → the
+  client was handed 3600. `resendWarpOnce` is therefore no longer out of scope; S28 cannot
+  be met without it.
+- **Blocker 2, contradicts S27 and S28's ordering.** With the whole pool parked at entry,
+  `preferredExitForAttempt` (relay.mjs:1663) spends a request on the **stalest** candidate
+  before round 1 runs, round 1 then excludes it, and the terminal attempt goes to the last
+  candidate — so a fully parked pool costs two parked requests and the delivered bytes are
+  not the last candidate's. Pre-change baseline on the same fixture: one attempt, no
+  credential. The free round's `clean.length === 0` branch already performs the terminal
+  attempt in the right order, so the request-path fallback is redundant and must go: that
+  also removes the shared-code behaviour change flagged as Risk item 3.
+- **Advisory.** Round 1 adopts any non-429 answer (relay.mjs:2661), so a 503 from the next
+  exit replaces the 429 already in hand; round 2 only adopts `<400` (:2496, :2507). The
+  client must see the 429, not a burnt exit's 503.
+- **Nit.** Duplicated S23 comment (:3243, :3247); `warpTerminal429s` (:3026) counts only
+  inside the ladder block, so a resend-disabled or legacy request is counted inconsistently.
+
+Clean by verification: freshest-first rank order regardless of pool order, one attempt per
+exit, park-before-next, zero enrollments in round 1, exactly one response per request,
+and legacy and warp-off shape-identical to baseline.
+
