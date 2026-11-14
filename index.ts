@@ -1760,6 +1760,51 @@ export function readWarpProcess(): { pid: number; bin: string; spawned_at: numbe
 	}
 }
 
+/** T9c: what this extension last installed, kept beside the binary like the
+ *  process record. A release publishes its tag and its assets, never the commit
+ *  inside it, and the binary prints the source's version constant — so "is the
+ *  release newer than what I installed?" is a fact only this file can answer.
+ *  Nothing reads it yet: the update path that will is a separate change. */
+export function warpInstallRecordPath(): string {
+	return join(WARP_INSTALL_DIR, "warp-install.json");
+}
+
+/** A tag that is not a non-empty string means no record, so the `tag` check is
+ *  the whole shape rule; the other two fields degrade to empty values. */
+export type WarpInstallRecord = { tag: string; commit: string; installed_at: number };
+
+export function writeWarpInstallRecord({ tag, commit }: { tag: string; commit: string }, path = warpInstallRecordPath()): void {
+	const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(temp, `${JSON.stringify({ tag, commit, installed_at: Date.now() })}\n`, "utf-8");
+		renameSync(temp, path);
+	} catch {
+		// A lost record costs one unnecessary install; a thrown error would cost
+		// the update that just succeeded. Leave no half-written temp behind either.
+		try {
+			rmSync(temp, { force: true });
+		} catch {
+			// Nothing more to do: the record is lost and that is survivable.
+		}
+	}
+}
+
+export function readWarpInstallRecord(path = warpInstallRecordPath()): WarpInstallRecord | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(path, "utf-8"));
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+		if (typeof raw.tag !== "string" || !raw.tag.trim()) return undefined;
+		return {
+			tag: raw.tag,
+			commit: typeof raw.commit === "string" ? raw.commit : "",
+			installed_at: typeof raw.installed_at === "number" ? raw.installed_at : 0,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 export type StopWarpDeps = {
 	/** The proxy's `/health` body, or undefined when nothing answers. */
 	probe: () => Promise<unknown>;

@@ -6612,6 +6612,60 @@ test("warpUpdateDecision: no latest tag is unknown, which is not 'update' (T9c)"
 	assert.equal(releaseMod.warpUpdateDecision({ latestTag: "  ", installedTag: "v0.4.0" }), "unknown");
 });
 
+// T9c: the record is the fact `warpUpdateDecision` needs. Every test below passes
+// an explicit path, so the real install directory is never read or written.
+test("warpInstallRecord: a written record round trips tag, commit and timestamp (T9c)", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-install-record-"));
+	try {
+		const path = join(dir, "warp-install.json");
+		const before = Date.now();
+		releaseMod.writeWarpInstallRecord({ tag: "v0.4.0", commit: "b04459a" }, path);
+		const read = releaseMod.readWarpInstallRecord(path);
+		assert.deepEqual({ tag: read.tag, commit: read.commit }, { tag: "v0.4.0", commit: "b04459a" });
+		assert.ok(typeof read.installed_at === "number", "installed_at is a number");
+		assert.ok(read.installed_at >= before && read.installed_at <= Date.now(), "installed_at is the write time");
+		// Atomic write: the record is the only file left, no temp file beside it.
+		assert.deepEqual(readdirSync(dir), ["warp-install.json"]);
+		assert.equal(
+			releaseMod.warpUpdateDecision({ latestTag: "v0.4.0", installedTag: releaseMod.readWarpInstallRecord(path).tag }),
+			"up-to-date",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("warpInstallRecord: a missing file is no record at all (T9c)", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-install-record-"));
+	try {
+		assert.equal(releaseMod.readWarpInstallRecord(join(dir, "warp-install.json")), undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("warpInstallRecord: an unparseable or wrong-shape file is no record either (T9c)", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-install-record-"));
+	try {
+		const path = join(dir, "warp-install.json");
+		writeFileSync(path, "not json at all", "utf-8");
+		assert.equal(releaseMod.readWarpInstallRecord(path), undefined, "unparseable");
+		for (const bad of [
+			"null",
+			"[]",
+			JSON.stringify({ commit: "b04459a", installed_at: 1 }),
+			JSON.stringify({ tag: "", commit: "b04459a", installed_at: 1 }),
+			JSON.stringify({ tag: "   ", commit: "b04459a", installed_at: 1 }),
+			JSON.stringify({ tag: 42, commit: "b04459a", installed_at: 1 }),
+		]) {
+			writeFileSync(path, bad, "utf-8");
+			assert.equal(releaseMod.readWarpInstallRecord(path), undefined, `wrong shape: ${bad}`);
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 
 // D10: the port the relay listens on and the variable its clash message names
 // must be the same one, otherwise following the advice cannot change anything.
