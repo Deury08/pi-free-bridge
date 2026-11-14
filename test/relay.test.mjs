@@ -5146,6 +5146,31 @@ test("quotaLedgerHealth: the two numbers /health publishes (S12)", () => {
 	});
 });
 
+// D12: the ledger is pruned only when it is written, so in the window between a
+// reset expiring and the next park the in-memory ledger still carries the stale
+// entry. What /health reports has to be the clock's answer, not the file's: no
+// write happens here, so the only thing that can keep `parked` honest is the
+// read-time filter.
+test("quotaLedgerHealth: an expired park stops counting before any write prunes it (D12)", () => {
+	const ledger = parseQuotaLedger(
+		JSON.stringify({
+			version: 1,
+			egresses: {
+				[V4_A]: { parked_until: LEDGER_NOW - 1_000, exit_id: "warp-a" },
+				[V4_B]: { parked_until: LEDGER_NOW - 60_000, exit_id: "warp-b" },
+				[LOCAL_EGRESS_KEY]: { parked_until: LEDGER_NOW - 90_000 },
+			},
+		}),
+	);
+	// The window D12 names: every entry already expired, and nothing has written.
+	assert.equal(Object.keys(ledger.egresses).length, 3, "the expired parks are still in the in-memory ledger");
+	assert.deepEqual(quotaLedgerHealth(ledger, [{ id: "warp-a" }, { id: "warp-b" }], LEDGER_NOW), {
+		parked: 0,
+		parkedLive: 0,
+		nearestResetInMs: 0,
+	});
+});
+
 // D14: a park is a guard, not a tombstone — a burnt address still protects a
 // live exit if the address came back. So nothing is pruned; the health line only
 // says how many of the guards can fire against the pool as it stands right now.
