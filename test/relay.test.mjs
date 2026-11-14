@@ -6530,3 +6530,67 @@ test("/health republishes the proxy's build identity, and null when it has none 
 		globalThis.fetch = originalFetch;
 	}
 });
+
+// T9b / S29, S30c, S30d: the running proxy must be able to say which build it is,
+// and when it cannot, the notice has to name the action. Every case below is one
+// line of policy: silence when there is nothing to do, one actionable sentence
+// otherwise, and never a diagnostic without a command.
+test("parseWarpBuildVersion: the commit in parentheses is the identity (T9b)", () => {
+	assert.equal(releaseMod.parseWarpBuildVersion("warp-minimal v0.2.3 (b04459a)"), "b04459a");
+	assert.equal(releaseMod.parseWarpBuildVersion("  warp-minimal v0.2.3 (b04459a)\n"), "b04459a");
+});
+
+test("parseWarpBuildVersion: (unknown) is absence of identity, not a commit (T9b)", () => {
+	assert.equal(releaseMod.parseWarpBuildVersion("warp-minimal v0.2.3 (unknown)"), null);
+	assert.equal(releaseMod.parseWarpBuildVersion("warp-minimal v0.2.3"), null);
+	assert.equal(releaseMod.parseWarpBuildVersion(""), null);
+});
+
+test("warpBuildNotice: equal builds say nothing at all (T9b)", () => {
+	assert.equal(releaseMod.warpBuildNotice({ running: "b04459a", installed: "b04459a" }), null);
+});
+
+test("warpBuildNotice: an unidentifiable proxy names the update, which is what installs identity (T9b)", () => {
+	assert.equal(
+		releaseMod.warpBuildNotice({ running: null, installed: null }),
+		"warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update",
+	);
+	assert.equal(
+		releaseMod.warpBuildNotice({ running: null, installed: "b04459a" }),
+		"warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update",
+	);
+});
+
+test("warpBuildNotice: a different build on disk names both commits (T9b)", () => {
+	assert.equal(
+		releaseMod.warpBuildNotice({ running: "b04459a", installed: "9a1c2f0" }),
+		"the proxy runs b04459a, the installed build is 9a1c2f0 — /warp update",
+	);
+});
+
+test("warpBuildNotice: an installed build older than the running one is not an update (T9b)", () => {
+	// The running proxy can name itself and the file on disk cannot: the file is
+	// the older artifact, so "update" would be advice to downgrade.
+	assert.equal(releaseMod.warpBuildNotice({ running: "b04459a", installed: null }), null);
+});
+
+test("warpBuildDrift: a dependency that fails is no answer, never a broken entry point (T9b)", async () => {
+	const notice = await releaseMod.warpBuildDrift({
+		fetchProxyBuild: async () => {
+			throw new Error("connect ECONNREFUSED");
+		},
+		readInstalledBuild: () => {
+			throw new Error("spawn failed");
+		},
+	});
+	assert.match(notice ?? "", /does not publish its identity/);
+});
+
+test("warpBuildDrift: matching builds produce no notice at all (T9b)", async () => {
+	const notice = await releaseMod.warpBuildDrift({
+		fetchProxyBuild: async () => "b04459a",
+		readInstalledBuild: () => "b04459a",
+	});
+	assert.equal(notice, null);
+});
+

@@ -1668,6 +1668,52 @@ function resolveWarpBin(): string | undefined {
  *
  *  Startup rule: probe first. Only when a LOOPBACK target does not answer is a
  *  local binary launched — a remote target is never spawned, only reported. */
+/** T9b / S29: the identity a binary prints for itself. Its `-version` line ends
+ *  in the commit in parentheses, and the Go default is the literal `unknown` —
+ *  which is absence of identity, never a commit to compare against. */
+export function parseWarpBuildVersion(text: string): string | null {
+	if (typeof text !== "string") return null;
+	const match = /\(([^()]*)\)\s*$/.exec(text.trim());
+	if (!match) return null;
+	const commit = match[1].trim();
+	return commit && commit !== "unknown" ? commit : null;
+}
+
+/** T9b / S30c, S30d: one line of policy for "installed versus running". Silence
+ *  when there is nothing to do, otherwise a sentence that names the action — a
+ *  diagnostic that names no command is noise. The case this deliberately cannot
+ *  speak about is an installed file older than the running process: advising an
+ *  update would advise a downgrade, so it says nothing instead of misleading. */
+export function warpBuildNotice({ running, installed }: { running: string | null; installed: string | null }): string | null {
+	if (!running) {
+		return "warp does not publish its identity (a build older than warp-build-identity), so what runs cannot be verified — update with /warp update";
+	}
+	if (!installed || installed === running) return null;
+	return `the proxy runs ${running}, the installed build is ${installed} — /warp update`;
+}
+
+/** T9b: the two observations the notice needs, injected so the decision can be
+ *  tested without a proxy or a spawn. A dependency that fails is "no answer",
+ *  never an exception: this runs at an entry point and must not break it. */
+export async function warpBuildDrift(deps: {
+	fetchProxyBuild: () => Promise<string | null>;
+	readInstalledBuild: () => string | null;
+}): Promise<string | null> {
+	let running: string | null = null;
+	try {
+		running = await deps.fetchProxyBuild();
+	} catch {
+		running = null;
+	}
+	let installed: string | null = null;
+	try {
+		installed = deps.readInstalledBuild();
+	} catch {
+		installed = null;
+	}
+	return warpBuildNotice({ running, installed });
+}
+
 export async function ensureWarp(): Promise<boolean> {
 	const target = resolveWarpTarget();
 
