@@ -144,6 +144,85 @@ by any *unrecognised* `stack` value, so a typo in that key silently moves the
 deployment to WireGuard and the only alarm is `/health.stack` reading `"wireguard"`.
 Never write "the deploy is IPv6 end to end" or "WireGuard is dead code".
 
+S20. The ladder has exactly **two rounds and one terminal**. Round 1 is free: the
+relay may attempt each eligible exit it already has, **at most once each**, in the
+order `chooseWarpExit` ranks them, parking the egress of every attributable 429
+(S4, S7) before moving to the next. No enrollment is spent in round 1. Round 2 is
+paid: only when round 1 has run out of eligible exits, the relay triggers **one**
+rotation and then attempts the exits the pool offers **after** the replacement —
+whatever the pool actually publishes, never an assumed count.
+
+S21. Round 2 spends an enrollment only on evidence that the exit is the cause.
+If any 429 in round 1 classified as `session_suspect` (`classifyGate429`), the
+cause is not the egress: no rotation, the original 429 is delivered. The same
+`warpSwapDecision` that already decides whether a swap is worth its enrollment
+gates round 2, so a long `retry-after` never buys a rotation that cannot help.
+Round 2 buys the cheapest replacement the proxy offers. `POST /swap {"exit": id}`
+replaces **that** exit and only that one — one enrollment, victim chosen by the relay —
+so the ladder sacrifices the exit whose egress was burnt and leaves the other alone.
+`POST /recycle` is the fallback for a proxy that answers it has no `/swap`: it rotates
+every exit that is not cooling down, in parallel, one enrollment each, so it must never
+be the first choice when the targeted verb is available. (Correction to L21/L24: the
+ladder as first specified used `/recycle` and would have spent two enrollments; the
+targeted swap makes round 2 cost one, and only for the exit that actually burnt.)
+
+S22. The client sees **exactly one 429 per request**, and it is the terminal one.
+The delivered response is the original rebuilt byte-exact with `forwardedHeaders`
+(S13), `retry-after` included; an intermediate 429 from an inner rung is never
+shown. Nothing retries after delivery: the terminal decision is final for that
+request.
+
+S23. Every rung is observable. `/health` reports how many round-1 cross-exit
+attempts were made, how many round-2 rotations ran, and how many requests ended
+in a terminal 429, so a ladder that is quietly burning enrollments is visible in
+the same place the ledger already is.
+
+S27. A parked egress is **skipped, not attempted**. Round 1 and round 2 attempt
+only exits whose egress IP is not parked in the ledger; an exit whose IP is parked
+while its reset is in the future is not a candidate and spends no request. This is
+the whole point of the ledger: the ladder exists to avoid the burnt addresses, not
+to rediscover them.
+
+S28. When every egress the ladder knows is parked, it still makes **one final
+attempt through the last candidate in its own order** and delivers that attempt's
+response; a refusal is never synthesized from the ledger alone. The delivered 429
+is byte-exact from the **last attempt that produced a response**, falling back to
+the original 429 when that last attempt failed without one. Rationale: after a whole
+episode every burnt address is known, and the only thing the client can act on is
+the freshest `retry-after`, which belongs to the last refusal, not the first. The
+episode is bounded by the pool, not by a number: two exits per round means at most
+four egress attempts when the proxy publishes two, and fewer when it does not (S26).
+
+S26a. Two replacement verbs, and the ladder prefers the narrow one. `POST /swap
+{"exit": id}` replaces exactly the named exit (one enrollment). `POST /recycle`
+replaces every exit not cooling down, in parallel (one enrollment **each**). The
+ladder swaps the burnt exit first and only falls back to the broad verb when the
+proxy reports it has no `/swap`, because the broad verb spends enrollments on exits
+that were never implicated.
+
+S26. The proxy's rotation contract, as measured by the peer (`path:line`, installed
+binary, unchanged by the feature branch): the `POST /recycle` body reports
+`recycling:true` **unconditionally**, including when nothing started, so it is never
+evidence of progress; the truthful field is `/health.recycling`, which is the pool's
+own flag and clears when the rotation finishes. Exit ids after a rotation are always
+new (`warp-<unixnano>`), never reused. The number of exits that come back is **not
+guaranteed**: a replacement that fails permanently releases its slot, so the pool may
+publish two, one, or none. The ladder therefore counts what the pool publishes and
+must handle all three, and never infers a count.
+
+S24. The ladder terminates by construction. A request spends at most one attempt
+per eligible exit in round 1 plus one attempt per exit the pool publishes after a
+single rotation, and round 2 happens at most once; no path loops, and no path
+re-enters round 1 after a terminal delivery.
+
+S25. The proxy stays agnostic to the ladder. It never learns that a retry
+exists: it publishes facts (`/health`, `/exits`, the credential it was given) and
+exposes verbs (`/recycle`, `/swap`), and the relay decides which verb, when, and
+how many times. No round counter, no retry budget, no ladder state, no `reset_at`
+interpretation ever crosses into the proxy. Round 2 is the relay asking for a
+rotation and then *reading* what the pool publishes afterwards; the proxy is not
+told why, and must not be able to tell.
+
 ## Defects found in review
 
 These are defects, not footnotes: each one either produces silently wrong state or
@@ -161,6 +240,8 @@ routes traffic using evidence that does not hold.
 | D9 | **My own capability probe was the same trap.** `warpExitsCapability` sent `GET <proxy>/exits`; against a binary without that route the request lands in the catch-all and, with D7's bug, costs an exit 30 minutes. Caught before it was ever pointed at the live proxy; replaced by a declared capability in `/health` (S11), so the relay sends no probe at all. | reading the probe against the peer's D7 diagnosis | a test asserting no request to `/exits` unless the capability is declared | fixed by S11 |
 | D4 | `::ffff:1.2.3.4` canonicalises to the IPv6 form instead of collapsing to IPv4. Harmless for a real trace, unhandled if one ever appears. | a manual check of the canonicaliser | none | accepted, documented |
 | D5 | Two concurrent traces on different exits were never measured against a live pool. The design is safe by construction (a mutex per exit, separate QUIC sessions) but it is unverified. | the peer's own report | none | open, low risk |
+| D12 | `/health.quotaLedger.parked` is computed from the in-memory ledger, which is pruned **only when it is written**. Between a reset expiring and the next park, the counter can report more parked egresses than there really are, while routing stays correct because `isEgressParked` compares against the reset at decision time. A counter that over-reports invites distrust of the file that is telling the truth. | the user asking whether the file really clears itself | a test on the reported count after a reset has passed with no write in between | open; queued behind T7 (same files) |
+| D13 | **Proxy side.** `recycleHandler` (main.go:266+) sets `recycling: true` in the POST `/recycle` response **unconditionally**, including when `started == false` because a rotation was already in flight. The field therefore asserts something the proxy has not observed. The relay is safe only because it ignores it and reads `/health.recycling`, which is the pool's own flag; any future reader of the POST body inherits a lie. | the peer's reading, prompted by the relay needing to know whether a rotation started | none (the relay's existing test pins that it never reads the POST body for progress) | open, proxy side; fix or remove the field |
 
 D6 is the one that matters: D1 and D2 are fixed in the wiring, D5 is a measurement
 gap, D3 never existed, but D6 means the field the relay sees is weaker than its
@@ -170,12 +251,13 @@ name — and D7 means the pool can lose an exit to a malformed request.
 
 | ID | Task | Specs | Route | Commit |
 |---|---|---|---|---|
-| T1 | Ledger module: read/write/prune the JSON by IP, derive `prefix64` | S5, S6 | relay | uncommitted |
+| T1 | Ledger module: read/write/prune the JSON by IP, derive `prefix64` | S5, S6 | relay | f92c990 |
 | T2 | Park WARP egresses from a 429, honouring `classifyGate429` | S4, S7 | relay | pending |
-| T3 | Persist the local park and load it on start | S10 | relay | uncommitted |
-| T4 | Per-request routing: exit choice → proxy credential, with capability detection | S2, S3, S8, S9, S11 | relay | pending |
-| T5 | `/health` reports the ledger and whether routing is live | S12 | relay | uncommitted |
-| T6 | `warp-minimal`: `GET /exits`, `GET /exit/<id>`, credential read, silent fallback, no 407 | S1, S8, S13, S14, S15 | warp-minimal (peer) | pending |
+| T3 | Persist the local park and load it on start | S10 | relay | f92c990 |
+| T4 | Per-request routing: exit choice → proxy credential, with capability detection | S2, S3, S8, S9, S11 | relay | f92c990 |
+| T5 | `/health` reports the ledger and whether routing is live | S12 | relay | f92c990 |
+| T6 | `warp-minimal`: `GET /exits`, `GET /exit/<id>`, credential read, silent fallback, no 407 | S1, S8, S13, S14, S15 | warp-minimal (peer) | peer's tree |
+| T7 | Two-round ladder: free cross-exit rung, one gated rotation, terminal 429 | S20, S21, S22, S23, S24 | relay | pending |
 
 ## Log
 
@@ -371,3 +453,178 @@ the relay reads `legacy` there — which is the correct answer, and means the fe
 is inert on the live service until the owner deploys. The end-to-end run must
 therefore use a binary built from `feat/warp-exit-facts` on the probe port, or it
 would validate nothing about the prefer path.
+
+L19 (user, verbatim): «otra cosa, cuando llegue el 429 a la pantalla del cliente osea
+despues de la escalera, podemos tener retri?»
+
+L20 (user, verbatim, the design): «bueno la idea mia es si se quema a usar b si no
+queda ninguna reclicle y lo mmismo a yluego b es lo que ya hay pero cualdo llegue el
+429 al cliente reclicle y peticion denuevo a y luego b recicle a y luego b y llega el
+ultimo 429, osea escalera interna, llega al cliente el 429 recile + retri y luego
+escalera inerna nuevamente y ahi no hace el rety cuando llega al cliente el segundo
+429»
+
+L21 (decision, asked and answered): round 2 is **automatic** — the relay rotates and
+retries on its own, and the client sees a single terminal 429. **The cost I stated
+when asking was wrong**: I said one enrollment, and `RecycleAll` spends two (L24). The
+choice was made on the correct direction — free rung first, one paid rotation at
+most — but the price is double what the user was told.
+
+L28 (correction of my own claim, verified at relay.mjs:2366): a per-exit rotation DOES
+exist — `POST /swap {"exit": id}` — and the relay already uses it, passing the id of the
+exit it wants replaced. My earlier table said "per-exit rotation: does not exist", which
+was wrong, and the wrong claim would have made round 2 spend two enrollments through
+`/recycle` instead of one through `/swap`. The warp work I proposed for a per-exit verb
+is therefore unnecessary; only D13 remains as a proxy-side item.
+
+L27 (user, verbatim): «estos cambios no ameritan trabajar mas el el warp?». Answer: the
+ladder itself needs nothing new from the proxy — every fact it reads already exists. Two
+warp changes are worth batching though: a per-exit rotation verb, which would cut round 2
+from two enrollments to one and let the relay inspect the new address before spending the
+second, and D13, the lying `recycling` field. Both are deferred deliberately because every
+proxy change costs a restart, and a restart is an outage while the local egress is parked.
+
+L26 (user, verbatim): «tambien en un archivo ponemos las ips quemadas y las borramos
+cuando esten libres asi durante el dia no volvemos a chocar con la misma piedra». This is
+already the design: the ledger is a file keyed by canonical egress IP, pruned on write
+and on load, and consulted at decision time, so it is shared by every session and
+survives a restart. What it did surface is D12: the reported count is pruned only on
+write, so the number can lag the truth even though routing does not.
+
+L25 (user, verbatim): «obio esta escalera va a usar lo qeu implementamos anteriormente si
+un de esas ips las quemamos y aun no estan libres no las usamos y si son todas reclicle y
+vamos a la otra, si las 4 estan quemadas usamos la ultima para enviar el 429». Read as
+S27 (a parked IP is never a candidate) and S28 (the terminal 429 comes from a real final
+attempt, not from the ledger). S28 supersedes the "always the original 429" detail of
+S13 for the terminal delivery only: the original stays the fallback when the final
+attempt produced no response.
+
+L24 (evidence, peer agent, `path:line` from the installed binary): a recycle rotates
+**every** exit not in cooldown, in parallel (`RecycleAll`, pool.go:566-600), each via
+`replaceExit` → `buildExit` → `createExit` → `RegisterDevice` (pool.go:528), so a
+rotation over two healthy exits spends **two enrollments and two devices**. The POST
+`/recycle` body sets `recycling:true` unconditionally (`recycleHandler`, main.go:266+),
+even when a concurrent rotation meant `started == false`, so it proves nothing;
+`/health.recycling` is the pool's own flag and clears when the WaitGroup finishes.
+Ids are new every time (`warp-<unixnano>`), and the count is not guaranteed — a
+permanently failed replacement releases its slot, so the pool can return 0, 1 or 2.
+
+L22 (user, constraint): «pero el proxy debe ser agnostico a eso». So S25: the ladder
+is relay policy end to end. The proxy keeps only facts and verbs, and never learns
+that a retry exists.
+
+L23 (evidence, live production after the owner restarted both processes): relay
+`/health` on 8788 reports `warpExits:"structured"`, `preferredRouting:true`,
+`preferredExit:"warp-18e7d77fcab7a02a"`, `warpExitsDetail.usable:2`,
+`quotaLedger.parked:1` (the local egress). Proxy `/health` on 8789 reports
+`capabilities:{exits:true}`, `stack:masque`, `pool_size:2`, `healthy:2`, and `/exits`
+serves two real egress addresses in distinct /64s — `2a09:bac5:3053:323c::501:1a` and
+`2a09:bac5:3057:323c::501:12`. The proxy's `served` counter reads 1 on exactly the
+exit the relay named and 0 on the other, so the credential channel works end to end
+in production. D7 is closed in production by the deployed binary.
+
+L29 (evidence, peer agent, read-only, `path:line`): the three warp capabilities the owner
+asked about, priced.
+
+- **Reconnect without re-enrolling: not possible today**, and for a concrete reason — the
+  `WireGuardConfig` that `RegisterDevice` returns is used to build the tunnel and then
+  discarded. `Exit` (internal/warp/types.go) keeps `PrivateKey`, `Endpoint`, `IPv6`,
+  `tunnel`, `obs`; neither it nor `Tunnel` (tunnel.go:49) keeps `DeviceID` or `Token`.
+  Retaining that cfg plus a `reconnect` verb would make replacing a tunnel cost a
+  `connect-ip`, not a registration. **Whether the egress address is per connection or per
+  device cannot be decided from the code**: it is Cloudflare's policy, and this pool has
+  never reconnected the same device, so there is no observation either. If it is per
+  connection, round 2 costs zero enrollments; if it is per device, reconnecting returns
+  the same burnt address and only helps D6 (a dead tunnel whose IP is not burnt). Only an
+  experiment answers it, and the experiment needs the cfg retained first.
+- **Liveness as a fact: the measurement already exists.** `traceEgressIP` /
+  `observeEgressIP` (internal/warp/facts.go) already drive one health check per MASQUE exit
+  and return `(ip, family, at, error)`; `egressObservation` stores `ip`, `family`,
+  `observedAt` and **drops the error**, which is why a failure only shows up as an
+  `observed_at` that stops renewing. Publishing `trace:{ok,error,at}` is a small change
+  with no new measurement, provided readers stay behind the 45 s cache.
+- **Registration pressure: nothing is kept.** `Pool` holds `recycling`, `swapping`,
+  `swapTarget`, `retrying`, `fillRetry*`, `replaceAttempts*` and no last-error or
+  retry-until field; `replaceExit`'s backoff is local to its goroutine and the error is
+  logged and lost. So this is not exposing an existing fact but creating one, with its
+  semantics still to define.
+
+L30 (correction to the peer's closing line): the peer reported that "the live 8789 still
+runs the old binary in memory". That was already false when it was written — `/health` on
+8789 answers `capabilities:{exits:true}` and `/exits` serves both real IPv6 egress
+addresses. The peer was working from its own earlier notes.
+
+L31 (delivery, T7 thin layer, verified by the parent): 287 pass / 0 fail, no timeouts,
++193/-5 in relay.mjs and +218 in the tests. The free round and the terminal rule landed
+as a layer on top: no line of `swapWarpExit`, `waitForPoolReplacement`, `resendWarpOnce`,
+`rotateWarp`, `resendAfterRotation` or `warpSwapDecision` was modified. The first attempt
+at this task produced 1068 lines, six failures and a test that hung the file for 150 s; it
+was cancelled with the brief narrowed to two behaviours and a hard no-unbounded-wait rule.
+
+Two gaps the worker declared, recorded rather than buried:
+
+- **S28 is only partly met on the paid path.** `resendWarpOnce` returns `undefined` when
+  the resend also refuses, so a terminal 429 that follows a paid resend carries round 1's
+  freshest `retry-after`, not the resend's. The rule says the last real refusal wins;
+  today the last *raw* refusal wins. Fixing it needs `resendWarpOnce`, deliberately out of
+  scope.
+- **A behaviour change on shared code.** While the whole pool is parked,
+  `preferredExitForAttempt` now names the last candidate instead of sending no credential,
+  so the pre-existing unattributed plain-proxy request no longer happens for structured
+  proxies. This is what S28 asks for ("take the last one and make the request"), and it is
+  pinned by a test, but it changes what every request does in that state and needs the
+  owner's explicit acceptance. Side effect: fully parked, one client request can spend two
+  real attempts against parked exits.
+
+L32 (independent verification of 4a81a14, `gentle-ai-verify`): verdicts **S20 met,
+S22 met, S23 met, S27 partly met, S28 partly met**. Two blockers, both confirmed by
+probe, plus one advisory and one nit.
+
+- **Blocker 1, contradicts S28.** After a paid resend the delivered 429 carries round 1's
+  `retry-after`, not the resend's: `resendWarpOnce` drains the resend response and returns
+  `undefined` (relay.mjs:2500), the caller keeps round 1's refusal (:2749) and rebuilds it
+  (:2407). Measured: round 1 a=7200, b=3600, resend 429 with `retry-after: 120` → the
+  client was handed 3600. `resendWarpOnce` is therefore no longer out of scope; S28 cannot
+  be met without it.
+- **Blocker 2, contradicts S27 and S28's ordering.** With the whole pool parked at entry,
+  `preferredExitForAttempt` (relay.mjs:1663) spends a request on the **stalest** candidate
+  before round 1 runs, round 1 then excludes it, and the terminal attempt goes to the last
+  candidate — so a fully parked pool costs two parked requests and the delivered bytes are
+  not the last candidate's. Pre-change baseline on the same fixture: one attempt, no
+  credential. The free round's `clean.length === 0` branch already performs the terminal
+  attempt in the right order, so the request-path fallback is redundant and must go: that
+  also removes the shared-code behaviour change flagged as Risk item 3.
+- **Advisory.** Round 1 adopts any non-429 answer (relay.mjs:2661), so a 503 from the next
+  exit replaces the 429 already in hand; round 2 only adopts `<400` (:2496, :2507). The
+  client must see the 429, not a burnt exit's 503.
+- **Nit.** Duplicated S23 comment (:3243, :3247); `warpTerminal429s` (:3026) counts only
+  inside the ladder block, so a resend-disabled or legacy request is counted inconsistently.
+
+Clean by verification: freshest-first rank order regardless of pool order, one attempt per
+exit, park-before-next, zero enrollments in round 1, exactly one response per request,
+and legacy and warp-off shape-identical to baseline.
+
+L33 (delivery of the three fixes, verified by the parent: 288 pass / 0 fail, +92 in
+relay.mjs, no line of `swapWarpExit`, `waitForPoolReplacement`, `rotateWarp`,
+`resendAfterRotation` or `warpSwapDecision` modified):
+
+- **Fix 1, S28 now met on the paid path.** `resendWarpOnce` returns the resend's own
+  refusal (relay.mjs:2544) instead of `undefined`, so the delivered 429 carries the
+  resend's bytes and `retry-after`; the original stays the fallback only when the resend
+  produced no response, and a 4xx/5xx never replaces a 429 in hand.
+- **Fix 2, with the correction L32 got wrong.** The naming is not removed: it is narrowed.
+  `preferredExitForAttempt` names nothing only when every ladder candidate is parked
+  (relay.mjs:1671), because an address already in the ledger needs no attribution; in
+  every other case the fallback is untouched. Deleting it outright had broken two tests,
+  which is what proved the naming also sustains attribution.
+- **Fix 3, S22 closed.** Round 1 adopts only `<400`; a 5xx from the next exit is drained
+  and logged, and the refusal in hand is what the client receives (relay.mjs:2703).
+- **Nit closed.** Duplicate comment gone, `warpTerminal429s` counted at the delivered
+  response (relay.mjs:3085), proven with the resend switched off.
+
+Two deviations the worker chose, accepted here because both are the same rule applied
+consistently: a pool whose only choosable exits are all parked also names nothing, and a
+round-1 non-429 4xx is no longer adopted either. One honest note from the worker: in this
+tree the "unclean for another reason" leg cannot actually name anything, because the
+fallback is fed by choosable exits only — that test is a preserve case, not new behaviour.
+
