@@ -230,6 +230,7 @@ routes traffic using evidence that does not hold.
 | D4 | `::ffff:1.2.3.4` canonicalises to the IPv6 form instead of collapsing to IPv4. Harmless for a real trace, unhandled if one ever appears. | a manual check of the canonicaliser | none | accepted, documented |
 | D5 | Two concurrent traces on different exits were never measured against a live pool. The design is safe by construction (a mutex per exit, separate QUIC sessions) but it is unverified. | the peer's own report | none | open, low risk |
 | D12 | `/health.quotaLedger.parked` is computed from the in-memory ledger, which is pruned **only when it is written**. Between a reset expiring and the next park, the counter can report more parked egresses than there really are, while routing stays correct because `isEgressParked` compares against the reset at decision time. A counter that over-reports invites distrust of the file that is telling the truth. | the user asking whether the file really clears itself | a test on the reported count after a reset has passed with no write in between | open; queued behind T7 (same files) |
+| D13 | **Proxy side.** `recycleHandler` (main.go:266+) sets `recycling: true` in the POST `/recycle` response **unconditionally**, including when `started == false` because a rotation was already in flight. The field therefore asserts something the proxy has not observed. The relay is safe only because it ignores it and reads `/health.recycling`, which is the pool's own flag; any future reader of the POST body inherits a lie. | the peer's reading, prompted by the relay needing to know whether a rotation started | none (the relay's existing test pins that it never reads the POST body for progress) | open, proxy side; fix or remove the field |
 
 D6 is the one that matters: D1 and D2 are fixed in the wiring, D5 is a measurement
 gap, D3 never existed, but D6 means the field the relay sees is weaker than its
@@ -457,6 +458,13 @@ retries on its own, and the client sees a single terminal 429. **The cost I stat
 when asking was wrong**: I said one enrollment, and `RecycleAll` spends two (L24). The
 choice was made on the correct direction — free rung first, one paid rotation at
 most — but the price is double what the user was told.
+
+L27 (user, verbatim): «estos cambios no ameritan trabajar mas el el warp?». Answer: the
+ladder itself needs nothing new from the proxy — every fact it reads already exists. Two
+warp changes are worth batching though: a per-exit rotation verb, which would cut round 2
+from two enrollments to one and let the relay inspect the new address before spending the
+second, and D13, the lying `recycling` field. Both are deferred deliberately because every
+proxy change costs a restart, and a restart is an outage while the local egress is parked.
 
 L26 (user, verbatim): «tambien en un archivo ponemos las ips quemadas y las borramos
 cuando esten libres asi durante el dia no volvemos a chocar con la misma piedra». This is
