@@ -14,12 +14,13 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	rmSync,
 	statSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -1005,7 +1006,13 @@ function installFakeFetch(handler) {
 	const calls = [];
 	const original = globalThis.fetch;
 	globalThis.fetch = async (url, opts = {}) => {
-		const call = { url: String(url), method: String(opts.method ?? "GET").toUpperCase(), body: opts.body };
+		const call = {
+			url: String(url),
+			method: String(opts.method ?? "GET").toUpperCase(),
+			body: opts.body,
+			// S3: the preference travels in the proxy URL, so the fake has to keep it.
+			proxy: opts.proxy,
+		};
 		calls.push(call);
 		return handler(call);
 	};
@@ -1016,7 +1023,15 @@ function installFakeFetch(handler) {
 async function driveWarp(handler, run) {
 	resetWarpStateForTests();
 	setWarpRotationTimingForTests(500, 1);
-	const fake = installFakeFetch(handler);	try {
+	// These cases pin the ladder against the proxy surface of the slice they were
+	// written for: `/health`, `/swap`, `/recycle`. `GET /exits` answers 404 here on
+	// purpose — that is an older binary, the relay then sends no credential, and the
+	// ladder under test is the only thing in the picture. Routing has its own cases
+	// at the end of this file, against a proxy that publishes the list.
+	const fake = installFakeFetch((call) =>
+		call.url.endsWith("/exits") ? new Response("", { status: 404 }) : handler(call),
+	);
+	try {
 		return await run(fake);
 	} finally {
 		fake.restore();
@@ -1769,6 +1784,8 @@ test("forward: a warp delivery is counted once and released on every exit path (
 		upstreamStatus = status;
 		globalThis.fetch = async (url) => {
 			const u = String(url);
+			// An older proxy: this case is about the delivery counter, never routing.
+			if (u.endsWith("/exits")) return new Response("", { status: 404 });
 			if (u.endsWith("/recycle")) {
 				duringRotation = warpStateForTests().deliveringWarpStreams;
 				// Refused on purpose: an ACCEPTED rotation is waited out until the pool
@@ -3499,7 +3516,11 @@ test("relay /health publishes the swap ladder and its kill switch (S10)", async 
 				warpSwapEnabled(process.env.RELAY_WARP_SWAP),
 				"with no override the ladder follows RELAY_WARP_SWAP",
 			);
-			assert.equal(fake.calls.length, 0, "reading /health reaches no proxy");
+			assert.deepEqual(
+				fake.calls.map((call) => call.url),
+				["http://127.0.0.1:8789/health"],
+				"reading /health reads the proxy's health once and never probes /exits (D9)",
+			);
 
 			setWarpSwapEnabledForTests(false);
 			try {
@@ -4744,4 +4765,1152 @@ test("a versioned leftover is never treated as the relay to start (S3.0)", () =>
 		false,
 		"a foreign binary with a number in it is not ours to ignore",
 	);
+});
+
+// ---------------------------------------------------------------------------
+// Quota ledger, keyed by egress IP (S5, S10, S12)
+// ---------------------------------------------------------------------------
+// The ledger is the file that remembers which egress IP the gate refused and
+// until when. Its pure core ships now and is pinned here; the live "prefer this
+// exit" path waits for the proxy's structured `GET /exits`, because a preference
+// nothing honours is worse than none (S11).
+
+import {
+	chooseWarpExit,
+	isEgressParked,
+	LOCAL_EGRESS_KEY,
+	loadQuotaLedgerAtStartup,
+	nearestQuotaReset,
+	parkQuotaEgress,
+	parseQuotaLedger,
+	pruneQuotaLedger,
+	proxyUrlWithExit,
+	quotaEgressKey,
+	quotaLedgerHealth,
+	quotaLedgerPath,
+	quotaPrefix64,
+	readQuotaLedger,
+	serializeQuotaLedger,
+	warpExitsCapability,
+	writeQuotaLedger,
+} from "../relay.mjs";
+
+const V4_A = "203.0.113.7";
+const V4_B = "198.51.100.9";
+const V6_A = "2001:db8:1:2::1";
+const LEDGER_NOW = 1_700_000_000_000;
+
+/** A throwaway ledger file, removed when the case ends. No case here writes to
+ *  the real home directory. */
+async function withQuotaDir(run) {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-quota-"));
+	try {
+		return await run(join(dir, "quota.json"));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+test("quotaEgressKey: one address, one key", () => {
+	assert.equal(quotaEgressKey(" 203.0.113.7 "), V4_A, "a padded literal keys the address");
+	assert.equal(quotaEgressKey("2001:DB8::1"), "2001:db8::1", "case is not part of an address");
+	assert.equal(quotaEgressKey(`[${V6_A}]`), "2001:db8:1:2::1", "brackets are spelled around an address, not in it");
+	assert.equal(
+		quotaEgressKey("2001:0db8:0001:0002:0000:0000:0000:0001"),
+		V6_A,
+		"a zero-padded spelling is the same egress",
+	);
+});
+
+test("quotaEgressKey: anything that is not an address has no key", () => {
+	const rejected = [
+		undefined,
+		null,
+		"",
+		"   ",
+		"local",
+		"not-an-ip",
+		"999.1.1.1",
+		"1.2.3",
+		":::",
+		"1:2:3:4:5:6:7:8:9",
+		"warp-18e4af",
+	];
+	for (const value of rejected) {
+		assert.equal(quotaEgressKey(value), undefined, `key for ${JSON.stringify(value)}`);
+	}
+});
+
+test("quotaPrefix64: the /64 is derived from the address, never asked of the proxy (S5)", () => {
+	assert.equal(quotaPrefix64(V6_A), "2001:0db8:0001:0002::/64");
+	assert.equal(quotaPrefix64("2001:DB8::1"), "2001:0db8:0000:0000::/64", "the padded form is the normalised one");
+	assert.equal(quotaPrefix64(` ${V4_A} `), V4_A, "IPv4 is its own prefix, unchanged");
+	assert.equal(quotaPrefix64("not-an-ip"), undefined);
+	assert.equal(quotaPrefix64(LOCAL_EGRESS_KEY), undefined, "the local egress has no address to derive from");
+});
+
+test("parseQuotaLedger: a readable file gives back its entries", () => {
+	const text = JSON.stringify({
+		version: 1,
+		egresses: { [V4_A]: { prefix64: V4_A, exit_id: "warp-2", parked_until: LEDGER_NOW, hits: 3 } },
+	});
+	const ledger = parseQuotaLedger(text);
+	assert.equal(ledger.version, 1);
+	assert.equal(ledger.egresses[V4_A].exit_id, "warp-2");
+	assert.equal(ledger.egresses[V4_A].hits, 3);
+});
+
+test("parseQuotaLedger: every way a file can be wrong reads as empty (S5)", () => {
+	const wrong = [
+		"",
+		"{not json",
+		"[]",
+		"null",
+		'"text"',
+		JSON.stringify({ version: 2, egresses: {} }),
+		JSON.stringify({ egresses: {} }),
+		JSON.stringify({ version: 1, egresses: [] }),
+		JSON.stringify({ version: 1 }),
+	];
+	for (const text of wrong) {
+		assert.deepEqual(parseQuotaLedger(text), { version: 1, egresses: {} }, `ledger from ${text}`);
+	}
+	assert.deepEqual(parseQuotaLedger(undefined), { version: 1, egresses: {} }, "no text is not a throw");
+});
+
+test("parseQuotaLedger: an entry without a numeric reset is dropped, not guessed", () => {
+	const text = JSON.stringify({
+		version: 1,
+		egresses: { [V4_A]: { prefix64: V4_A }, [V4_B]: { prefix64: V4_B, parked_until: "soon" } },
+	});
+	assert.deepEqual(parseQuotaLedger(text).egresses, {}, "a park nobody can compare to a clock is not a park");
+});
+
+test("serializeQuotaLedger: the same ledger writes the same bytes", () => {
+	const ledger = parseQuotaLedger(
+		JSON.stringify({
+			version: 1,
+			egresses: {
+				[V4_B]: { prefix64: V4_B, parked_until: LEDGER_NOW + 2_000 },
+				[V4_A]: { prefix64: V4_A, parked_until: LEDGER_NOW + 1_000 },
+			},
+		}),
+	);
+	const text = serializeQuotaLedger(ledger);
+	assert.equal(text, serializeQuotaLedger(parseQuotaLedger(text)), "a round trip is byte-identical");
+	assert.ok(text.indexOf(V4_B) < text.indexOf(V4_A), "keys are sorted, so a rewrite is reviewable");
+});
+
+test("parkQuotaEgress: one entry per IP, keyed by the address the gate refused (S5)", () => {
+	const ledger = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: V4_A,
+		exitId: "warp-2",
+		parkedUntil: LEDGER_NOW + 60_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	assert.deepEqual(ledger.egresses[V4_A], {
+		prefix64: V4_A,
+		exit_id: "warp-2",
+		parked_until: LEDGER_NOW + 60_000,
+		observed_at: LEDGER_NOW,
+		reason: "gate_429",
+		hits: 1,
+	});
+	assert.equal(ledger.egresses[V4_A].prefix64, V4_A, "the IPv4 entry carries its own literal as its prefix");
+});
+
+test("parkQuotaEgress: two spellings of one IPv6 address are one entry, not two (S5)", () => {
+	// The tunnel is IPv6-only, so the same egress arrives spelled however the
+	// trace felt like spelling it. One burnt address must stay one park, or the
+	// next request finds the burnt one under a name it does not recognise.
+	const first = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: "2a09:bac5:1:2::1",
+		exitId: "warp-2",
+		parkedUntil: LEDGER_NOW + 60_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	const second = parkQuotaEgress(first, {
+		ip: "2A09:BAC5:1:2:0:0:0:1",
+		exitId: "warp-3",
+		parkedUntil: LEDGER_NOW + 120_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	assert.deepEqual(Object.keys(second.egresses), ["2a09:bac5:1:2::1"], "one burnt address, one entry");
+	assert.equal(second.egresses["2a09:bac5:1:2::1"].hits, 2, "the second sighting is the same park seen again");
+	assert.equal(second.egresses["2a09:bac5:1:2::1"].parked_until, LEDGER_NOW + 120_000, "the later reset wins");
+	assert.equal(second.egresses["2a09:bac5:1:2::1"].exit_id, "warp-3", "the entry follows the exit it last saw");
+	assert.equal(second.egresses["2a09:bac5:1:2::1"].prefix64, "2a09:bac5:0001:0002::/64", "the shared /64 rides along");
+});
+
+test("parkQuotaEgress: re-parking the same IP increments hits and moves the reset", () => {
+	const first = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: V6_A,
+		exitId: "warp-2",
+		parkedUntil: LEDGER_NOW + 1_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	const second = parkQuotaEgress(first, {
+		ip: V6_A,
+		exitId: "warp-7",
+		parkedUntil: LEDGER_NOW + 90_000,
+		reason: "gate_429",
+		now: LEDGER_NOW + 500,
+	});
+	const entry = second.egresses["2001:db8:1:2::1"];
+	assert.equal(entry.hits, 2, "the second park is history on the same entry");
+	assert.equal(entry.parked_until, LEDGER_NOW + 90_000);
+	assert.equal(entry.exit_id, "warp-7", "the exit that burnt it last is the one reported");
+	assert.equal(entry.prefix64, "2001:0db8:0001:0002::/64");
+	assert.equal(first.egresses["2001:db8:1:2::1"].hits, 1, "the previous ledger is untouched");
+});
+
+test("parkQuotaEgress: two IPs are two entries", () => {
+	const ledger = parkQuotaEgress(
+		parkQuotaEgress(parseQuotaLedger(""), { ip: V4_A, parkedUntil: LEDGER_NOW + 1_000, reason: "gate_429", now: LEDGER_NOW }),
+		{ ip: V4_B, parkedUntil: LEDGER_NOW + 2_000, reason: "gate_429", now: LEDGER_NOW },
+	);
+	assert.deepEqual(Object.keys(ledger.egresses).sort(), [V4_B, V4_A].sort());
+});
+
+test("parkQuotaEgress: the local egress is remembered under its own key (S10)", () => {
+	const ledger = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: LOCAL_EGRESS_KEY,
+		parkedUntil: LEDGER_NOW + 3_600_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	assert.deepEqual(Object.keys(ledger.egresses), [LOCAL_EGRESS_KEY]);
+	const entry = ledger.egresses[LOCAL_EGRESS_KEY];
+	assert.equal(entry.reason, "gate_429");
+	assert.equal(entry.prefix64, undefined, "the local egress has no /64 to report");
+	assert.equal(entry.exit_id, undefined, "and no warp exit to name");
+});
+
+test("parkQuotaEgress: nothing is remembered for an egress it cannot key", () => {
+	const before = parseQuotaLedger("");
+	const after = parkQuotaEgress(before, {
+		ip: "not-an-ip",
+		parkedUntil: LEDGER_NOW + 1_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	assert.deepEqual(after.egresses, {}, "a key nothing can match later is worse than no entry");
+	assert.equal(
+		parkQuotaEgress(before, { ip: V4_A, parkedUntil: undefined, reason: "gate_429" }).egresses[V4_A],
+		undefined,
+		"no reset, no park",
+	);
+});
+
+test("pruneQuotaLedger: an expired park is dropped, a live one stays", () => {
+	const ledger = parseQuotaLedger(
+		JSON.stringify({
+			version: 1,
+			egresses: {
+				[V4_A]: { prefix64: V4_A, parked_until: LEDGER_NOW + 1_000, hits: 1 },
+				[V4_B]: { prefix64: V4_B, parked_until: LEDGER_NOW - 1_000, hits: 2 },
+			},
+		}),
+	);
+	const pruned = pruneQuotaLedger(ledger, LEDGER_NOW);
+	assert.deepEqual(Object.keys(pruned.egresses), [V4_A]);
+	assert.equal(pruned.egresses[V4_A].hits, 1, "pruning never rewrites what it keeps");
+	assert.deepEqual(Object.keys(ledger.egresses).sort(), [V4_B, V4_A].sort(), "the input keeps every entry");
+});
+
+test("isEgressParked: the window, not the entry, is what parks an egress", () => {
+	const ledger = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: V4_A,
+		parkedUntil: LEDGER_NOW + 60_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	assert.equal(isEgressParked(ledger, V4_A, LEDGER_NOW + 59_999), true);
+	assert.equal(isEgressParked(ledger, V4_A, LEDGER_NOW + 60_000), false, "the reset second frees the egress");
+	assert.equal(isEgressParked(ledger, V4_B, LEDGER_NOW), false);
+	assert.equal(isEgressParked(ledger, "not-an-ip", LEDGER_NOW), false, "an egress without a key is never parked");
+	assert.equal(isEgressParked(parseQuotaLedger(""), V4_A, LEDGER_NOW), false);
+});
+
+test("nearestQuotaReset: the earliest live reset, or 0 when nothing is parked", () => {
+	const ledger = parseQuotaLedger(
+		JSON.stringify({
+			version: 1,
+			egresses: {
+				[V4_A]: { parked_until: LEDGER_NOW + 90_000 },
+				[V4_B]: { parked_until: LEDGER_NOW + 30_000 },
+				[LOCAL_EGRESS_KEY]: { parked_until: LEDGER_NOW - 1 },
+			},
+		}),
+	);
+	assert.equal(nearestQuotaReset(ledger, LEDGER_NOW), LEDGER_NOW + 30_000, "past entries are not a reset");
+	assert.equal(nearestQuotaReset(parseQuotaLedger(""), LEDGER_NOW), 0);
+});
+
+test("quotaLedgerHealth: the two numbers /health publishes (S12)", () => {
+	const ledger = parseQuotaLedger(
+		JSON.stringify({
+			version: 1,
+			egresses: {
+				[V4_A]: { parked_until: LEDGER_NOW + 90_000 },
+				[V4_B]: { parked_until: LEDGER_NOW + 30_000 },
+				[LOCAL_EGRESS_KEY]: { parked_until: LEDGER_NOW - 1 },
+			},
+		}),
+	);
+	assert.deepEqual(quotaLedgerHealth(ledger, LEDGER_NOW), { parked: 2, nearestResetInMs: 30_000 });
+	assert.deepEqual(quotaLedgerHealth(parseQuotaLedger(""), LEDGER_NOW), { parked: 0, nearestResetInMs: 0 });
+});
+
+test("proxyUrlWithExit: the exit id rides as the credential, empty password (S3, L5)", () => {
+	assert.equal(
+		proxyUrlWithExit("http://127.0.0.1:8789", "warp-2"),
+		"http://warp-2:@127.0.0.1:8789",
+		"the username is the exit id and the password is empty",
+	);
+});
+
+test("proxyUrlWithExit: protocol, host, port and path all survive", () => {
+	assert.equal(
+		proxyUrlWithExit("https://proxy.example.test:8899/tunnel", "warp_5"),
+		"https://warp_5:@proxy.example.test:8899/tunnel",
+	);
+	assert.equal(
+		proxyUrlWithExit("http://old-exit:s3cret@127.0.0.1:8789", "warp-2"),
+		"http://warp-2:@127.0.0.1:8789",
+		"the exit id replaces whatever userinfo the URL carried",
+	);
+});
+
+test("proxyUrlWithExit: an id the proxy cannot parse never reaches it", () => {
+	for (const id of [undefined, null, "", "   ", "warp 2", "warp/2", "warp-2:s3cret", "warp@2", "warp-2\n"]) {
+		assert.equal(
+			proxyUrlWithExit("http://127.0.0.1:8789", id),
+			"http://127.0.0.1:8789",
+			`exit id ${JSON.stringify(id)}`,
+		);
+	}
+});
+
+test("proxyUrlWithExit: a URL it cannot read comes back unchanged instead of throwing", () => {
+	assert.equal(proxyUrlWithExit("", "warp-2"), "");
+	assert.equal(proxyUrlWithExit("127.0.0.1:8789", "warp-2"), "127.0.0.1:8789");
+	assert.equal(proxyUrlWithExit(undefined, "warp-2"), undefined);
+});
+
+test("chooseWarpExit: the first clean exit wins, because rotating is the last resort (S9)", () => {
+	const ledger = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: V4_A,
+		parkedUntil: LEDGER_NOW + 60_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	const entries = [
+		{ id: "warp-2", ip: V4_A },
+		{ id: "warp-7", ip: V4_B },
+	];
+	assert.equal(chooseWarpExit(entries, ledger, LEDGER_NOW), "warp-7", "a parked exit is skipped, not rotated");
+	assert.equal(
+		chooseWarpExit(entries, ledger, LEDGER_NOW + 60_000),
+		"warp-2",
+		"once the park expires the first exit is usable again",
+	);
+});
+
+test("chooseWarpExit: no clean exit is an answer of its own", () => {
+	const ledger = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: V4_A,
+		parkedUntil: LEDGER_NOW + 60_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	assert.equal(chooseWarpExit([{ id: "warp-2", ip: V4_A }], ledger, LEDGER_NOW), undefined);
+	assert.equal(chooseWarpExit([], ledger, LEDGER_NOW), undefined);
+	assert.equal(chooseWarpExit(undefined, ledger, LEDGER_NOW), undefined);
+	assert.equal(
+		chooseWarpExit([{ id: "warp-2" }, { id: "warp-7" }], ledger, LEDGER_NOW),
+		undefined,
+		"an exit with no address cannot be proven clean",
+	);
+	assert.equal(
+		chooseWarpExit([{ id: "warp-2", ip: "not-an-ip" }], ledger, LEDGER_NOW),
+		undefined,
+		"and neither can one whose address the ledger cannot key",
+	);
+});
+
+test("quotaLedgerPath: RELAY_QUOTA_PATH wins, otherwise the agent directory (S10)", () => {
+	const fallback = join(homedir(), ".pi", "agent", "pi-free-bridge-quota.json");
+	assert.equal(quotaLedgerPath({ RELAY_QUOTA_PATH: "/tmp/x/quota.json" }), "/tmp/x/quota.json");
+	assert.equal(quotaLedgerPath({}), fallback);
+	assert.equal(quotaLedgerPath({ RELAY_QUOTA_PATH: "   " }), fallback, "an empty override is not a path");
+});
+
+test("loadQuotaLedgerAtStartup: a restart keeps the local park (S10)", async () => {
+	await withQuotaDir(async (file) => {
+		const parkedUntil = Date.now() + 3_600_000;
+		writeFileSync(
+			file,
+			serializeQuotaLedger(
+				parkQuotaEgress(parseQuotaLedger(""), {
+					ip: LOCAL_EGRESS_KEY,
+					parkedUntil,
+					reason: "gate_429",
+					now: Date.now(),
+				}),
+			),
+		);
+		try {
+			resetWarpStateForTests();
+			const ledger = loadQuotaLedgerAtStartup(file);
+			assert.equal(ledger.egresses[LOCAL_EGRESS_KEY].reason, "gate_429");
+			assert.equal(
+				warpStateForTests().localParkedUntil,
+				parkedUntil,
+				"without this the first request after a restart spends itself on a known 429",
+			);
+		} finally {
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("loadQuotaLedgerAtStartup: an expired park does not survive the restart", async () => {
+	await withQuotaDir(async (file) => {
+		writeFileSync(
+			file,
+			serializeQuotaLedger(
+				parkQuotaEgress(parseQuotaLedger(""), {
+					ip: LOCAL_EGRESS_KEY,
+					parkedUntil: Date.now() - 1_000,
+					reason: "gate_429",
+					now: Date.now() - 2_000,
+				}),
+			),
+		);
+		try {
+			resetWarpStateForTests();
+			loadQuotaLedgerAtStartup(file);
+			assert.equal(warpStateForTests().localParkedUntil, 0, "the window is over, so the egress is free");
+		} finally {
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("loadQuotaLedgerAtStartup: a malformed or missing file degrades to empty (S10)", async () => {
+	await withQuotaDir(async (file) => {
+		const cases = ["{not json", "[]", "null", JSON.stringify({ version: 99, egresses: {} })];
+		for (const text of cases) {
+			writeFileSync(file, text);
+			try {
+				resetWarpStateForTests();
+				assert.deepEqual(loadQuotaLedgerAtStartup(file), { version: 1, egresses: {} }, `ledger from ${text}`);
+				assert.equal(warpStateForTests().localParkedUntil, 0);
+			} finally {
+				resetWarpStateForTests();
+			}
+		}
+		try {
+			resetWarpStateForTests();
+			assert.deepEqual(
+				loadQuotaLedgerAtStartup(join(file, "..", "pfb-quota-absent", "quota.json")),
+				{ version: 1, egresses: {} },
+				"a missing file is the normal first run",
+			);
+		} finally {
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("forward: a local 429 writes the ledger, and a restart re-parks it (S10)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = async () =>
+			new Response(GATE_429_BODY, { status: 429, headers: { "retry-after": "3600" } });
+		try {
+			resetWarpStateForTests(); // also clears the resolved ledger path
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "local-429" }), res, RESEND_PATH, {
+				...FORWARD_CONFIG,
+				warpMode: "off",
+			});
+
+			assert.equal(res.status, 429, "the gate 429 is still delivered byte-exact");
+			const ledger = parseQuotaLedger(readFileSync(file, "utf8"));
+			const entry = ledger.egresses[LOCAL_EGRESS_KEY];
+			assert.equal(entry.reason, "gate_429");
+			assert.equal(entry.hits, 1);
+			assert.ok(entry.parked_until > Date.now(), "the reset is in the future");
+			assert.equal(existsSync(`${file}.tmp`), false, "the temp file never survives the rename");
+
+			resetWarpStateForTests();
+			loadQuotaLedgerAtStartup(file);
+			assert.ok(
+				warpStateForTests().localParkedUntil > Date.now(),
+				"the park that reached the disk is the one a restart adopts",
+			);
+		} finally {
+			globalThis.fetch = originalFetch;
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("writeQuotaLedger: a write that cannot land logs one line and never throws (S10)", async () => {
+	await withQuotaDir(async (file) => {
+		// The parent of the ledger path is a FILE, so nothing can be created under
+		// it: a read-only home or a full disk looks exactly like this.
+		writeFileSync(file, "not a directory");
+		const ledger = parkQuotaEgress(parseQuotaLedger(""), {
+			ip: V4_A,
+			parkedUntil: Date.now() + 60_000,
+			reason: "gate_429",
+		});
+		const lines = [];
+		const originalWrite = process.stderr.write;
+		process.stderr.write = (chunk) => (lines.push(String(chunk)), true);
+		try {
+			const written = writeQuotaLedger(ledger, join(file, "quota.json"));
+			assert.equal(written.egresses[V4_A].reason, "gate_429", "the park survives in memory");
+		} finally {
+			process.stderr.write = originalWrite;
+		}
+		assert.equal(
+			lines.filter((line) => line.includes("quota ledger")).length,
+			1,
+			`exactly one line, got ${JSON.stringify(lines)}`,
+		);
+	});
+});
+
+test("readQuotaLedger: a file that is gone reads as empty instead of throwing", async () => {
+	await withQuotaDir(async (file) => {
+		assert.deepEqual(readQuotaLedger(join(file, "absent.json")), { version: 1, egresses: {} });
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Proxy capability detection (S11)
+// ---------------------------------------------------------------------------
+// The relay hides its choice in the proxy credential, which only means something
+// to a proxy that can read it. An older binary has no `GET /exits` and no exit to
+// prefer, so the relay must not claim it routes (S11) — and must not send a
+// credential it cannot honour.
+
+const CAPABILITY_CONFIG = { warpProxy: "http://127.0.0.1:8789" };
+
+// S11: the capability is DECLARED by the proxy in `/health`, never probed. On a
+// binary without the `/exits` route a probe reaches the catch-all, and the
+// catch-all defect (D7) charges that request to an exit: 30 minutes out of
+// rotation for one diagnostic read. These tests pin the URL, not just the verdict.
+test("warpExitsCapability: a /health that declares the route is the structured contract (S11)", async () => {
+	const seen = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, opts = {}) => {
+		seen.push({ url: String(url), opts });
+		return healthJson({ ok: true, capabilities: { exits: true }, exits: [] });
+	};
+	try {
+		resetWarpStateForTests();
+		assert.equal(await warpExitsCapability(CAPABILITY_CONFIG, 0), "structured");
+		assert.equal(seen[0].url, "http://127.0.0.1:8789/health", "the declared capability travels on /health");
+		assert.equal(seen[0].opts.headers, undefined, "capability detection sends no credential");
+		assert.ok(seen[0].opts.method === undefined || seen[0].opts.method === "GET", "a plain GET");
+	} finally {
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+test("warpExitsCapability: a /health without the declaration is legacy and /exits is never asked (S11, D9)", async () => {
+	const seen = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		seen.push(String(url));
+		// A pre-capability binary: a real /health report, no declared route.
+		return healthJson({ ok: true, service: "warp-minimal", stack: "masque", exits: [] });
+	};
+	try {
+		resetWarpStateForTests();
+		assert.equal(await warpExitsCapability(CAPABILITY_CONFIG, 0), "legacy");
+		assert.equal(seen.length, 1, "one question, and only to /health");
+		assert.deepEqual(
+			seen.filter((url) => url.endsWith("/exits")),
+			[],
+			"probing /exits on an old binary takes an exit out of rotation for 30 minutes",
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+test("warpExitsCapability: an unreachable or non-200 /health is unknown, never legacy (S11)", async () => {
+	const answers = [
+		() => {
+			throw new Error("ECONNREFUSED");
+		},
+		() => new Response("", { status: 500 }),
+		() => new Response("", { status: 404 }),
+	];
+	const originalFetch = globalThis.fetch;
+	try {
+		for (const answer of answers) {
+			globalThis.fetch = async () => answer();
+			resetWarpStateForTests();
+			assert.equal(await warpExitsCapability(CAPABILITY_CONFIG, 0), "unknown");
+		}
+	} finally {
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+test("warpExitsCapability: the answer is cached for a minute (S11)", async () => {
+	let calls = 0;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => {
+		calls += 1;
+		return healthJson({ ok: true, exits: [] });
+	};
+	try {
+		resetWarpStateForTests();
+		assert.equal(await warpExitsCapability(CAPABILITY_CONFIG, 0), "legacy");
+		assert.equal(await warpExitsCapability(CAPABILITY_CONFIG, 59_999), "legacy");
+		assert.equal(calls, 1, "one probe inside the window");
+		assert.equal(await warpExitsCapability(CAPABILITY_CONFIG, 60_000), "legacy");
+		assert.equal(calls, 2, "the window is a minute, then the probe runs again");
+		assert.equal(
+			await warpExitsCapability({ warpProxy: "http://127.0.0.1:9999" }, 60_001),
+			"legacy",
+			"a different proxy is a different answer",
+		);
+		assert.equal(calls, 3);
+	} finally {
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// /health reports the ledger, and no routing it cannot honour (S12)
+// ---------------------------------------------------------------------------
+
+test("/health reports the ledger and keeps preferredRouting false (S12)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const now = Date.now();
+		writeFileSync(
+			file,
+			serializeQuotaLedger(
+				parkQuotaEgress(
+					parkQuotaEgress(parseQuotaLedger(""), {
+						ip: V4_A,
+						parkedUntil: now + 60_000,
+						reason: "gate_429",
+						now,
+					}),
+					{ ip: V4_B, parkedUntil: now + 120_000, reason: "gate_429", now },
+				),
+			),
+		);
+		const originalFetch = globalThis.fetch;
+		// S11: a real /health report is an object that DECLARES the structured
+		// route. A bare array is a body no binary sends, and reads as legacy.
+		globalThis.fetch = async () => healthJson({ ok: true, capabilities: { exits: true }, exits: [] });
+		try {
+			resetWarpStateForTests();
+			loadQuotaLedgerAtStartup(file);
+			const res = fakeRelayRes();
+			await handle({ method: "GET", url: "/health", headers: {}, on() {} }, res, {
+				...FORWARD_CONFIG,
+				warpMode: "off",
+			});
+			const body = JSON.parse(res.body());
+
+			assert.deepEqual(Object.keys(body.quotaLedger).sort(), ["nearestResetInMs", "parked", "path"]);
+			assert.equal(body.quotaLedger.parked, 2);
+			assert.ok(
+				body.quotaLedger.nearestResetInMs > 0 && body.quotaLedger.nearestResetInMs <= 60_000,
+				`nearest reset ${body.quotaLedger.nearestResetInMs}ms`,
+			);
+			assert.equal(body.quotaLedger.path, file);
+			assert.equal(body.warpExits, "structured");
+			assert.equal(body.preferredRouting, false, "nothing is preferred until the prefer path is wired");
+			assert.equal(body.service, "pi-free-bridge-relay", "nothing existing is renamed or removed");
+			assert.equal(body.ok, true);
+		} finally {
+			globalThis.fetch = originalFetch;
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
+// ---------------------------------------------------------------------------
+// Per-request routing: one exit per attempt, named by the proxy credential
+// (S2, S3, S4, S7, S9)
+// ---------------------------------------------------------------------------
+// The relay hides its choice in the proxy credential (L5: a custom header never
+// reaches the proxy, URL userinfo does), so the whole feature is observable in
+// one place — the `proxy` the upstream request was built with. Every case below
+// drives the real `forward()` with a fake network; nothing touches a port.
+//
+// `state` is eligibility and `observed_at` is liveness: the proxy derives the
+// state from `stateLocked()` and runs no health check, so a silently dead tunnel
+// still says `healthy` and only stops renewing its trace.
+
+import {
+	countWarpExitAddresses,
+	isWarpExitChoosable,
+	parseWarpExits,
+	preferredWarpExit,
+	readWarpExitsDetail,
+	WARP_EXIT_STALE_MS,
+	warpExitObservedAtMs,
+} from "../relay.mjs";
+
+const POOL_PROXY = WARP_CONFIG.warpProxy;
+// Two real egresses on purpose: they sit in DIFFERENT /64s, so nothing here can
+// lean on a shared prefix.
+const EGRESS_A = "2a09:bac5:3057:aa::11:1eb";
+const EGRESS_B = "2a09:bac1:2040:10::4";
+/** The measured `/exits` shape: flat objects, epoch SECONDS, no `prefix64`. */
+const POOL_A = { id: "warp-a", state: "healthy", served: 0, streams: 0, ip: EGRESS_A, family: "v6" };
+const POOL_B = { id: "warp-b", state: "healthy", served: 0, streams: 0, ip: EGRESS_B, family: "v6" };
+const EMPTY_LEDGER = parseQuotaLedger("");
+
+/** `observed_at` is epoch seconds, so a fresh entry is derived from our clock. */
+const freshExit = (exit, ageSeconds = 0) => ({
+	...exit,
+	observed_at: Math.floor(Date.now() / 1000) - ageSeconds,
+});
+/** The `/health` string form the relay has always parsed (S14). */
+const healthOf = (...pairs) => ({
+	exits: pairs.map(([id, state]) => `${id} (${state}, served=0, streams=0)`),
+});
+
+/** A fake proxy publishing `/exits`, `/health`, `/recycle` and the upstream. */
+function fakePoolProxy({ detail, health, upstream } = {}) {
+	// S11: a real binary either has the structured route and says so in `/health`,
+	// or has neither. The fake mirrors that: `detail` present means a proxy that
+	// declares the capability, `detail: undefined` means an older build that never
+	// mentions it — and must never be asked for `/exits`.
+	const healthBody = () => ({
+		...(health ?? {}),
+		...(detail === undefined ? {} : { capabilities: { exits: true } }),
+	});
+	return installFakeFetch((call) => {
+		if (call.url === `${POOL_PROXY}/exits`) {
+			return detail === undefined ? new Response("", { status: 404 }) : healthJson(detail);
+		}
+		if (call.url === `${POOL_PROXY}/health`) return healthJson(healthBody());
+		if (call.url === `${POOL_PROXY}/recycle`) {
+			return new Response(JSON.stringify({ ok: false }), { status: 202 });
+		}
+		if (upstream) return upstream(call);
+		return new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } });
+	});
+}
+
+const upstreamCall = (fake) =>
+	fake.calls.filter((call) => call.url.startsWith(WARP_CONFIG.upstream)).at(-1);
+
+test("parseWarpExits: the flat array is the contract, everything else is undefined (S11, S13)", () => {
+	assert.deepEqual(parseWarpExits([POOL_A]), [
+		{ id: "warp-a", state: "healthy", ip: EGRESS_A, observed_at: undefined },
+	]);
+	assert.equal(parseWarpExits(undefined), undefined, "no body is no evidence");
+	assert.equal(parseWarpExits({ ok: true }), undefined, "a JSON object is not the array");
+	assert.equal(parseWarpExits("[]"), undefined, "unparseable text never becomes an empty pool");
+	assert.deepEqual(
+		parseWarpExits([{ state: "healthy" }, null, "x", { id: "   " }]),
+		[],
+		"an entry without an id is not an exit",
+	);
+	// The proxy omits `ip`/`family`/`observed_at` when the trace never worked.
+	assert.deepEqual(parseWarpExits([{ id: "warp-a", state: "healthy" }]), [
+		{ id: "warp-a", state: "healthy", ip: undefined, observed_at: undefined },
+	]);
+});
+
+test("readWarpExitsDetail: one GET per five seconds, every bad answer is no evidence (S11)", async () => {
+	const fake = fakePoolProxy({ detail: [freshExit(POOL_A), freshExit(POOL_B)] });
+	try {
+		resetWarpStateForTests();
+		assert.equal((await readWarpExitsDetail(WARP_CONFIG, 0)).length, 2);
+		assert.equal(fake.calls[0].url, `${POOL_PROXY}/exits`);
+		assert.equal(fake.calls[0].method, "GET");
+		await readWarpExitsDetail(WARP_CONFIG, 4_999);
+		assert.equal(fake.calls.length, 1, "a request never pays the hop twice inside the window");
+		await readWarpExitsDetail(WARP_CONFIG, 5_000);
+		assert.equal(fake.calls.length, 2, "and the window is five seconds");
+	} finally {
+		fake.restore();
+		resetWarpStateForTests();
+	}
+
+	const bad = [
+		["a 404", () => new Response("", { status: 404 })],
+		["a 500", () => new Response("", { status: 500 })],
+		["a non-JSON 200", () => new Response("<html>nope</html>", { status: 200 })],
+		["a JSON object", () => healthJson({ ok: true })],
+		["a refused connection", () => {
+			throw new Error("ECONNREFUSED");
+		}],
+	];
+	for (const [name, answer] of bad) {
+		const broken = installFakeFetch(answer);
+		try {
+			resetWarpStateForTests();
+			assert.equal(await readWarpExitsDetail(WARP_CONFIG, 0), undefined, name);
+		} finally {
+			broken.restore();
+			resetWarpStateForTests();
+		}
+	}
+});
+
+test("warpExitObservedAtMs: seconds become milliseconds, and 0 is absent (S9)", () => {
+	assert.equal(warpExitObservedAtMs(1_794_636_453), 1_794_636_453_000, "the proxy's unit is seconds");
+	assert.equal(warpExitObservedAtMs(0), undefined, "0 means 'never observed', not 1970");
+	assert.equal(warpExitObservedAtMs(undefined), undefined);
+	assert.equal(warpExitObservedAtMs("1794636453"), undefined, "a string is not a timestamp");
+});
+
+test("isWarpExitChoosable: a fresh second-granularity stamp is fresh, not ancient (S9)", () => {
+	// The failure this pins: comparing epoch SECONDS against a Date.now()
+	// MILLISECOND clock makes every real exit look ~50 years old, so the relay
+	// would never prefer anything again. Drop the `* 1000` and this goes red.
+	const now = Math.floor(Date.now() / 1000) * 1000;
+	assert.equal(isWarpExitChoosable(freshExit(POOL_A), now), true);
+	assert.equal(isWarpExitChoosable({ ...POOL_A, observed_at: 0 }, now), false, "0 is absent, never 'expired by miles'");
+	assert.equal(isWarpExitChoosable({ ...POOL_A, observed_at: undefined }, now), false, "no stamp, no vouch");
+});
+
+test("isWarpExitChoosable: state is eligibility, observed_at is liveness (S9)", () => {
+	// Aligned to the second: `observed_at` has second granularity, so a boundary
+	// case is only exact on a whole second.
+	const now = Math.floor(Date.now() / 1000) * 1000;
+	assert.equal(isWarpExitChoosable(freshExit(POOL_A), now), true);
+	assert.equal(isWarpExitChoosable(freshExit({ ...POOL_A, state: "in_use" }), now), true);
+	for (const state of ["draining", "cooldown", "starting", undefined]) {
+		assert.equal(isWarpExitChoosable(freshExit({ ...POOL_A, state }), now), false, `state ${String(state)}`);
+	}
+	assert.equal(isWarpExitChoosable(freshExit({ ...POOL_A, ip: undefined }), now), false, "no egress address, no key");
+	assert.equal(isWarpExitChoosable(freshExit({ ...POOL_A, ip: "not-an-ip" }), now), false);
+
+	assert.equal(WARP_EXIT_STALE_MS, 120_000, "two minutes: the proxy caches the trace 45s, not two hours");
+	assert.equal(
+		isWarpExitChoosable(freshExit(POOL_A, WARP_EXIT_STALE_MS / 1000), now),
+		true,
+		"the two-minute boundary is still vouchable",
+	);
+	assert.equal(
+		isWarpExitChoosable(freshExit(POOL_A, WARP_EXIT_STALE_MS / 1000 + 1), now),
+		false,
+		"past it the address is not vouched for, however healthy the state is",
+	);
+	assert.equal(isWarpExitChoosable(undefined, now), false);
+});
+
+test("countWarpExitAddresses: a stale address still counts as an existing exit (S9, S12)", () => {
+	assert.equal(countWarpExitAddresses([freshExit(POOL_A), freshExit(POOL_B, 600)]), 2);
+	assert.equal(countWarpExitAddresses([freshExit(POOL_A), { id: "warp-x", state: "healthy" }]), 1);
+	assert.equal(countWarpExitAddresses([{ id: "warp-x", state: "healthy", ip: "nope" }]), 0);
+	assert.equal(countWarpExitAddresses(undefined), 0);
+});
+
+test("preferredWarpExit: the freshest address wins, because healthy is not alive (S9)", () => {
+	const now = Date.now();
+	// (a) Both eligible; the fresher stamp wins even when it is listed last.
+	const fresh = freshExit(POOL_B, 5);
+	const older = freshExit(POOL_A, 100);
+	assert.equal(preferredWarpExit([older, fresh], EMPTY_LEDGER, now).id, "warp-b");
+	assert.equal(preferredWarpExit([fresh, older], EMPTY_LEDGER, now).id, "warp-b");
+
+	// (a) A dead tunnel keeps `healthy` and stops renewing its trace, so an
+	// address past the window is not preferred at all.
+	assert.equal(preferredWarpExit([freshExit(POOL_A, 300), fresh], EMPTY_LEDGER, now).id, "warp-b");
+
+	// (b) A park is the stronger evidence: the parked fresh exit hands the
+	// attempt to the older one instead of overriding the park.
+	const parkedLedger = parkQuotaEgress(EMPTY_LEDGER, {
+		ip: EGRESS_B,
+		parkedUntil: now + 60_000,
+		reason: "gate_429",
+		now,
+	});
+	assert.equal(preferredWarpExit([older, fresh], parkedLedger, now).id, "warp-a");
+
+	// (b) And nothing else clean means nothing is preferred, never a burnt exit.
+	assert.equal(preferredWarpExit([fresh], parkedLedger, now), undefined);
+
+	// (c) Every address aged out: no preference, which is today's behaviour.
+	assert.equal(preferredWarpExit([freshExit(POOL_A, 300), freshExit(POOL_B, 300)], EMPTY_LEDGER, now), undefined);
+	assert.equal(preferredWarpExit([], EMPTY_LEDGER, now), undefined);
+	assert.equal(preferredWarpExit(undefined, EMPTY_LEDGER, now), undefined);
+});
+
+test("preferredWarpExit: a frozen observed_at is the death signal, not a missing ip (S17)", () => {
+	// The proxy's cache does not expire on failure: after a trace worked once and
+	// then failed, it keeps serving the LAST `ip` with its ORIGINAL `observed_at`,
+	// forever. So the normal dead exit is `ip` present with a frozen stamp — the
+	// one the relay already paid an enrollment for — and a missing `ip` only means
+	// "never observed": newborn exit, trace never worked. Reading absence as death
+	// would miss every tunnel that died after working, which is all of them.
+	const now = Math.floor(Date.now() / 1000) * 1000;
+	const frozen = freshExit(POOL_A, 300);
+	assert.ok(frozen.ip, "the dead exit still publishes the last egress address it had");
+	assert.equal(isWarpExitChoosable(frozen, now), false, "a healthy state does not survive a frozen trace");
+	assert.equal(preferredWarpExit([frozen, freshExit(POOL_B, 10)], EMPTY_LEDGER, now).id, "warp-b");
+
+	assert.equal(preferredWarpExit([freshExit(POOL_B, 10)], EMPTY_LEDGER, now).id, "warp-b");
+	assert.equal(
+		preferredWarpExit([frozen], EMPTY_LEDGER, now),
+		undefined,
+		"a frozen address alone prefers nothing",
+	);
+
+	// The rare case: no `ip` at all, which is "never observed", also unusable.
+	const neverObserved = { id: "warp-c", state: "healthy", ip: undefined, observed_at: undefined };
+	assert.equal(isWarpExitChoosable(neverObserved, now), false);
+	assert.equal(preferredWarpExit([neverObserved], EMPTY_LEDGER, now), undefined);
+});
+
+test("forward: the chosen exit rides in the proxy URL as the credential (S2, S3, S9)", async () => {
+	const fake = fakePoolProxy({
+		detail: [freshExit(POOL_A), freshExit(POOL_B, 60)],
+		health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+	});
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await forward(fakeReq({ marker: "prefer" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+		assert.equal(res.status, 200);
+		assert.equal(
+			upstreamCall(fake).proxy,
+			"http://warp-a:@127.0.0.1:8789",
+			"the exit id is the username and the password is empty (L5)",
+		);
+		assert.equal(warpStateForTests().preferredExitId, "warp-a");
+	} finally {
+		fake.restore();
+		resetWarpStateForTests();
+	}
+});
+
+test("forward: with a legacy proxy the request is exactly the one sent before (S11)", async () => {
+	const fake = fakePoolProxy({ detail: undefined, health: { exits: [] } });
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await forward(fakeReq({ marker: "legacy" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+		assert.equal(res.status, 200);
+		assert.equal(upstreamCall(fake).proxy, POOL_PROXY, "no credential, not even an empty one");
+		assert.equal(String(upstreamCall(fake).proxy).includes("@"), false);
+		assert.equal(warpStateForTests().preferredExitId, undefined, "nothing claims to be preferred");
+		assert.equal(
+			fake.calls.filter((call) => call.url === `${POOL_PROXY}/exits`).length,
+			0,
+			"an older proxy is never asked for /exits: that request costs it 30 minutes (D7, D9)",
+		);
+	} finally {
+		fake.restore();
+		resetWarpStateForTests();
+	}
+});
+
+test("forward: a warp 429 on a named exit parks its egress IP (S4, S6)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		let upstreamStatus = 429;
+		const fake = fakePoolProxy({
+			detail: [freshExit(POOL_A), freshExit(POOL_B, 60)],
+			health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			upstream: () =>
+				upstreamStatus === 429
+					? new Response(GATE_429_BODY, { status: 429, headers: { "retry-after": "3600" } })
+					: new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } }),
+		});
+		try {
+			resetWarpStateForTests();
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "park" }), res, RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(res.status, 429, "the gate 429 is still delivered byte-exact");
+
+			const entry = readQuotaLedger(file).egresses[quotaEgressKey(EGRESS_A)];
+			assert.ok(entry, `the serving address is parked: ${JSON.stringify(readQuotaLedger(file).egresses)}`);
+			assert.equal(entry.reason, "gate_429");
+			assert.equal(entry.exit_id, "warp-a");
+			assert.equal(entry.prefix64, quotaPrefix64(EGRESS_A), "the /64 is derived from the egress address (S5)");
+			assert.ok(entry.parked_until > Date.now() + 3_500_000, "retry-after 3600s plus the margin");
+
+			// The park outweighs freshness: the next attempt takes the other exit.
+			upstreamStatus = 200;
+			await forward(fakeReq({ marker: "after-park" }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(upstreamCall(fake).proxy, "http://warp-b:@127.0.0.1:8789");
+		} finally {
+			fake.restore();
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("forward: a 429 the relay cannot blame on the exit parks nothing (S7)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const fake = fakePoolProxy({
+			detail: [freshExit(POOL_A)],
+			health: healthOf(["warp-a", "healthy"]),
+			upstream: () => new Response(GATE_429_BODY, { status: 429, headers: { "retry-after": "3600" } }),
+		});
+		try {
+			resetWarpStateForTests();
+			await forward(fakeReq({ marker: "suspect" }), fakeRelayRes(), RESEND_PATH, {
+				...FORWARD_CONFIG,
+				sessionSource: "env",
+			});
+			assert.deepEqual(
+				readQuotaLedger(file).egresses,
+				{},
+				"an id the relay cannot vouch for fails exactly like a spent quota",
+			);
+		} finally {
+			fake.restore();
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("forward: only an attributable 429 with a parsed retry-after parks an IP (S4, S6)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const cases = [
+			{ name: "no chosen exit (legacy proxy)", detail: undefined, headers: { "retry-after": "3600" } },
+			{ name: "chosen exit but no retry-after", detail: [freshExit(POOL_A)], headers: {} },
+			{
+				name: "chosen exit but a retry-after that is not an integer",
+				detail: [freshExit(POOL_A)],
+				headers: { "retry-after": "1h" },
+			},
+		];
+		for (const item of cases) {
+			const fake = fakePoolProxy({
+				detail: item.detail,
+				health: healthOf(["warp-a", "healthy"]),
+				upstream: () => new Response(GATE_429_BODY, { status: 429, headers: item.headers }),
+			});
+			try {
+				resetWarpStateForTests();
+				await forward(fakeReq({ marker: item.name }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+				assert.deepEqual(readQuotaLedger(file).egresses, {}, item.name);
+			} finally {
+				fake.restore();
+				resetWarpStateForTests();
+			}
+		}
+		delete process.env.RELAY_QUOTA_PATH;
+	});
+});
+
+test("/health: preferredRouting is live only when an exit is choosable (S12)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const readHealth = async (detail, health) => {
+			const fake = fakePoolProxy({ detail, health });
+			try {
+				const res = fakeRelayRes();
+				await handle({ method: "GET", url: "/health", headers: {}, on() {} }, res, {
+					...FORWARD_CONFIG,
+					warpMode: "off",
+				});
+				return JSON.parse(res.body());
+			} finally {
+				fake.restore();
+			}
+		};
+		try {
+			// Capable and preferable, but nothing has been preferred yet.
+			resetWarpStateForTests();
+			let body = await readHealth(
+				[freshExit(POOL_A), freshExit(POOL_B)],
+				healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			);
+			assert.equal(body.warpExits, "structured");
+			assert.equal(body.preferredRouting, true);
+			assert.equal(body.preferredExit, null);
+			assert.deepEqual(body.warpExitsDetail, { usable: 2 });
+
+			// Every address aged out: the exits still exist, nothing is routable.
+			resetWarpStateForTests();
+			body = await readHealth(
+				[freshExit(POOL_A, 300), freshExit(POOL_B, 300)],
+				healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			);
+			assert.equal(body.preferredRouting, false, "a dead tunnel's stale address is not preferred");
+			assert.deepEqual(body.warpExitsDetail, { usable: 2 }, "the exits still exist");
+
+			// Every eligible exit parked: inert as well.
+			resetWarpStateForTests();
+			const now = Date.now();
+			writeFileSync(
+				file,
+				serializeQuotaLedger(
+					parkQuotaEgress(
+						parkQuotaEgress(parseQuotaLedger(""), { ip: EGRESS_A, parkedUntil: now + 60_000, reason: "gate_429", now }),
+						{ ip: EGRESS_B, parkedUntil: now + 120_000, reason: "gate_429", now },
+					),
+				),
+			);
+			loadQuotaLedgerAtStartup(file);
+			body = await readHealth(
+				[freshExit(POOL_A), freshExit(POOL_B)],
+				healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			);
+			assert.equal(body.preferredRouting, false, "a burnt pool routes nothing");
+			assert.equal(body.quotaLedger.parked, 2);
+
+			// An older binary is inert, and its `/exits` is never read for details.
+			resetWarpStateForTests();
+			body = await readHealth(undefined, { exits: [] });
+			assert.equal(body.warpExits, "legacy");
+			assert.equal(body.preferredRouting, false);
+			assert.equal(body.preferredExit, null);
+			assert.deepEqual(body.warpExitsDetail, { usable: 0 });
+			assert.equal(body.service, "pi-free-bridge-relay", "nothing existing is renamed or removed");
+
+			// After a request that preferred an exit, /health names it.
+			resetWarpStateForTests();
+			const fake = fakePoolProxy({
+				detail: [freshExit(POOL_A), freshExit(POOL_B)],
+				health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			});
+			try {
+				await forward(fakeReq({ marker: "preferred" }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+			} finally {
+				fake.restore();
+			}
+			body = await readHealth(
+				[freshExit(POOL_A), freshExit(POOL_B)],
+				healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			);
+			assert.equal(body.preferredRouting, true);
+			assert.equal(body.preferredExit, "warp-a", "the id the relay last preferred");
+		} finally {
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
 });
