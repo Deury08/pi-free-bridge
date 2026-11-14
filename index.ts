@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1728,6 +1728,135 @@ export async function warpBuildDrift(deps: {
 	return warpBuildNotice({ running, installed });
 }
 
+/** D11: the proxy's own process record, kept beside its binary. It is the only
+ *  thing that knows which pid belongs to us after the session that spawned it is
+ *  gone: the proxy is detached on purpose, and its `/health` has no pid. */
+function warpProcessPath(): string {
+	return join(WARP_INSTALL_DIR, "warp-process.json");
+}
+
+export function recordWarpProcess(pid: number | undefined, bin: string, now = Date.now()): void {
+	if (typeof pid !== "number" || !Number.isFinite(pid)) return;
+	try {
+		mkdirSync(WARP_INSTALL_DIR, { recursive: true });
+		writeFileSync(warpProcessPath(), `${JSON.stringify({ pid, bin, spawned_at: now })}\n`, "utf-8");
+	} catch {
+		// A record that cannot be written must not break starting the proxy.
+	}
+}
+
+export function readWarpProcess(): { pid: number; bin: string; spawned_at: number } | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(warpProcessPath(), "utf-8"));
+		if (!raw || typeof raw !== "object") return undefined;
+		if (typeof raw.pid !== "number" || !Number.isFinite(raw.pid) || raw.pid <= 0) return undefined;
+		return {
+			pid: raw.pid,
+			bin: typeof raw.bin === "string" ? raw.bin : "",
+			spawned_at: typeof raw.spawned_at === "number" ? raw.spawned_at : 0,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+export type StopWarpDeps = {
+	/** The proxy's `/health` body, or undefined when nothing answers. */
+	probe: () => Promise<unknown>;
+	recorded: () => { pid: number; bin: string } | undefined;
+	/** The executable behind a pid when the platform exposes it; undefined when
+	 *  it cannot be read, which is not the same as a mismatch. */
+	exeOf: (pid: number) => string | undefined;
+	kill: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
+	sleep: (ms: number) => Promise<void>;
+	attempts?: number;
+};
+
+/** D11: stop the proxy we started, and refuse to guess. Four refusals are more
+ *  useful than one wrong kill: nothing answering means nothing to stop; no
+ *  record means no pid we can claim; an executable that does not match the
+ *  recorded binary means the pid was reused, so it is not ours; and a process
+ *  that survives SIGKILL is reported instead of being assumed dead. */
+export async function stopWarpProxy(deps: StopWarpDeps): Promise<"stopped" | "nothing-to-stop" | "unknown-pid" | "refused" | "unverified"> {
+	const alive = async (): Promise<boolean> => {
+		try {
+			return Boolean(await deps.probe());
+		} catch {
+			return false;
+		}
+	};
+	if (!(await alive())) return "nothing-to-stop";
+	const record = deps.recorded();
+	if (!record) return "unknown-pid";
+	let exe: string | undefined;
+	try {
+		exe = deps.exeOf(record.pid);
+	} catch {
+		exe = undefined;
+	}
+	if (exe && record.bin && exe !== record.bin) return "refused";
+
+	const attempts = deps.attempts ?? 20;
+	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+		try {
+			deps.kill(record.pid, signal);
+		} catch {
+			// already gone, or not ours to signal: the probe decides below
+		}
+		for (let i = 0; i < attempts; i++) {
+			if (!(await alive())) return "stopped";
+			await deps.sleep(150);
+		}
+	}
+	return "unverified";
+}
+
+/** D11: the executable behind a pid, when the kernel exposes it. Linux only;
+ *  everywhere else this answers undefined, which the stop policy reads as "cannot
+ *  check" and never as a mismatch. */
+function exeBehindPid(pid: number): string | undefined {
+	try {
+		return readlinkSync(`/proc/${pid}/exe`);
+	} catch {
+		return undefined;
+	}
+}
+
+/** D11: the only place the proxy is stopped is the menu switching WARP off (and
+ *  an update, which stops it to replace the binary). Closing the relay leaves it
+ *  running on purpose: stopping it costs two enrollments, new addresses and the
+ *  matching of every parked entry. */
+async function stopWarpFromMenu(healthUrl: string): Promise<"stopped" | "nothing-to-stop" | "unknown-pid" | "refused" | "unverified"> {
+	return stopWarpProxy({
+		probe: async () => {
+			try {
+				const res = await fetch(healthUrl, { signal: AbortSignal.timeout(1500) });
+				return res.ok ? await res.json() : undefined;
+			} catch {
+				return undefined;
+			}
+		},
+		recorded: () => readWarpProcess(),
+		exeOf: exeBehindPid,
+		kill: (pid, signal) => process.kill(pid, signal),
+		sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+	});
+}
+
+/** D11 / S30c: the new binary is in place only if the answering proxy proves it:
+ *  an identity, the exit capability, and at least one exit with an address. A
+ *  restart that leaves the old build serving fails here, which is the whole
+ *  point of checking. */
+export function warpReadyFact(body: unknown): boolean {
+	const b = body as { build?: { commit?: unknown }; capabilities?: { exits?: unknown }; exits?: unknown } | undefined;
+	if (!b || typeof b !== "object") return false;
+	const commit = b.build && typeof b.build.commit === "string" ? b.build.commit.trim() : "";
+	if (!commit || commit === "unknown") return false;
+	if (!b.capabilities || b.capabilities.exits !== true) return false;
+	const exits = Array.isArray(b.exits) ? b.exits : [];
+	return exits.some((exit) => Boolean(exit) && typeof exit === "object" && Boolean((exit as { ip?: unknown }).ip));
+}
+
 export async function ensureWarp(): Promise<boolean> {
 	const target = resolveWarpTarget();
 
@@ -1754,6 +1883,10 @@ export async function ensureWarp(): Promise<boolean> {
 			windowsHide: true,
 		});
 		child.once("error", () => undefined); // surface via probe failure
+		// D11: remember what was started, so a later update can stop exactly this
+		// process instead of hunting a pid by name or leaving it serving an old
+		// binary while a new one sits on disk.
+		recordWarpProcess(child.pid, bin);
 		child.unref();
 
 		// (e) Probe again up to 6 attempts.
@@ -3386,11 +3519,18 @@ export default async function (pi: ExtensionAPI) {
 		}
 
 		writeBridgeConfig({ warpEnabled: chosen });
+		// D11: switching off is the one moment WARP's process is stopped on purpose.
+		// Every refusal is reported as itself, never smoothed into "off".
+		let stopNote = "";
+		if (chosen === "off") {
+			const stopped = await stopWarpFromMenu(warpTarget.healthUrl);
+			stopNote = ` Proxy: ${stopped}.`;
+		}
 		// relay-warp-hot-reload: no relay restart. The relay re-reads the config
 		// file on every request, so the new mode applies on the next request with
 		// the same process (pid survives the switch).
 		ctx.ui.notify(
-			`WARP mode set to ${chosen} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.`,
+			`WARP mode set to ${chosen} and saved to ${BRIDGE_CONFIG_PATH}. Takes effect on the next request.${stopNote}`,
 			"info",
 		);
 	}

@@ -6621,3 +6621,93 @@ test("D10: the listen port reads the variable the error message names", async ()
 	assert.equal(resolveListenPort({ PORT: "8788" }), 8788, "PORT stays supported for the spawn path");
 	assert.ok(Number.isNaN(resolveListenPort({})), "no port named is not a port");
 });
+
+// D11: stopping the proxy is the only moment it may die, so every refusal has to
+// be louder than a wrong kill. The four answers below are the whole policy.
+const stopDeps = (over = {}) => ({
+	probe: async () => ({ ok: true }),
+	recorded: () => ({ pid: 4242, bin: "/x/warp-minimal" }),
+	exeOf: () => "/x/warp-minimal",
+	kill: () => undefined,
+	sleep: async () => undefined,
+	attempts: 2,
+	...over,
+});
+
+test("stopWarpProxy: nothing answering means nothing to stop, and nothing is killed (D11)", async () => {
+	let killed = 0;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			probe: async () => undefined,
+			kill: () => {
+				killed += 1;
+			},
+		}),
+	);
+	assert.equal(result, "nothing-to-stop");
+	assert.equal(killed, 0);
+});
+
+test("stopWarpProxy: no record means no pid it can claim, so it refuses (D11)", async () => {
+	let killed = 0;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			recorded: () => undefined,
+			kill: () => {
+				killed += 1;
+			},
+		}),
+	);
+	assert.equal(result, "unknown-pid");
+	assert.equal(killed, 0);
+});
+
+test("stopWarpProxy: an executable that is not the recorded binary is a reused pid (D11)", async () => {
+	let killed = 0;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			exeOf: () => "/usr/bin/something-else",
+			kill: () => {
+				killed += 1;
+			},
+		}),
+	);
+	assert.equal(result, "refused");
+	assert.equal(killed, 0);
+});
+
+test("stopWarpProxy: an unreadable executable is not a mismatch, so it does stop (D11)", async () => {
+	const signals = [];
+	let alive = true;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			exeOf: () => undefined,
+			probe: async () => (alive ? { ok: true } : undefined),
+			kill: (_pid, signal) => {
+				signals.push(signal);
+				alive = false;
+			},
+		}),
+	);
+	assert.equal(result, "stopped");
+	assert.deepEqual(signals, ["SIGTERM"]);
+});
+
+test("stopWarpProxy: a process that survives every signal is reported, never assumed dead (D11)", async () => {
+	const result = await releaseMod.stopWarpProxy(stopDeps());
+	assert.equal(result, "unverified");
+});
+
+test("warpReadyFact: a new binary proves itself with identity, capability and an exit (D11)", () => {
+	const good = {
+		build: { commit: "b04459a" },
+		capabilities: { exits: true },
+		exits: [{ id: "warp-1", ip: "2a09::1" }],
+	};
+	assert.equal(releaseMod.warpReadyFact(good), true);
+	assert.equal(releaseMod.warpReadyFact({ ...good, build: { commit: "unknown" } }), false, "a versionless build is not proof");
+	assert.equal(releaseMod.warpReadyFact({ ...good, build: undefined }), false, "the old build serving is exactly what this must catch");
+	assert.equal(releaseMod.warpReadyFact({ ...good, capabilities: { exits: false } }), false);
+	assert.equal(releaseMod.warpReadyFact({ ...good, exits: [] }), false);
+	assert.equal(releaseMod.warpReadyFact({ ...good, exits: [{ id: "warp-1" }] }), false, "an exit without an address is not eligible");
+});
