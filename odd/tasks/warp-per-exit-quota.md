@@ -173,6 +173,22 @@ attempts were made, how many round-2 rotations ran, and how many requests ended
 in a terminal 429, so a ladder that is quietly burning enrollments is visible in
 the same place the ledger already is.
 
+S27. A parked egress is **skipped, not attempted**. Round 1 and round 2 attempt
+only exits whose egress IP is not parked in the ledger; an exit whose IP is parked
+while its reset is in the future is not a candidate and spends no request. This is
+the whole point of the ledger: the ladder exists to avoid the burnt addresses, not
+to rediscover them.
+
+S28. When every egress the ladder knows is parked, it still makes **one final
+attempt through the last candidate in its own order** and delivers that attempt's
+response; a refusal is never synthesized from the ledger alone. The delivered 429
+is byte-exact from the **last attempt that produced a response**, falling back to
+the original 429 when that last attempt failed without one. Rationale: after a whole
+episode every burnt address is known, and the only thing the client can act on is
+the freshest `retry-after`, which belongs to the last refusal, not the first. The
+episode is bounded by the pool, not by a number: two exits per round means at most
+four egress attempts when the proxy publishes two, and fewer when it does not (S26).
+
 S26. The proxy's rotation contract, as measured by the peer (`path:line`, installed
 binary, unchanged by the feature branch): the `POST /recycle` body reports
 `recycling:true` **unconditionally**, including when nothing started, so it is never
@@ -440,6 +456,14 @@ retries on its own, and the client sees a single terminal 429. **The cost I stat
 when asking was wrong**: I said one enrollment, and `RecycleAll` spends two (L24). The
 choice was made on the correct direction — free rung first, one paid rotation at
 most — but the price is double what the user was told.
+
+L25 (user, verbatim): «obio esta escalera va a usar lo qeu implementamos anteriormente si
+un de esas ips las quemamos y aun no estan libres no las usamos y si son todas reclicle y
+vamos a la otra, si las 4 estan quemadas usamos la ultima para enviar el 429». Read as
+S27 (a parked IP is never a candidate) and S28 (the terminal 429 comes from a real final
+attempt, not from the ledger). S28 supersedes the "always the original 429" detail of
+S13 for the terminal delivery only: the original stays the fallback when the final
+attempt produced no response.
 
 L24 (evidence, peer agent, `path:line` from the installed binary): a recycle rotates
 **every** exit not in cooldown, in parallel (`RecycleAll`, pool.go:566-600), each via
