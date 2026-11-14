@@ -4083,19 +4083,27 @@ test("the proxy update lives in the WARP sector, and nowhere else", () => {
 		"the label the owner asked for",
 	);
 
-	// Always offered: it is the row that creates the binary, so hiding it behind
-	// that binary's absence would make it unreachable when it is needed most.
-	for (const state of [
-		{ bunReady: false, binaryPresent: false, warpReady: false },
-		{ bunReady: true, binaryPresent: false, warpReady: false },
-		{ bunReady: false, binaryPresent: true, warpReady: true },
-	]) {
-		assert.equal(
-			visibleMenuIndices(state).includes(MENU_UPDATE_WARP),
-			true,
-			`visible with ${JSON.stringify(state)}`,
-		);
-	}
+	// The owner's two visibility rules, asserted as rules:
+	// 1. without Bun and without a relay binary, the menu is the single row that
+	//    can fix that — every other action could only fail;
+	assert.deepEqual(
+		visibleMenuIndices({ bunReady: false, binaryPresent: false, warpReady: false }),
+		[0],
+		"no Bun and no relay: only installing the relay",
+	);
+	// 2. with Bun present the relay row is gone, because npm carries the update.
+	assert.equal(
+		visibleMenuIndices({ bunReady: true, binaryPresent: false, warpReady: false }).includes(0),
+		false,
+		"Bun present hides the relay install row",
+	);
+	// 3. with a runnable relay, updating the proxy is offered even when no warp
+	//    binary exists yet: that row is how it gets installed.
+	assert.equal(
+		visibleMenuIndices({ bunReady: true, binaryPresent: false, warpReady: false }).includes(MENU_UPDATE_WARP),
+		true,
+		"a runnable relay is enough to offer the proxy update",
+	);
 
 	// The four sectors are exactly these, in this order.
 	assert.deepEqual(
@@ -4111,7 +4119,7 @@ test("the install item exists only for machines without Bun", () => {
 	// Nothing at all: installing is the only real action.
 	assert.deepEqual(
 		visibleMenuIndices({ bunReady: false, binaryPresent: false, warpReady: false }),
-		[MENU_INSTALL, 7],
+		[MENU_INSTALL],
 		"no Bun and no binary: installing is the only real action",
 	);
 	// A binary without Bun: the row is how it gets installed and updated.
@@ -7124,4 +7132,30 @@ test("updateWarpBinary: success writes the record with the commit read from the 
 	assert.match(failed.reason, /identif/i, "it says the new build did not identify itself");
 	assert.equal(anonymous.calls.writeRecord, 0, "no record is written without a commit");
 	assert.deepEqual(anonymous.written, []);
+});
+
+test("menuUpdateSuffix: the label states a fact, never a wish (T9d)", () => {
+	const { menuUpdateSuffix } = releaseMod;
+
+	// No answer from the release API: the row says so instead of pretending.
+	assert.equal(
+		menuUpdateSuffix({ latestTag: null, currentTag: "0.7.0" }),
+		" — no se pudo verificar la última versión",
+	);
+	// No install record: naming the published version is honest, claiming
+	// "al día" would not be — nothing was compared.
+	assert.equal(
+		menuUpdateSuffix({ latestTag: "v0.7.0", currentTag: null }),
+		" — última publicada: 0.7.0",
+	);
+	// Equal, with the tag's "v" tolerated on either side.
+	assert.equal(
+		menuUpdateSuffix({ latestTag: "v0.7.0", currentTag: "0.7.0" }),
+		" — al día (0.7.0)",
+	);
+	// Behind: both numbers, so the user can see what they would get.
+	assert.equal(
+		menuUpdateSuffix({ latestTag: "v0.8.0", currentTag: "0.7.0" }),
+		" — hay 0.8.0, corre 0.7.0",
+	);
 });

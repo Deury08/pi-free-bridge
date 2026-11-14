@@ -616,7 +616,7 @@ están todas ocultas no se ofrece, así que el menú nunca abre en un callejón.
 | **Relay** | Instalar / actualizar relay | Baja el binario del relay, verifica el `SHA256SUMS` publicado, lo instala y reinicia el relay. **Pregunta antes** y guarda el binario que corría como `.prev`: si el nuevo no responde `/health`, vuelve solo al anterior |
 | **Relay** | Estado del relay | URL, proceso, versión, `/health`, session id y su origen, modelos, WARP, cable y Bun |
 | **WARP** | Modo: on / off | Muestra el modo actual y lo cambia (`off`, `auto`, `on`); sin `warp-minimal` arriba, ofrece instalarlo |
-| **WARP** | Instalar/actualizar warp | Descarga **siempre** la última release publicada de `warp-minimal` y reemplaza el archivo. Es la única acción que **detiene el proxy**; muestra el costo y pide confirmación |
+| **WARP** | Instalar/actualizar warp | La etiqueta dice el estado: `al día (0.4.0)`, `hay 0.4.1, corre 0.4.0`, `última publicada: …` si no hay registro, o que no se pudo verificar. Se elige **siempre descarga** la última release y reemplaza el archivo. Es la única acción que **detiene el proxy**; muestra el costo y pide confirmación |
 | **WARP** | Reciclar WARP | Lo mismo que `/free-bridge-warp-recycle` |
 | **Red** | Protocolo: v1 / v2 | Muestra el modo actual y lo cambia |
 | **Sesión** | Modelos | Lista los modelos gratis efectivamente registrados y de dónde salieron |
@@ -630,11 +630,10 @@ fingir que lo cambió.
 
 **El menú muestra sólo lo que podés usar.** No es una lista fija: en una máquina
 recién instalada, sin relay y sin WARP, el único sector con acciones es **Relay**
-—«Instalar / actualizar relay»— porque las demás sólo podrían fallar. La excepción
-deliberada es **WARP → Instalar/actualizar warp**, que está siempre: es la fila
-que crea el binario, así que esconderla detrás de su propia ausencia la haría
-inaccesible justo cuando hace falta. «Reciclar WARP» se suma recién cuando hay un
-binario al cual pedirle la rotación. La lista se arma en cada entrada al menú, así
+—«Instalar / actualizar relay»— porque las demás sólo podrían fallar. Con Bun presente, «Instalar / actualizar relay» no aparece: npm ya trae el
+relay. Con un relay corriendo, «Instalar/actualizar warp» sí, aunque no haya
+binario de WARP todavía: esa fila es cómo se instala. «Reciclar WARP» se suma
+recién cuando hay un binario al cual pedirle la rotación. La lista se arma en cada entrada al menú, así
 que si instalás algo, la próxima vez está ahí.
 
 ### Dos nombres, no uno por versión
