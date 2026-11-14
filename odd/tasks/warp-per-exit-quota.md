@@ -604,3 +604,27 @@ Clean by verification: freshest-first rank order regardless of pool order, one a
 exit, park-before-next, zero enrollments in round 1, exactly one response per request,
 and legacy and warp-off shape-identical to baseline.
 
+L33 (delivery of the three fixes, verified by the parent: 288 pass / 0 fail, +92 in
+relay.mjs, no line of `swapWarpExit`, `waitForPoolReplacement`, `rotateWarp`,
+`resendAfterRotation` or `warpSwapDecision` modified):
+
+- **Fix 1, S28 now met on the paid path.** `resendWarpOnce` returns the resend's own
+  refusal (relay.mjs:2544) instead of `undefined`, so the delivered 429 carries the
+  resend's bytes and `retry-after`; the original stays the fallback only when the resend
+  produced no response, and a 4xx/5xx never replaces a 429 in hand.
+- **Fix 2, with the correction L32 got wrong.** The naming is not removed: it is narrowed.
+  `preferredExitForAttempt` names nothing only when every ladder candidate is parked
+  (relay.mjs:1671), because an address already in the ledger needs no attribution; in
+  every other case the fallback is untouched. Deleting it outright had broken two tests,
+  which is what proved the naming also sustains attribution.
+- **Fix 3, S22 closed.** Round 1 adopts only `<400`; a 5xx from the next exit is drained
+  and logged, and the refusal in hand is what the client receives (relay.mjs:2703).
+- **Nit closed.** Duplicate comment gone, `warpTerminal429s` counted at the delivered
+  response (relay.mjs:3085), proven with the resend switched off.
+
+Two deviations the worker chose, accepted here because both are the same rule applied
+consistently: a pool whose only choosable exits are all parked also names nothing, and a
+round-1 non-429 4xx is no longer adopted either. One honest note from the worker: in this
+tree the "unclean for another reason" leg cannot actually name anything, because the
+fallback is fed by choosable exits only — that test is a preserve case, not new behaviour.
+
