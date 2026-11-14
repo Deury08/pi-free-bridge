@@ -3110,24 +3110,6 @@ export function visibleMenuIndices(state: {
 }
 
 export default async function (pi: ExtensionAPI) {
-	// D11: the proxy dies on quit, and only when WARP is switched off. With WARP on
-	// it survives the session on purpose: the addresses and the enrollments are
-	// already paid for, and every parked entry keeps matching a live exit. A reload
-	// or a new session is not a quit — the proxy is left alone there.
-	try {
-		pi.on?.("session_shutdown", async (event: { reason?: string } | undefined) => {
-			try {
-				if (event?.reason !== "quit") return;
-				if (resolveWarpMode() !== "off") return;
-				await stopWarpFromMenu(resolveWarpTarget().healthUrl);
-			} catch {
-				// Shutdown must never hang or throw because of the proxy.
-			}
-		});
-	} catch {
-		// An older host without this event keeps the previous behaviour: the proxy
-		// simply outlives the session.
-	}
 	const g = globalThis as Record<symbol, unknown>;
 	if (g[REG_KEY]) return;
 
@@ -3537,12 +3519,13 @@ export default async function (pi: ExtensionAPI) {
 		}
 
 		writeBridgeConfig({ warpEnabled: chosen });
-		// D11: switching off is deliberately deferred. The proxy stays online for the
-		// rest of the session, so switching back on is instant and the pool keeps its
-		// addresses; it is stopped on quit instead (session_shutdown, reason quit).
+		// D11: nothing stops the proxy automatically. It is shared between sessions, so
+		// a session that quits cannot know whether another one is using it; the cost
+		// of leaving it alive is zero, and the cost of guessing wrong is another Pi's
+		// service. The only stop is an explicit act: replacing the binary.
 		const stopNote =
 			chosen === "off"
-				? " The proxy stays online until you quit; it is stopped then, so switching back on stays instant."
+				? " The proxy keeps running: nothing stops it automatically, and switching back on stays instant."
 				: "";
 		// relay-warp-hot-reload: no relay restart. The relay re-reads the config
 		// file on every request, so the new mode applies on the next request with
