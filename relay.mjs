@@ -1660,7 +1660,17 @@ async function preferredExitForAttempt(config, now) {
 	// S28: a pool whose every egress is parked is not a reason to leave the choice
 	// to the proxy — one final attempt goes through the last candidate in the
 	// ladder's own order, so a refusal is never synthesized from the ledger alone.
-	return terminalWarpExit(orderedWarpExits(entries, now));
+	//
+	// But naming buys ATTRIBUTION, and attribution buys nothing for an address the
+	// ledger already holds: every candidate is parked, so the park is already
+	// recorded. Naming one there spends a parked request before round 1 runs and
+	// pushes the terminal attempt off the last candidate (S27, S28), which is why
+	// the fully parked pool is the one case that names nothing: the free round's
+	// `clean.length === 0` branch takes that last candidate in the right order. A
+	// pool that is unclean for any OTHER reason keeps today's fallback untouched.
+	const ordered = orderedWarpExits(entries, now);
+	if (ordered.length > 0 && ordered.every((exit) => isEgressParked(quotaLedger, exit.ip, now))) return undefined;
+	return terminalWarpExit(ordered);
 }
 
 /** S4/S7: remember the address a 429 is attributable to. The attribution is the
@@ -2468,10 +2478,12 @@ async function waitForPoolReplacement(config, before, drained, client) {
 	}
 }
 
-/** S5: the one attempt a fresh exit buys. Returns the adopted response, or
- *  `undefined` when that exit refused as well, so the caller decides whether
- *  anything harder is still worth it and the original 429 is rebuilt once, in
- *  the only place that delivers it. */
+/** S5: the one attempt a fresh exit buys. Three answers: the adopted response
+ *  (`{ egress, response }`), the fresh exit's own 429 as `{ refused }` — S28's
+ *  last real refusal, whose `retry-after` is the only number the client can act
+ *  on — or `undefined` when that attempt produced no response at all, or one
+ *  that must not replace the 429 already in hand. The caller decides what is
+ *  worth trying next; the original 429 stays the fallback either way. */
 async function resendWarpOnce(config, pathname, body, original, via) {
 	// S6: the same window, on the resend. After a swap the tunnel is a NEW exit,
 	// so the map relearns from this attempt instead of keeping the id that was
@@ -2497,17 +2509,39 @@ async function resendWarpOnce(config, pathname, body, original, via) {
 		return { egress: "warp", response: attempt };
 	}
 
-	await attempt.arrayBuffer(); // drain for connection reuse
 	// A 429 from the fresh exit is exit evidence like any other warp 429, so the
 	// same helper the loop uses must count it; otherwise a second burnt exit
 	// under-reports the streak and the next burst rotates late.
 	warp429Streak = bumpWarp429Streak(warp429Streak, attempt.status, "warp");
-	if (attempt.status === 429) await noteWarpAttribution(config, before);
+	if (attempt.status !== 429) {
+		// Not a refusal of the same kind: a 4xx/5xx from the fresh exit is never
+		// handed to the client in place of the 429, so the original stays the
+		// fallback.
+		await attempt.arrayBuffer(); // drain for connection reuse
+		process.stderr.write(
+			`pi-free-bridge relay: warp resend after ${via} got ${attempt.status} — delivering the original ${original.status}\n`,
+		);
+		logWarpEvent("resend_refused", { status: attempt.status, delivered: original.status, via });
+		return undefined;
+	}
+	await noteWarpAttribution(config, before);
+	// S28: the resend's own 429 IS the last real refusal, so its bytes and its
+	// `retry-after` are what the client must get. It comes back in the original's
+	// shape, so it is delivered by the one place that rebuilds a 429
+	// (`rebuildOriginal`) — and a rotation that never confirms delivers THIS
+	// window instead of the one round 1 measured.
+	const refused = {
+		status: attempt.status,
+		contentType: attempt.headers.get("content-type"),
+		retryAfter: attempt.headers.get("retry-after"),
+		retryAfterMs: parkDurationMs(attempt.headers.get("retry-after")),
+		body: Buffer.from(await attempt.arrayBuffer()),
+	};
 	process.stderr.write(
-		`pi-free-bridge relay: warp resend after ${via} got ${attempt.status} — delivering the original ${original.status}\n`,
+		`pi-free-bridge relay: warp resend after ${via} got 429 — it is the refusal the client gets\n`,
 	);
-	logWarpEvent("resend_refused", { status: attempt.status, delivered: original.status, via });
-	return undefined;
+	logWarpEvent("resend_refused", { status: attempt.status, via });
+	return { refused };
 }
 
 export async function resendAfterRotation(config, pathname, body, original, client) {
@@ -2518,7 +2552,12 @@ export async function resendAfterRotation(config, pathname, body, original, clie
 		logWarpEvent("resend_skipped", { reason: "rotation_not_confirmed" });
 		return rebuildOriginal(original);
 	}
-	return (await resendWarpOnce(config, pathname, body, original, "rotation")) ?? rebuildOriginal(original);
+	const resend = await resendWarpOnce(config, pathname, body, original, "rotation");
+	if (!resend) return rebuildOriginal(original);
+	// S28: the rotation's resend is the LAST attempt of the episode, so its own
+	// refusal is what the client gets — never a window measured before it ran.
+	if (resend.refused) return { egress: "warp", response: rebuildOriginal(resend.refused).response };
+	return resend;
 }
 
 /** Pure: how many exits could serve new work in this snapshot. The pool's own
@@ -2658,9 +2697,20 @@ async function freeRoundAttempt(config, pathname, body, exit) {
 		return undefined;
 	}
 	warp429Streak = bumpWarp429Streak(warp429Streak, response.status, "warp");
-	if (response.status !== 429) {
+	// S22: only a SUCCESS is adopted. A 5xx from the next exit is a failed
+	// attempt, not an answer: adopting it would replace the 429 already in hand
+	// with a burnt exit's error, and the client can act on the refusal only.
+	if (response.status < 400) {
 		logWarpEvent("free_round_delivered", { exit: exit.id, status: response.status });
 		return { delivered: response };
+	}
+	if (response.status !== 429) {
+		await response.arrayBuffer(); // drain for connection reuse
+		process.stderr.write(
+			`pi-free-bridge relay: warp attempt on ${exit.id} answered ${response.status} — not adopted\n`,
+		);
+		logWarpEvent("free_round_error", { exit: exit.id, status: response.status });
+		return undefined;
 	}
 	// S4/S7: the attempt carried this exit's credential, so an attributable 429
 	// names the address that served it — parked before the next candidate runs.
@@ -2794,7 +2844,13 @@ export async function recoverWarp429(config, pathname, body, original, client) {
 		}
 		logWarpEvent("swap_wait_ok", { exit: drainedExit, newExit: replaced.newExit, usable: replaced.usable });
 		const attempt = await resendWarpOnce(config, pathname, body, original, "swap");
-		if (attempt) return attempt;
+		if (attempt && attempt.refused) {
+			// S28: the swap's resend refused too, so it is now the newest refusal the
+			// ladder holds. A rotation that cannot confirm delivers THIS window.
+			original = attempt.refused;
+		} else if (attempt) {
+			return attempt;
+		}
 		return resendAfterRotation(config, pathname, body, original, client);
 	}
 	return resendAfterRotation(config, pathname, body, original, client);
@@ -3021,10 +3077,12 @@ export async function forward(req, res, pathname, config) {
 			// No egress means the original 429 was handed back, so it keeps the
 			// egress that produced it.
 			if (resend.egress) egressUsed = resend.egress;
-			// S23: one terminal 429 per request, counted where it is decided, so a
-			// ladder that ends in a refusal is visible in the same place the ledger is.
-			if (response.status === 429) warpTerminal429s += 1;
 		}
+		// S23: one terminal 429 per request, counted on the response the CLIENT
+		// actually gets, so a request that ends in a refusal is visible here whether
+		// it went through the ladder, fell back to the original, or never ran the
+		// ladder at all (a legacy proxy, or the resend switched off).
+		if (response && response.status === 429) warpTerminal429s += 1;
 
 		// Count this response for as long as it is being delivered over warp. A
 		// rotation would kill it, and it already passed the gate, so it is exactly
@@ -3244,8 +3302,6 @@ export async function handle(req, res, config) {
 			// burning requests or ending in refusals is readable here.
 			warpCrossExitAttempts: warpCrossExitAttempts,
 			warpTerminal429s: warpTerminal429s,
-			// S23: the free round and its terminal 429, so a ladder that is quietly
-			// burning requests or ending in refusals is readable here.
 			warpSwapEnabled: warpSwapEnabledOverride ? WARP_SWAP_ENABLED : false,
 			warpSwapUnsupported: warpSwapUnsupported,
 			warpSwapInFlight: warpSwapInFlight,
