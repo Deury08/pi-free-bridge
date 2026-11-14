@@ -5079,8 +5079,47 @@ test("quotaLedgerHealth: the two numbers /health publishes (S12)", () => {
 			},
 		}),
 	);
-	assert.deepEqual(quotaLedgerHealth(ledger, LEDGER_NOW), { parked: 2, nearestResetInMs: 30_000 });
-	assert.deepEqual(quotaLedgerHealth(parseQuotaLedger(""), LEDGER_NOW), { parked: 0, nearestResetInMs: 0 });
+	// D14: the same two numbers must survive the pool argument being absent.
+	assert.deepEqual(quotaLedgerHealth(ledger, undefined, LEDGER_NOW), {
+		parked: 2,
+		parkedLive: null,
+		nearestResetInMs: 30_000,
+	});
+	assert.deepEqual(quotaLedgerHealth(parseQuotaLedger(""), undefined, LEDGER_NOW), {
+		parked: 0,
+		parkedLive: null,
+		nearestResetInMs: 0,
+	});
+});
+
+// D14: a park is a guard, not a tombstone — a burnt address still protects a
+// live exit if the address came back. So nothing is pruned; the health line only
+// says how many of the guards can fire against the pool as it stands right now.
+const D14_LEDGER = parseQuotaLedger(
+	JSON.stringify({
+		version: 1,
+		egresses: {
+			[V4_A]: { parked_until: LEDGER_NOW + 90_000, exit_id: "warp-a" },
+			[V4_B]: { parked_until: LEDGER_NOW + 30_000, exit_id: "warp-gone" },
+			[LOCAL_EGRESS_KEY]: { parked_until: LEDGER_NOW + 60_000 },
+		},
+	}),
+);
+
+test("quotaLedgerHealth: parkedLive counts the guards whose exit is still in the pool (D14)", () => {
+	const health = quotaLedgerHealth(D14_LEDGER, [{ id: "warp-a" }, { id: "warp-b" }], LEDGER_NOW);
+	assert.equal(health.parked, 3);
+	assert.equal(health.parkedLive, 1, "two of the three guards name an exit that is not in the pool");
+});
+
+test("quotaLedgerHealth: a pool that did not answer says null, never zero (D14)", () => {
+	assert.equal(quotaLedgerHealth(D14_LEDGER, undefined, LEDGER_NOW).parkedLive, null);
+});
+
+test("quotaLedgerHealth: a pool that answered with no exits says zero, which is not null (D14)", () => {
+	const parkedBefore = JSON.stringify(D14_LEDGER);
+	assert.equal(quotaLedgerHealth(D14_LEDGER, [], LEDGER_NOW).parkedLive, 0);
+	assert.equal(JSON.stringify(D14_LEDGER), parkedBefore, "reading health must not mutate the ledger");
 });
 
 test("proxyUrlWithExit: the exit id rides as the credential, empty password (S3, L5)", () => {
@@ -5453,8 +5492,16 @@ test("/health reports the ledger and keeps preferredRouting false (S12)", async 
 			});
 			const body = JSON.parse(res.body());
 
-			assert.deepEqual(Object.keys(body.quotaLedger).sort(), ["nearestResetInMs", "parked", "path"]);
+			assert.deepEqual(Object.keys(body.quotaLedger).sort(), [
+				"nearestResetInMs",
+				"parked",
+				"parkedLive",
+				"path",
+			]);
 			assert.equal(body.quotaLedger.parked, 2);
+			// D14: with warp off there is no pool to ask, so the guard count is
+			// null — an unanswered pool is not an empty one.
+			assert.equal(body.quotaLedger.parkedLive, null);
 			assert.ok(
 				body.quotaLedger.nearestResetInMs > 0 && body.quotaLedger.nearestResetInMs <= 60_000,
 				`nearest reset ${body.quotaLedger.nearestResetInMs}ms`,
@@ -6429,3 +6476,4 @@ test("every file download in index.ts streams through readDownloadBody", () => {
 		"both install sites report progress",
 	);
 });
+

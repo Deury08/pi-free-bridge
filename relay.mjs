@@ -1301,13 +1301,30 @@ export function nearestQuotaReset(ledger, now = Date.now()) {
 
 /** Pure: what `/health` publishes about the ledger. `nearestResetInMs` is a
  *  remaining window, like `localParkedForMs`, because that is the number a human
- *  reads; 0 means nothing is parked (S12). */
-export function quotaLedgerHealth(ledger, now = Date.now()) {
-	const parked = Object.values(ledger && ledger.egresses ? ledger.egresses : {}).filter(
+ *  reads; 0 means nothing is parked (S12).
+ *
+ *  D14: a park is a guard, not a tombstone. A restart hands the pool new egress
+ *  addresses, so an entry can name an exit that is gone — but addresses are
+ *  reused, so that entry still protects the address if it comes back, and it is
+ *  never pruned. What the count alone cannot say is how many guards can fire
+ *  against the pool as it stands, so `parkedLive` says exactly that. `null` when
+ *  the pool did not answer, because not knowing is not the same as knowing there
+ *  are none; an empty pool answers with 0. */
+export function quotaLedgerHealth(ledger, exits, now = Date.now()) {
+	const parkedEntries = Object.values(ledger && ledger.egresses ? ledger.egresses : {}).filter(
 		(entry) => entry && typeof entry.parked_until === "number" && entry.parked_until > now,
-	).length;
+	);
 	const reset = nearestQuotaReset(ledger, now);
-	return { parked, nearestResetInMs: reset > 0 ? Math.max(0, reset - now) : 0 };
+	let parkedLive = null;
+	if (Array.isArray(exits)) {
+		const live = new Set(exits.map((exit) => exit && exit.id).filter(Boolean));
+		parkedLive = parkedEntries.filter((entry) => live.has(entry.exit_id)).length;
+	}
+	return {
+		parked: parkedEntries.length,
+		parkedLive,
+		nearestResetInMs: reset > 0 ? Math.max(0, reset - now) : 0,
+	};
 }
 
 /** Pure: the proxy URL that names one exit. The credential is the only channel
@@ -3314,7 +3331,9 @@ export async function handle(req, res, config) {
 			// S12: the ledger in one glance — how many egresses are parked right now,
 			// how long until the nearest one frees up, and the file it lives in.
 			quotaLedger: {
-				...quotaLedgerHealth(quotaLedger, Date.now()),
+				// D14: the pool as it stands, so the count can say how many parks
+				// still correspond to a live exit. Undefined leaves it null.
+				...quotaLedgerHealth(quotaLedger, exitsDetail, Date.now()),
 				path: activeQuotaLedgerPath(),
 			},
 			// S11: what the proxy can actually answer. `legacy` means it has no
