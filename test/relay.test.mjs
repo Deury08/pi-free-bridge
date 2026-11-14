@@ -3936,7 +3936,7 @@ test("the installed binary keeps its plain name; the previous one is .prev (S1)"
 	assert.equal(String(current) + ".prev", "/opt/bin/relay-linux-x64.prev");
 });
 
-test("the extension registers exactly three commands, no aliases, no argument form", async () => {
+test("the extension registers exactly four commands, no aliases, no argument form", async () => {
 	// The catalog fetch is skipped so this test never depends on the network.
 	process.env.PI_FREE_BRIDGE_SKIP_CATALOG = "1";
 	// S1: the whole point of the change is the autocomplete list, so the list
@@ -3954,7 +3954,7 @@ test("the extension registers exactly three commands, no aliases, no argument fo
 
 	assert.deepEqual(
 		registered.map((entry) => entry.name),
-		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-warp-update", "free-bridge-doctor"],
 	);
 
 	const menu = registered.find((entry) => entry.name === "free-bridge");
@@ -4022,9 +4022,62 @@ test("commands register even when model discovery finds nothing at all", () => {
 
 	assert.deepEqual(
 		registered,
-		["free-bridge", "free-bridge-warp-recycle", "free-bridge-doctor"],
+		["free-bridge", "free-bridge-warp-recycle", "free-bridge-warp-update", "free-bridge-doctor"],
 		"zero models must not cost the user the menu",
 	);
+});
+
+test("free-bridge-warp-update says what it does and refuses to run blind", (t) => {
+	// The command is the one entry point that replaces the proxy binary, so its
+	// autocomplete line has to name the release it fetches and the stop it costs.
+	// Asserted through the registration a fake `pi` captures, never a source grep:
+	// this is exactly what Pi shows when the user types `/free-bridge`. A child
+	// process is used because the factory guards double registration on
+	// globalThis, so the in-process test above already consumed it.
+	const home = mkdtempSync(join(tmpdir(), "pfb-warp-update-"));
+	t.after(() => rmSync(home, { recursive: true, force: true }));
+	const marker = "@@WARP-UPDATE@@";
+	const script = `
+		const { default: factory } = await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});
+		const commands = {};
+		await factory({
+			registerCommand: (name, options) => { commands[name] = options; },
+			registerProvider: () => {},
+			registerTool: () => {},
+			on: () => {},
+			config: {},
+			ui: { notify() {} },
+		});
+		const seen = [];
+		const ctx = { hasUI: false, ui: { notify: (text, kind) => seen.push({ text, kind }) } };
+		await commands["free-bridge-warp-update"].handler("", ctx);
+		process.stdout.write(${JSON.stringify("\n" + marker)} + JSON.stringify({
+			names: Object.keys(commands),
+			description: commands["free-bridge-warp-update"].description,
+			hasHandler: typeof commands["free-bridge-warp-update"].handler === "function",
+			seen,
+		}));
+	`;
+	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+		env: { ...process.env, HOME: home, USERPROFILE: home, PI_FREE_BRIDGE_DRY_RUN: "1", PI_FREE_BRIDGE_SKIP_CATALOG: "1" },
+		encoding: "utf-8",
+	});
+	const captured = JSON.parse(output.slice(output.indexOf(marker) + marker.length));
+
+	assert.equal(captured.names.includes("free-bridge-warp-update"), true, "the update command is registered");
+	assert.equal(
+		captured.description,
+		"Update warp-minimal to the latest release — the only command that stops the proxy to replace its binary",
+	);
+	assert.equal(captured.hasHandler, true, "the command is actually runnable");
+
+	// Without a UI nobody can read the cost or answer the confirmation, so the
+	// handler must refuse and say why instead of stopping the proxy blind.
+	assert.equal(captured.seen.length, 1, "the refusal answers exactly once");
+	assert.equal(captured.seen[0].kind, "warning");
+	assert.match(captured.seen[0].text, /STOPS the proxy/, "it says the stop it would cost");
+	assert.match(captured.seen[0].text, /no UI to ask in/, "it names the reason it cannot ask");
+	assert.match(captured.seen[0].text, /free-bridge-warp-update from an interactive Pi/, "and where to run it instead");
 });
 
 test("the install item exists only for machines without Bun", () => {

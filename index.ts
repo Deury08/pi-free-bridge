@@ -2304,10 +2304,19 @@ async function findWarpAsset(): Promise<{ tag: string; url: string; name: string
  *  undefined with the failure logged. `status` reports each stage to Pi's
  *  notifications (ctx.ui.notify). Extraction uses the system `tar`
  *  (bsdtar), which ships with Windows 10+, macOS and Linux and handles the
- *  zip archives too. */
+ *  zip archives too.
+ *
+ *  `stage` is for the update path, and it is not a convenience: a proxy that is
+ *  already running executes the file at the canonical name, so writing the new
+ *  bytes over it either fails (Windows will not replace a running image) or
+ *  destroys the only known-good rollback source (elsewhere). Staging leaves the
+ *  verified bytes under a third name beside `current` and `current.prev`, and
+ *  the swap renames them into place after the proxy stopped. Same volume by
+ *  construction, so the rename never has to copy. */
 async function installWarpBinary(
 	asset: { tag: string; url: string; name: string; size: number },
 	status?: (message: string) => void,
+	options: { stage?: boolean } = {},
 ): Promise<string | undefined> {
 	const tmpDir = mkdtempSync(join(tmpdir(), "pfb-warp-"));
 	try {
@@ -2354,7 +2363,11 @@ async function installWarpBinary(
 			return undefined;
 		}
 
-		status?.(`Installing to ${WARP_INSTALL_DIR}…`);
+		status?.(
+			options.stage
+				? `Staging the verified binary in ${WARP_INSTALL_DIR}…`
+				: `Installing to ${WARP_INSTALL_DIR}…`,
+		);
 		mkdirSync(WARP_INSTALL_DIR, { recursive: true });
 		const { execFileSync } = await import("node:child_process");
 		// bsdtar handles the zip archives; GNU tar in a Git-Bash PATH does not.
@@ -2383,10 +2396,12 @@ async function installWarpBinary(
 			console.error(`pi-free-bridge: did not find ${exeName} inside ${asset.name}`);
 			return undefined;
 		}
-		const target = join(WARP_INSTALL_DIR, exeName);
+		const target = options.stage ? `${join(WARP_INSTALL_DIR, exeName)}.tmp` : join(WARP_INSTALL_DIR, exeName);
+		if (options.stage) rmSync(target, { force: true });
 		copyFileSync(extracted, target);
 		if (process.platform !== "win32") chmodSync(target, 0o755);
-		writeBridgeConfig({ warpBin: target });
+		// The config names the binary that runs; a staged file is not it yet.
+		if (!options.stage) writeBridgeConfig({ warpBin: target });
 		return target;
 	} catch (err) {
 		const message = `warp-minimal install failed: ${(err as Error).message}`;
@@ -3566,6 +3581,227 @@ export default async function (pi: ExtensionAPI) {
 		ctx.ui.notify(lines.join("\n"), body.ok ? "info" : "error");
 	}
 
+	/** The one command that updates warp-minimal — and therefore the only path
+	 *  that stops the proxy to replace its binary. The decision, the consent order
+	 *  and the rollback live in `updateWarpBinary` and `swapRelayBinary`; this body
+	 *  supplies their real deps and turns the outcome into one message per status.
+	 *
+	 *  Two refusals come first, because both would cost more than saying no: a
+	 *  session with no UI cannot show the cost before stopping the proxy, and a
+	 *  proxy started from a path outside WARP_INSTALL_DIR keeps executing bytes
+	 *  this command would never replace. */
+	async function runWarpUpdate(ctx: MenuCtx): Promise<void> {
+		if (!ctx.hasUI) {
+			ctx.ui.notify(
+				[
+					"pi-free-bridge: this command replaces the proxy binary, and replacing it",
+					"STOPS the proxy on purpose: the file is swapped underneath the process",
+					"that is serving right now. That needs a confirmation, and this session has",
+					"no UI to ask in.",
+					"",
+					"Run /free-bridge-warp-update from an interactive Pi session.",
+				].join("\n"),
+				"warning",
+			);
+			return;
+		}
+
+		const target = resolveWarpTarget();
+		const exeName = process.platform === "win32" ? "warp-minimal.exe" : "warp-minimal";
+		const binPath = warpInstallPath();
+		const runningBin = resolveWarpBin();
+		const sameDir = (left: string, right: string): boolean =>
+			left.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() ===
+			right.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+		if (runningBin && !sameDir(dirname(runningBin), WARP_INSTALL_DIR)) {
+			ctx.ui.notify(
+				[
+					"pi-free-bridge warp update",
+					`  runs from: ${runningBin}`,
+					`  replaces:  ${binPath}`,
+					"",
+					"The running proxy is not the binary this command owns, so swapping the file",
+					"here would leave the old process serving the old build. Point warpBin (in",
+					`${BRIDGE_CONFIG_PATH}) or PI_FREE_BRIDGE_WARP_BIN at ${binPath}, then run it again.`,
+				].join("\n"),
+				"warning",
+			);
+			return;
+		}
+
+		// Facts the outcome message needs and `UpdateWarpBinaryResult` cannot carry:
+		// whether the swap was even reached, whether the proxy stopped, and whether
+		// the new binary landed. Each one changes what "the old binary" means.
+		let asset: { tag: string; url: string; name: string; size: number } | undefined;
+		let staged: string | undefined;
+		let swapAttempted = false;
+		let stoppedForSwap: boolean | undefined;
+		let swapOk = false;
+
+		const proxyHealth = async (): Promise<unknown> => {
+			try {
+				const res = await fetch(target.healthUrl, { signal: AbortSignal.timeout(1500) });
+				return res.ok ? await res.json() : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+		const timeoutSeconds = Math.round(RELAY_SWAP_TIMEOUT_MS / 1000);
+
+		/** Where the old binary stands after an attempt that installed no verified
+		 *  build. Never a bare verdict: every branch names a file. */
+		const restoreNote = (): string[] => {
+			if (!swapAttempted) return [`  nothing was swapped: ${binPath} is the binary it already was.`];
+			if (stoppedForSwap === false) return [`  the proxy could not be stopped, so ${binPath} was not replaced.`];
+			if (swapOk) return [`  the new binary is at ${binPath}; the previous one is kept as ${binPath}.prev.`];
+			return [`  the previous binary was not restored: ${binPath} does not hold it.`];
+		};
+
+		let result: UpdateWarpBinaryResult | undefined;
+		let thrown: string | undefined;
+		try {
+			result = await updateWarpBinary({
+				latestTag: async () => {
+					asset = await findWarpAsset();
+					return asset?.tag ?? null;
+				},
+				installedRecord: () => {
+					const record = readWarpInstallRecord();
+					return record ? { tag: record.tag, commit: record.commit } : undefined;
+				},
+				confirm: async () => {
+					const lines = [
+						`${asset?.tag ?? "the latest release"} — warp-minimal from github.com/Deury08/warp-minimal`,
+						`  installs to ${binPath}`,
+						"  the published sha256 is verified before anything is executed",
+						"",
+						"This is the only path that stops the proxy: the binary is replaced",
+						"underneath the process serving right now, and it stays down until the",
+						"new one answers /health.",
+						"",
+						...warpUpdateCostLines(),
+					];
+					return ctx.ui.confirm("pi-free-bridge: update warp-minimal", lines.join("\n"));
+				},
+				download: async () => {
+					// One release read for the whole update: the tag the decision used and
+					// the asset that is downloaded must be the same release.
+					const release = asset ?? (await findWarpAsset());
+					if (!release) return undefined;
+					staged = await installWarpBinary(release, (message) => ctx.ui.notify(message, "info"), {
+						stage: true,
+					});
+					return staged;
+				},
+				swap: async (downloaded, tag) => {
+					swapAttempted = true;
+					const swapped = await swapRelayBinary({
+						dir: WARP_INSTALL_DIR,
+						name: exeName,
+						downloaded,
+						version: String(tag).replace(/^v/, "") || "unknown",
+						timeoutMs: RELAY_SWAP_TIMEOUT_MS,
+						stopRelay: async () => {
+							stoppedForSwap = await warpStopForSwap(target.healthUrl);
+							return stoppedForSwap;
+						},
+						startRelay: () =>
+							warpStartAndVerify({
+								start: () => ensureWarp(),
+								probe: proxyHealth,
+								sleep: (ms) => new Promise<void>((done) => setTimeout(done, ms)),
+							}),
+						askContinue: async () => {
+							if (!ctx.hasUI) return "none";
+							const wait = await ctx.ui.confirm(
+								"pi-free-bridge: the new proxy did not answer",
+								[
+									`The new warp-minimal is installed but did not answer /health in ${timeoutSeconds}s.`,
+									`  target: ${target.healthUrl}`,
+									"",
+									`Wait the same ${timeoutSeconds}s again, or go back to the previous binary?`,
+									"If you do not answer, the previous binary comes back on its own.",
+								].join("\n"),
+							);
+							return wait ? "wait" : "rollback";
+						},
+					});
+					swapOk = swapped.ok;
+					return { ok: swapped.ok, rolledBack: swapped.rolledBack, reason: swapped.reason };
+				},
+				readRunningCommit: async () => {
+					const body = (await proxyHealth()) as { build?: { commit?: unknown } } | undefined;
+					const commit = body?.build && typeof body.build.commit === "string" ? body.build.commit.trim() : "";
+					return commit && commit !== "unknown" ? commit : null;
+				},
+				writeRecord: ({ tag, commit }) => writeWarpInstallRecord({ tag, commit }),
+			});
+		} catch (err) {
+			thrown = (err as Error)?.message || String(err);
+		} finally {
+			// A staged download is either renamed into place by the swap or left behind
+			// by a swap that never ran; it must not linger as a third name.
+			if (staged) {
+				try {
+					rmSync(staged, { force: true });
+				} catch {
+					// A leftover staged file costs disk, not correctness.
+				}
+			}
+		}
+
+		const lines = ["pi-free-bridge warp update", `  target:  ${describeWarpTarget(target)}`];
+
+		if (!result) {
+			lines.push(`  the update stopped on an error: ${thrown ?? "no result was reported"}.`, ...restoreNote());
+			ctx.ui.notify(lines.join("\n"), "error");
+			return;
+		}
+
+		switch (result.status) {
+			case "up-to-date":
+				lines.push(
+					`  ${result.tag} is already the release this extension installed${
+						result.commit ? ` (commit ${result.commit})` : ""
+					}: nothing was downloaded.`,
+				);
+				break;
+			case "unknown":
+				lines.push(
+					"  the Deury08/warp-minimal release could not be read, so nothing was",
+					"  downloaded and nothing was touched: the proxy keeps the binary it has.",
+					"  Run this command again once GitHub answers.",
+				);
+				break;
+			case "declined":
+				lines.push("  you answered no: nothing was downloaded and nothing was stopped.");
+				break;
+			case "updated":
+				lines.push(
+					`  ${result.tag} is installed, and ${target.healthUrl} answers /health`,
+					`  with commit ${result.commit}: this extension recorded what now runs.`,
+				);
+				break;
+			case "rolled-back":
+				lines.push(
+					`  the new build did not prove itself: ${result.reason}.`,
+					`  the previous binary was put back at ${binPath}; the build that failed was deleted.`,
+				);
+				break;
+			case "failed":
+				lines.push(`  ${result.reason}.`, ...restoreNote());
+				break;
+		}
+
+		const level =
+			result.status === "failed"
+				? "error"
+				: result.status === "unknown" || result.status === "rolled-back"
+					? "warning"
+					: "info";
+		ctx.ui.notify(lines.join("\n"), level);
+	}
+
 	/** Menu item 2: what the relay is doing right now. */
 	async function showRelayStatus(ctx: MenuCtx): Promise<void> {
 		const health = await fetchRelayHealth(RELAY_PORT);
@@ -3870,6 +4106,14 @@ export default async function (pi: ExtensionAPI) {
 			"Rotate the WARP exit right now — manual recovery when a 429 keeps killing turns",
 		handler: async (_args: string, ctx) => {
 			await runWarpRecycle(ctx as MenuCtx);
+		},
+	});
+
+	pi.registerCommand("free-bridge-warp-update", {
+		description:
+			"Update warp-minimal to the latest release — the only command that stops the proxy to replace its binary",
+		handler: async (_args: string, ctx) => {
+			await runWarpUpdate(ctx as MenuCtx);
 		},
 	});
 
