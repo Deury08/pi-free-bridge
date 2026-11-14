@@ -33,7 +33,7 @@ actualizaciones del relay viajan con npm — la misma instalación que actualiza
 extensión:
 
 ```bash
-pi install npm:pi-free-bridge@0.6.0
+pi install npm:pi-free-bridge@0.7.0
 ```
 
 Un binario compilado, en cambio, npm nunca lo toca: se actualiza sólo desde el
@@ -73,7 +73,7 @@ pi install npm:pi-free-bridge
 > explícita:
 >
 > ```bash
-> pi install npm:pi-free-bridge@0.6.0
+> pi install npm:pi-free-bridge@0.7.0
 > ```
 >
 > Una instalación nueva, sin lockfile, resuelve `latest` sin problema.
