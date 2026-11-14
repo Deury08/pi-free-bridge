@@ -24,6 +24,22 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+// The suite must never reach the live relay or proxy: a test whose result depends on
+// a service running on this machine is flaky by construction, and it also pokes
+// production. Any test that tries now fails loudly with the address it tried.
+{
+	const inner = globalThis.fetch;
+	globalThis.fetch = (input, init) => {
+		const url = String(typeof input === "string" ? input : (input?.url ?? input));
+		if (/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]):(8788|8789)\b/.test(url)) {
+			throw new Error(
+				`the test suite tried to reach the live service at ${url}; stub fetch in this test instead`,
+			);
+		}
+		return inner(input, init);
+	};
+}
+
 import {
 	basicAuthFor,
 	catalogPrice,
@@ -42,6 +58,27 @@ import {
 	resolveSessionFromStore,
 	toUpstreamUrl,
 } from "../relay.mjs";
+
+// ---------------------------------------------------------------------------
+// The live-service guard
+// ---------------------------------------------------------------------------
+// The guard above is this file's regression test: it must fire on every live
+// relay/proxy address and pass every other URL straight through. Asserted here
+// so a later edit cannot quietly soften it.
+test("guard: the suite refuses to reach a live relay or proxy port", () => {
+	for (const url of [
+		"http://127.0.0.1:8788/health",
+		"http://localhost:8789/health",
+		"http://[::1]:8789/api/session",
+	]) {
+		assert.throws(
+			() => globalThis.fetch(url),
+			new Error(
+				`the test suite tried to reach the live service at ${url}; stub fetch in this test instead`,
+			),
+		);
+	}
+});
 
 // ---------------------------------------------------------------------------
 // ensureEnvBlock (S21)

@@ -51,6 +51,10 @@ supuesto es la mitad del contenido.
     - [3. Comprobá que está vivo](#3-comprobá-que-está-vivo)
     - [Opciones](#opciones)
     - [Lo que este ejecutable NO hace](#lo-que-este-ejecutable-no-hace)
+13. [Los dos planos](dos-planos.md)
+14. [El ledger por IP](ledger-por-ip.md)
+15. [La escalera del 429](escalera-429.md)
+16. [Comandos](comandos.md)
 
 ## Cómo arranca el relay
 
@@ -592,7 +596,7 @@ Todo lo que expone el puente en un solo lugar. Elegí por síntoma: ver
 
 ### Dentro de una sesión de Pi (slash commands)
 
-Sólo quedan **tres comandos registrados**. Todo lo demás vive en un menú,
+Sólo quedan **cuatro comandos registrados**. Todo lo demás vive en un menú,
 porque cada comando registrado ocupa una línea del autocompletado — y los
 alias también aparecen ahí, así que no son una salida.
 
