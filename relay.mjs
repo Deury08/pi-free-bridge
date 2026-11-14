@@ -1001,6 +1001,15 @@ let warpRecycleInFlight = false;
 let warpRecycleUnavailableWarned = false;
 let warpSwapInFlight = false;
 let warpSwaps = 0;
+// S23: the ladder has to be visible, or a rung that quietly spends enrollments
+// looks exactly like a request that worked. `warpCrossExitAttempts` counts the
+// round-1 attempts made on an exit other than the one that already refused (the
+// free rung, which costs no enrollment) and `warpTerminal429s` counts the
+// requests that ended with a 429 delivered to the client after the ladder ran.
+// Round 2's rotations/spends are already published: `warpRecycles` and
+// `warpSwaps`.
+let warpCrossExitAttempts = 0;
+let warpTerminal429s = 0;
 // The proxy answered that it has no /swap at all — an older binary, or one
 // running the WireGuard stack, where the route is a 501. Nothing about the exit
 // is wrong in that case, so retrying would be a routine for the life of the
@@ -1645,7 +1654,13 @@ export async function readWarpExitsDetail(config, now = Date.now()) {
  *  a preference nothing honours (S11). */
 async function preferredExitForAttempt(config, now) {
 	if ((await warpExitsCapability(config, now)) !== "structured") return undefined;
-	return preferredWarpExit(await readWarpExitsDetail(config, now), quotaLedger, now);
+	const entries = await readWarpExitsDetail(config, now);
+	const clean = preferredWarpExit(entries, quotaLedger, now);
+	if (clean) return clean;
+	// S28: a pool whose every egress is parked is not a reason to leave the choice
+	// to the proxy — one final attempt goes through the last candidate in the
+	// ladder's own order, so a refusal is never synthesized from the ledger alone.
+	return terminalWarpExit(orderedWarpExits(entries, now));
 }
 
 /** S4/S7: remember the address a 429 is attributable to. The attribution is the
@@ -1912,6 +1927,8 @@ export function resetWarpStateForTests() {
 	warpResends = 0;
 	warpSwapInFlight = false;
 	warpSwaps = 0;
+	warpCrossExitAttempts = 0;
+	warpTerminal429s = 0;
 	warpSwapUnsupported = false;
 	warpSwapUnsupportedWarned = false;
 	warpSwapStrandedStreak = 0;
@@ -1936,6 +1953,8 @@ export function warpStateForTests() {
 		warpRecycles,
 		warpResends,
 		warpSwaps,
+		warpCrossExitAttempts,
+		warpTerminal429s,
 		warpSwapInFlight,
 		warpSwapUnsupported,
 		tunnelExit,
@@ -2381,12 +2400,14 @@ export async function swapWarpExit(config, exitId, client) {
  *  delivered and the egress that delivered it; `egress` is undefined when the
  *  original comes back, because then the original's own egress still stands. */
 function rebuildOriginal(original) {
+	const headers = {};
+	if (original.contentType) headers["content-type"] = original.contentType;
+	// S22: the delivered 429 is byte-exact WITH its `retry-after`, because that
+	// header is the only number the client can act on.
+	if (original.retryAfter) headers["retry-after"] = original.retryAfter;
 	return {
 		egress: undefined,
-		response: new Response(original.body, {
-			status: original.status,
-			headers: original.contentType ? { "content-type": original.contentType } : {},
-		}),
+		response: new Response(original.body, { status: original.status, headers }),
 	};
 }
 
@@ -2563,6 +2584,133 @@ function judgeStrandedWarpSwap(snapshot) {
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Round 1: the free round, and the one terminal attempt (S20, S27, S28)
+// ---------------------------------------------------------------------------
+//
+// An enrollment is the one thing the proxy cannot give back: `POST /swap`
+// re-registers a device and `POST /recycle` does it for every exit. Round 1
+// therefore spends nothing — it attempts the exits the pool ALREADY has, one
+// request each, in the order `chooseWarpExit` ranks them, and every attributable
+// 429 parks that egress (S4, S7) before the next candidate is tried. A parked
+// egress is skipped, not attempted (S27): the ledger exists to avoid the burnt
+// addresses, not to rediscover them.
+//
+// When nothing clean is left there is still exactly ONE attempt, through the
+// last candidate in that same order, because a refusal is never synthesized
+// from the ledger alone (S28). It ends the ladder for the request: whatever it
+// answers is delivered byte-exact, and nothing retries after that delivery.
+
+/** Pure: every eligible exit, freshest address first — the ranking
+ *  `chooseWarpExit` already applies, and the order the whole ladder uses. */
+function orderedWarpExits(entries, now) {
+	return (Array.isArray(entries) ? entries : [])
+		.filter((entry) => isWarpExitChoosable(entry, now))
+		.sort((a, b) => b.observed_at - a.observed_at);
+}
+
+/** Pure: the candidate the terminal attempt goes through (S28) — the LAST exit of
+ *  the ladder's own order, so the final request is spent on the one it would have
+ *  tried last anyway. */
+function terminalWarpExit(ordered) {
+	return ordered[ordered.length - 1];
+}
+
+/** Pure: the round-1 candidates. `ordered` is every eligible exit the request has
+ *  not attempted yet, freshest address first; `clean` is that list with the parked
+ *  egresses removed (S27). The terminal attempt takes the last entry of `ordered`:
+ *  the least preferred exit the ladder knows, which is the candidate it would
+ *  have tried last anyway. */
+function freeRoundOrder(entries, ledger, now = Date.now(), skipId) {
+	const ordered = orderedWarpExits(entries, now).filter((entry) => entry.id !== skipId);
+	return { ordered, clean: ordered.filter((entry) => !isEgressParked(ledger, entry.ip, now)) };
+}
+
+/** The candidates round 1 may use, or `undefined` when the proxy publishes none:
+ *  an older binary has no structured list, so there is nothing to choose from
+ *  and today's single attempt stays exactly as it is (S11). */
+async function freeRoundCandidates(config, now, skipId) {
+	if ((await warpExitsCapability(config, now)) !== "structured") return undefined;
+	const entries = await readWarpExitsDetail(config, now);
+	if (!Array.isArray(entries)) return undefined;
+	return freeRoundOrder(entries, quotaLedger, now, skipId);
+}
+
+/** One round-1 attempt through one named exit. Three answers: the exit answered
+ *  (`delivered`), the exit refused with a 429 whose bytes are kept for the
+ *  terminal delivery (`refused`), or the attempt produced no response at all
+ *  (`undefined`). An id `proxyUrlWithExit` could not spell is not an attempt:
+ *  a credential the proxy cannot parse must never reach it (S3). */
+async function freeRoundAttempt(config, pathname, body, exit) {
+	const proxyUrl = proxyUrlWithExit(config.warpProxy, exit.id);
+	if (proxyUrl === config.warpProxy) return undefined;
+	warpCrossExitAttempts += 1;
+	// S6: attribution needs the counters from BEFORE the attempt, because only
+	// the movement of `served` says a tunnel opened.
+	const before = await readWarpSnapshot(config);
+	let response;
+	try {
+		response = await egressFetch(config, pathname, { body: JSON.stringify(body), proxyUrl }, "warp");
+	} catch (err) {
+		const reason = err && err.message ? err.message : String(err);
+		process.stderr.write(`pi-free-bridge relay: warp attempt on ${exit.id} produced no response — ${reason}\n`);
+		logWarpEvent("free_round_failed", { exit: exit.id, reason });
+		return undefined;
+	}
+	warp429Streak = bumpWarp429Streak(warp429Streak, response.status, "warp");
+	if (response.status !== 429) {
+		logWarpEvent("free_round_delivered", { exit: exit.id, status: response.status });
+		return { delivered: response };
+	}
+	// S4/S7: the attempt carried this exit's credential, so an attributable 429
+	// names the address that served it — parked before the next candidate runs.
+	parkWarpExitOn429(config, exit, response);
+	await noteWarpAttribution(config, before);
+	logWarpEvent("free_round_refused", { exit: exit.id, ip: quotaEgressKey(exit.ip) });
+	// The body is buffered, not drained: this refusal may be the one the client
+	// is shown (S28), so its exact bytes and its `retry-after` are kept.
+	return {
+		refused: {
+			status: 429,
+			contentType: response.headers.get("content-type"),
+			retryAfter: response.headers.get("retry-after"),
+			retryAfterMs: parkDurationMs(response.headers.get("retry-after")),
+			body: Buffer.from(await response.arrayBuffer()),
+		},
+	};
+}
+
+/** Round 1 in one call. Returns `{ response }` when something answered (that
+ *  response is the request's, byte-exact), `{ original }` when every clean
+ *  candidate refused (the freshest refusal becomes the fallback the paid round
+ *  delivers), or `undefined` when there is no evidence to act on. */
+async function freeWarpRound(config, pathname, body, client, attemptedId) {
+	const candidates = await freeRoundCandidates(config, Date.now(), attemptedId);
+	if (!candidates || candidates.ordered.length === 0) return undefined;
+
+	if (candidates.clean.length === 0) {
+		// S28: every egress the ladder knows is parked, so this is the one final
+		// attempt, through the last candidate in the ladder's own order.
+		const terminalExit = terminalWarpExit(candidates.ordered);
+		const terminal = await freeRoundAttempt(config, pathname, body, terminalExit);
+		if (!terminal) return undefined; // no response: the 429 in hand stands
+		if (terminal.delivered) return { response: terminal.delivered };
+		return { terminal: terminal.refused };
+	}
+
+	let last;
+	for (const exit of candidates.clean) {
+		// A client that left is nobody to answer, and its dead connection is not a
+		// reason to spend another exit's quota.
+		if (client && client.gone) break;
+		const attempt = await freeRoundAttempt(config, pathname, body, exit);
+		if (!attempt) continue;
+		if (attempt.delivered) return { response: attempt.delivered };
+		last = attempt.refused;
+	}
+	return last ? { original: last } : undefined;
+}
+
 /** S8/S14: the bounded ladder, in ascending cost. A targeted swap replaces ONLY
  *  the exit that served the 429 and keeps the pool serving through the other
  *  one: one enrollment instead of N, no stream cut, nothing left empty. One
@@ -2583,6 +2731,24 @@ function judgeStrandedWarpSwap(snapshot) {
  *  which, by the time a 429 is being diagnosed, points at the wrong exit. So the
  *  ladder skips straight to the rotation instead of guessing. */
 export async function recoverWarp429(config, pathname, body, original, client) {
+	// S20/S27/S28: round 1 is free and comes first, before anything is spent.
+	const free = await freeWarpRound(config, pathname, body, client, original.exitId);
+	// Something answered: that response is what the client gets, byte-exact, and
+	// nothing runs after it (S22).
+	if (free && free.response) return { egress: "warp", response: free.response };
+	// Nothing clean was left, so the terminal attempt's own refusal IS the
+	// delivery (S28) — never a refusal synthesized from the ledger.
+	if (free && free.terminal) {
+		logWarpEvent("terminal_429", { status: free.terminal.status });
+		return { egress: "warp", response: rebuildOriginal(free.terminal).response };
+	}
+	// Every clean candidate refused: the paid round still gets its turn, and the
+	// 429 it delivers on failure is the FRESHEST refusal, not the first one (S28)
+	// — that is the `retry-after` the client can act on.
+	if (free && free.original) {
+		original = free.original;
+		logWarpEvent("free_round_exhausted", { retryAfterMs: original.retryAfterMs });
+	}
 	// Read the pool once, before the decision: a targeted swap costs the exit that
 	// served us, so it is only worth spending while another healthy exit remains
 	// to serve the retry. A snapshot that cannot be read counts as no standby.
@@ -2716,6 +2882,9 @@ export async function forward(req, res, pathname, config) {
 		// egress that answered THIS request cannot live in a module global that
 		// another handler overwrites in the meantime.
 		let egressUsed = undefined;
+		// The exit the delivered 429 was served by, so round 1 never asks the same
+		// exit twice for one request (S20, S24).
+		let ladderExitId;
 		for (const egress of order) {
 			egressUsed = egress;
 			let candidate;
@@ -2736,6 +2905,7 @@ export async function forward(req, res, pathname, config) {
 					if (chosen && withExit !== config.warpProxy) {
 						attemptExit = chosen;
 						attemptProxy = withExit;
+						ladderExitId = chosen.id;
 						preferredExitId = chosen.id;
 						logWarpEvent("warp_exit_preferred", { exit: chosen.id, ip: quotaEgressKey(chosen.ip) });
 					}
@@ -2836,6 +3006,10 @@ export async function forward(req, res, pathname, config) {
 				{
 					status: response.status,
 					contentType: response.headers.get("content-type"),
+					retryAfter: response.headers.get("retry-after"),
+					// S20/S24: the exit that already had its attempt on this request, so
+					// round 1 spends the other ones instead of repeating this one.
+					exitId: ladderExitId,
 					body: Buffer.from(await response.arrayBuffer()),
 					// Read here, while the header still exists: the decision to spend an
 					// enrollment instead of waiting depends on how long the wait is.
@@ -2847,6 +3021,9 @@ export async function forward(req, res, pathname, config) {
 			// No egress means the original 429 was handed back, so it keeps the
 			// egress that produced it.
 			if (resend.egress) egressUsed = resend.egress;
+			// S23: one terminal 429 per request, counted where it is decided, so a
+			// ladder that ends in a refusal is visible in the same place the ledger is.
+			if (response.status === 429) warpTerminal429s += 1;
 		}
 
 		// Count this response for as long as it is being delivered over warp. A
@@ -3063,6 +3240,12 @@ export async function handle(req, res, config) {
 			// again, so whether it ran, was disabled, or degraded is only knowable
 			// from the process that ran it.
 			warpSwaps: warpSwaps,
+			// S23: the free round and its terminal 429, so a ladder that is quietly
+			// burning requests or ending in refusals is readable here.
+			warpCrossExitAttempts: warpCrossExitAttempts,
+			warpTerminal429s: warpTerminal429s,
+			// S23: the free round and its terminal 429, so a ladder that is quietly
+			// burning requests or ending in refusals is readable here.
 			warpSwapEnabled: warpSwapEnabledOverride ? WARP_SWAP_ENABLED : false,
 			warpSwapUnsupported: warpSwapUnsupported,
 			warpSwapInFlight: warpSwapInFlight,

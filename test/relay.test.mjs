@@ -5914,3 +5914,221 @@ test("/health: preferredRouting is live only when an exit is choosable (S12)", a
 		}
 	});
 });
+
+// ---------------------------------------------------------------------------
+// T7 round 1: the free round (S20, S27) and the terminal rule (S22, S28)
+// ---------------------------------------------------------------------------
+// The ladder's cheapest rung is the one that spends no enrollment: attempt the
+// exits the pool ALREADY has, one request each, and let an attributable 429 park
+// that egress before the next candidate is tried. A parked egress is skipped
+// instead of attempted (S27) — that is what the ledger is for — and when nothing
+// clean is left exactly one terminal attempt goes through the last candidate, so
+// a refusal is never synthesized from the ledger (S28).
+
+const upstreamProxies = (fake) =>
+	fake.calls
+		.filter((call) => call.url.startsWith(WARP_CONFIG.upstream))
+		.map((call) => call.proxy);
+
+const credit = (id) => `http://${id}:@127.0.0.1:8789`;
+
+/** Both egresses burnt: the ledger is written BEFORE the request, because the
+ *  point of the case is the ladder's behaviour with nothing clean left. */
+async function withBurntPool(file, run) {
+	const now = Date.now();
+	const ledger = parkQuotaEgress(
+		parkQuotaEgress(parseQuotaLedger(""), { ip: EGRESS_A, parkedUntil: now + 3_600_000, reason: "gate_429", now }),
+		{ ip: EGRESS_B, parkedUntil: now + 3_600_000, reason: "gate_429", now },
+	);
+	writeFileSync(file, serializeQuotaLedger(ledger));
+	return run(loadQuotaLedgerAtStartup(file));
+}
+
+test("free round: each eligible exit is attempted once, in rank order, before any enrollment (S20)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		// The first exit refuses with a reset far in the future, the second one answers.
+		const fake = fakePoolProxy({
+			detail: [freshExit(POOL_A), freshExit(POOL_B, 60)],
+			health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			upstream: (call) =>
+				call.proxy === credit("warp-a")
+					? new Response(GATE_429_BODY, { status: 429, headers: { "retry-after": "3600" } })
+					: new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } }),
+		});
+		try {
+			resetWarpStateForTests();
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "free-round" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.deepEqual(
+				upstreamProxies(fake),
+				[credit("warp-a"), credit("warp-b")],
+				"the freshest exit first, then the next eligible one — each at most once",
+			);
+			assert.equal(res.status, 200, "the second exit answered, so the client is not rate-limited at all");
+			assert.ok(
+				readQuotaLedger(file).egresses[quotaEgressKey(EGRESS_A)],
+				`the burnt address is parked before the next attempt: ${JSON.stringify(readQuotaLedger(file).egresses)}`,
+			);
+			assert.equal(
+				fake.calls.filter((call) => call.method === "POST" && /\/(swap|recycle)$/.test(call.url)).length,
+				0,
+				"round 1 spends no enrollment",
+			);
+		} finally {
+			fake.restore();
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("terminal: the client sees the LAST refusal, never the first 429 of the episode (S22, S28)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const bodies = {
+			"warp-a": '{"type":"Refusal","exit":"warp-a"}',
+			"warp-b": '{"type":"Refusal","exit":"warp-b"}',
+		};
+		// Both existing exits refuse, each with its own window: the freshest
+		// `retry-after` is the only number the client can act on.
+		const fake = fakePoolProxy({
+			detail: [freshExit(POOL_A), freshExit(POOL_B, 60)],
+			health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			upstream: (call) => {
+				if (!call.url.startsWith(WARP_CONFIG.upstream)) return new Response("{}", { status: 501 });
+				const id = String(call.proxy ?? "").split("//")[1]?.split(":")[0];
+				return new Response(bodies[id] ?? "{}", { status: 429, headers: { "retry-after": "3600" } });
+			},
+		});
+		try {
+			resetWarpStateForTests();
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "terminal" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.deepEqual(upstreamProxies(fake), [credit("warp-a"), credit("warp-b")], "one attempt each");
+			assert.equal(res.status, 429, "one 429 reaches the client, and it is the terminal one");
+			assert.equal(
+				res.body(),
+				bodies["warp-b"],
+				"the delivered 429 is the LAST attempt's bytes, not the first one's",
+			);
+			const egresses = readQuotaLedger(file).egresses;
+			assert.ok(egresses[quotaEgressKey(EGRESS_A)] && egresses[quotaEgressKey(EGRESS_B)], "both are parked");
+		} finally {
+			fake.restore();
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("terminal: a pool whose every egress is parked still makes one real attempt (S28)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const bodies = {
+			"warp-a": '{"type":"Refusal","exit":"warp-a"}',
+			"warp-b": '{"type":"Refusal","exit":"warp-b"}',
+		};
+		const fake = fakePoolProxy({
+			detail: [freshExit(POOL_A), freshExit(POOL_B, 60)],
+			health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			upstream: (call) => {
+				if (!call.url.startsWith(WARP_CONFIG.upstream)) return new Response("{}", { status: 501 });
+				const id = String(call.proxy ?? "").split("//")[1]?.split(":")[0];
+				return new Response(bodies[id] ?? "{}", { status: 429, headers: { "retry-after": "3600" } });
+			},
+		});
+		try {
+			await withBurntPool(file, async () => {
+				resetWarpStateForTests();
+				loadQuotaLedgerAtStartup(file);
+				const res = fakeRelayRes();
+				await forward(fakeReq({ marker: "burnt" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+				const proxies = upstreamProxies(fake);
+				assert.ok(proxies.length > 0, "a refusal is never synthesized from the ledger alone");
+				assert.equal(proxies.length, 2, "one attempt per exit the ladder knows, and no loop beyond that");
+				assert.deepEqual([...new Set(proxies)].length, 2, "the same exit is never asked twice for one request");
+				assert.equal(res.status, 429);
+				assert.equal(
+					res.body(),
+					bodies["warp-a"],
+					"the bytes are the last attempt's own, delivered exactly as they arrived",
+				);
+			});
+		} finally {
+			fake.restore();
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("terminal: an attempt that produces no response leaves the 429 already in hand (S28)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		// The first attempt answers 429, the terminal one dies with no response at
+		// all: the fallback is the 429 the relay already holds, and the path must
+		// terminate on its own — no wait, no retry, no clock.
+		const fake = fakePoolProxy({
+			detail: [freshExit(POOL_A), freshExit(POOL_B, 60)],
+			health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			upstream: (call) => {
+				if (!call.url.startsWith(WARP_CONFIG.upstream)) return new Response("{}", { status: 501 });
+				if (call.proxy === credit("warp-a")) throw new Error("socket hang up");
+				return new Response('{"type":"Refusal","exit":"warp-b"}', {
+					status: 429,
+					headers: { "retry-after": "3600" },
+				});
+			},
+		});
+		try {
+			await withBurntPool(file, async () => {
+				resetWarpStateForTests();
+				loadQuotaLedgerAtStartup(file);
+				const res = fakeRelayRes();
+				await forward(fakeReq({ marker: "no-response" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+				assert.equal(res.status, 429, "the original 429 is the fallback when the last attempt answers nothing");
+				assert.equal(res.body(), '{"type":"Refusal","exit":"warp-b"}', "and it is delivered byte-exact");
+			});
+		} finally {
+			fake.restore();
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
+
+test("/health publishes the free round and its terminal 429 (S23)", async () => {
+	await withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const fake = fakePoolProxy({
+			detail: [freshExit(POOL_A), freshExit(POOL_B, 60)],
+			health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+			upstream: () => new Response(GATE_429_BODY, { status: 429, headers: { "retry-after": "3600" } }),
+		});
+		try {
+			resetWarpStateForTests();
+			await forward(fakeReq({ marker: "counted" }), fakeRelayRes(), RESEND_PATH, FORWARD_CONFIG);
+			const res = fakeRelayRes();
+			await handle({ method: "GET", url: "/health", headers: {}, on() {} }, res, { ...FORWARD_CONFIG, warpMode: "off" });
+			const body = JSON.parse(res.body());
+
+			assert.equal(
+				body.warpCrossExitAttempts,
+				1,
+				"the one exit round 1 attempted besides the one that refused first",
+			);
+			assert.equal(body.warpTerminal429s, 1, "one request ended in a terminal 429");
+			assert.equal(typeof body.warpRecycles, "number", "round 2's rotation counter is here as well");
+			assert.equal(typeof body.warpSwaps, "number", "and its targeted swap");
+		} finally {
+			fake.restore();
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+});
