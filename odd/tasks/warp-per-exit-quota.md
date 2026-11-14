@@ -144,6 +144,44 @@ by any *unrecognised* `stack` value, so a typo in that key silently moves the
 deployment to WireGuard and the only alarm is `/health.stack` reading `"wireguard"`.
 Never write "the deploy is IPv6 end to end" or "WireGuard is dead code".
 
+S20. The ladder has exactly **two rounds and one terminal**. Round 1 is free: the
+relay may attempt each eligible exit it already has, **at most once each**, in the
+order `chooseWarpExit` ranks them, parking the egress of every attributable 429
+(S4, S7) before moving to the next. No enrollment is spent in round 1. Round 2 is
+paid: only when round 1 has run out of eligible exits, the relay triggers **one**
+rotation and then attempts the exits the pool offers **after** the replacement —
+whatever the pool actually publishes, never an assumed count.
+
+S21. Round 2 spends an enrollment only on evidence that the exit is the cause.
+If any 429 in round 1 classified as `session_suspect` (`classifyGate429`), the
+cause is not the egress: no rotation, the original 429 is delivered. The same
+`warpSwapDecision` that already decides whether a swap is worth its enrollment
+gates round 2, so a long `retry-after` never buys a rotation that cannot help.
+
+S22. The client sees **exactly one 429 per request**, and it is the terminal one.
+The delivered response is the original rebuilt byte-exact with `forwardedHeaders`
+(S13), `retry-after` included; an intermediate 429 from an inner rung is never
+shown. Nothing retries after delivery: the terminal decision is final for that
+request.
+
+S23. Every rung is observable. `/health` reports how many round-1 cross-exit
+attempts were made, how many round-2 rotations ran, and how many requests ended
+in a terminal 429, so a ladder that is quietly burning enrollments is visible in
+the same place the ledger already is.
+
+S24. The ladder terminates by construction. A request spends at most one attempt
+per eligible exit in round 1 plus one attempt per exit the pool publishes after a
+single rotation, and round 2 happens at most once; no path loops, and no path
+re-enters round 1 after a terminal delivery.
+
+S25. The proxy stays agnostic to the ladder. It never learns that a retry
+exists: it publishes facts (`/health`, `/exits`, the credential it was given) and
+exposes verbs (`/recycle`, `/swap`), and the relay decides which verb, when, and
+how many times. No round counter, no retry budget, no ladder state, no `reset_at`
+interpretation ever crosses into the proxy. Round 2 is the relay asking for a
+rotation and then *reading* what the pool publishes afterwards; the proxy is not
+told why, and must not be able to tell.
+
 ## Defects found in review
 
 These are defects, not footnotes: each one either produces silently wrong state or
@@ -170,12 +208,13 @@ name — and D7 means the pool can lose an exit to a malformed request.
 
 | ID | Task | Specs | Route | Commit |
 |---|---|---|---|---|
-| T1 | Ledger module: read/write/prune the JSON by IP, derive `prefix64` | S5, S6 | relay | uncommitted |
+| T1 | Ledger module: read/write/prune the JSON by IP, derive `prefix64` | S5, S6 | relay | f92c990 |
 | T2 | Park WARP egresses from a 429, honouring `classifyGate429` | S4, S7 | relay | pending |
-| T3 | Persist the local park and load it on start | S10 | relay | uncommitted |
-| T4 | Per-request routing: exit choice → proxy credential, with capability detection | S2, S3, S8, S9, S11 | relay | pending |
-| T5 | `/health` reports the ledger and whether routing is live | S12 | relay | uncommitted |
-| T6 | `warp-minimal`: `GET /exits`, `GET /exit/<id>`, credential read, silent fallback, no 407 | S1, S8, S13, S14, S15 | warp-minimal (peer) | pending |
+| T3 | Persist the local park and load it on start | S10 | relay | f92c990 |
+| T4 | Per-request routing: exit choice → proxy credential, with capability detection | S2, S3, S8, S9, S11 | relay | f92c990 |
+| T5 | `/health` reports the ledger and whether routing is live | S12 | relay | f92c990 |
+| T6 | `warp-minimal`: `GET /exits`, `GET /exit/<id>`, credential read, silent fallback, no 407 | S1, S8, S13, S14, S15 | warp-minimal (peer) | peer's tree |
+| T7 | Two-round ladder: free cross-exit rung, one gated rotation, terminal 429 | S20, S21, S22, S23, S24 | relay | pending |
 
 ## Log
 
@@ -371,3 +410,31 @@ the relay reads `legacy` there — which is the correct answer, and means the fe
 is inert on the live service until the owner deploys. The end-to-end run must
 therefore use a binary built from `feat/warp-exit-facts` on the probe port, or it
 would validate nothing about the prefer path.
+
+L19 (user, verbatim): «otra cosa, cuando llegue el 429 a la pantalla del cliente osea
+despues de la escalera, podemos tener retri?»
+
+L20 (user, verbatim, the design): «bueno la idea mia es si se quema a usar b si no
+queda ninguna reclicle y lo mmismo a yluego b es lo que ya hay pero cualdo llegue el
+429 al cliente reclicle y peticion denuevo a y luego b recicle a y luego b y llega el
+ultimo 429, osea escalera interna, llega al cliente el 429 recile + retri y luego
+escalera inerna nuevamente y ahi no hace el rety cuando llega al cliente el segundo
+429»
+
+L21 (decision, asked and answered): round 2 is **automatic** — the relay rotates and
+retries on its own, and the client sees a single terminal 429. The cost was stated
+before choosing: one enrollment per request that reaches round 2.
+
+L22 (user, constraint): «pero el proxy debe ser agnostico a eso». So S25: the ladder
+is relay policy end to end. The proxy keeps only facts and verbs, and never learns
+that a retry exists.
+
+L23 (evidence, live production after the owner restarted both processes): relay
+`/health` on 8788 reports `warpExits:"structured"`, `preferredRouting:true`,
+`preferredExit:"warp-18e7d77fcab7a02a"`, `warpExitsDetail.usable:2`,
+`quotaLedger.parked:1` (the local egress). Proxy `/health` on 8789 reports
+`capabilities:{exits:true}`, `stack:masque`, `pool_size:2`, `healthy:2`, and `/exits`
+serves two real egress addresses in distinct /64s — `2a09:bac5:3053:323c::501:1a` and
+`2a09:bac5:3057:323c::501:12`. The proxy's `served` counter reads 1 on exactly the
+exit the relay named and 0 on the other, so the credential channel works end to end
+in production. D7 is closed in production by the deployed binary.
