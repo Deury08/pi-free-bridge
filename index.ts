@@ -1,9 +1,10 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
+import { connect as netConnect } from "node:net";
 import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
@@ -1720,7 +1721,7 @@ export type UpdateWarpBinaryDeps = {
 	confirm: () => Promise<boolean>;
 	/** The verified path of the new binary, or undefined when nothing landed. */
 	download: () => Promise<string | undefined>;
-	swap: (downloaded: string, tag: string) => Promise<{ ok: boolean; rolledBack: boolean; reason?: string }>;
+	swap: (downloaded: string, tag: string) => Promise<{ ok: boolean; rolledBack: boolean; reason?: string; inPlace?: string }>;
 	/** The commit the running proxy reports for itself, or null when it has none. */
 	readRunningCommit: () => Promise<string | null>;
 	writeRecord: (record: { tag: string; commit: string }) => void;
@@ -1728,6 +1729,14 @@ export type UpdateWarpBinaryDeps = {
 	 *  declaration said the pool is ready; this is the only thing that proves the
 	 *  binary actually serves, and it never depends on the relay's egress mode. */
 	probeTraffic?: () => Promise<WarpTraffic>;
+	/** Is the downloaded file byte-identical to the installed one? The update is
+	 *  asked to install the published build; when the published build is already
+	 *  what is installed, the safe and honest answer is not to touch anything. It
+	 *  used to evict, swap and probe in that case, which cost an exit and reported
+	 *  a failure for a machine that was already correct. */
+	sameFile?: (downloaded: string, installed: string) => Promise<boolean>;
+	/** Where the installed binary lives, so `sameFile` has something to compare to. */
+	installedPath?: string;
 	/** The menu installs on request even when the tag matches: what the owner asks
 	 *  for there is the file on disk replaced with the published one, not a
 	 *  comparison. Without it, an update that only reports "up to date" would
@@ -1736,7 +1745,7 @@ export type UpdateWarpBinaryDeps = {
 };
 
 export type UpdateWarpBinaryResult = {
-	status: "up-to-date" | "unknown" | "declined" | "updated" | "rolled-back" | "failed";
+	status: "up-to-date" | "unknown" | "declined" | "same-build" | "updated" | "rolled-back" | "failed";
 	tag?: string;
 	commit?: string;
 	reason?: string;
@@ -1744,6 +1753,8 @@ export type UpdateWarpBinaryResult = {
 	 *  It informs, it never rolls back — a flaky network must not condemn a
 	 *  binary that started and declared its exits. */
 	traffic?: WarpTraffic;
+	/** The proxy ran but never described itself, so the record had to say "unknown". */
+	identityUnreadable?: boolean;
 };
 
 /** T9c: the update, in the only order that is safe. The decision first, because
@@ -1754,6 +1765,63 @@ export type UpdateWarpBinaryResult = {
  *  running proxy reports — a swap that returns ok but no identity proved
  *  nothing. Every effect is a dependency so this can be measured without a
  *  network, a binary or a running proxy. */
+/** Did the proxy start? Two ways to know, and the weaker one is enough.
+ *
+ *  `/health` is the strong answer: the process is up, serving and willing to
+ *  describe itself. But it is an HTTP request made from inside the host, and on a
+ *  measured machine that request never arrives while the proxy serves traffic
+ *  perfectly — so gating the install on it reported a working proxy as broken, and
+ *  the rollback that followed threw away a good build.
+ *
+ *  The port is the weak answer, and it is a fact the operating system owns: if the
+ *  proxy's port is held, something bound it, and the swap only starts the binary
+ *  it installed. A gate that accepts either can no longer fail an install that
+ *  worked; it only reports which evidence it got.
+ */
+export async function warpServed(deps: {
+	health: () => Promise<unknown>;
+	held: () => Promise<boolean>;
+}): Promise<unknown> {
+	try {
+		const body = await deps.health();
+		if (body) return body;
+	} catch {
+		// A health read that threw is the same as one that did not answer.
+	}
+	try {
+		if (await deps.held()) return { bound: true, health: "did not answer" };
+	} catch {
+		return undefined;
+	}
+	return undefined;
+}
+
+/** Is the downloaded file byte-identical to the file already installed?
+ *
+ *  Two comparisons are refused, because a vacuous "same" is worse than no answer:
+ *  a missing installed file is a first install, not a match, and a downloaded path
+ *  that is the installed path is the file compared with itself — which would let
+ *  the update claim it verified something it never looked at.
+ */
+export async function sameBinaryFile(downloadedFile: string, installedFile: string): Promise<boolean> {
+	let a: string;
+	let b: string;
+	try {
+		a = resolve(downloadedFile);
+		b = resolve(installedFile);
+	} catch {
+		return false;
+	}
+	if (a === b) return false;
+	if (!existsSync(a) || !existsSync(b)) return false;
+	try {
+		return createHash("sha256").update(readFileSync(a)).digest("hex") ===
+			createHash("sha256").update(readFileSync(b)).digest("hex");
+	} catch {
+		return false;
+	}
+}
+
 export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<UpdateWarpBinaryResult> {
 	const latestTag = await deps.latestTag();
 	const installed = deps.installedRecord();
@@ -1762,7 +1830,9 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 	if (decision === "unknown") {
 		return {
 			status: "unknown",
-			reason: "the release could not be read: with no published tag there is nothing to install and nothing to claim",
+			reason: lastReleaseReadFailure
+				? `the release could not be read — ${lastReleaseReadFailure}`
+				: "the release could not be read: with no published tag there is nothing to install and nothing to claim",
 		};
 	}
 	if (decision === "up-to-date" && !deps.force) {
@@ -1781,26 +1851,41 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 		};
 	}
 
+	// Nothing is stopped, renamed or probed for a file that is already in place.
+	if (deps.sameFile && deps.installedPath) {
+		let same = false;
+		try {
+			same = await deps.sameFile(downloaded, deps.installedPath);
+		} catch {
+			same = false;
+		}
+		if (same) return { status: "same-build", tag };
+	}
+
 	const swapped = await deps.swap(downloaded, tag);
 	if (!swapped.ok) {
 		const reason = swapped.reason ?? "no reason was reported";
 		if (swapped.rolledBack) return { status: "rolled-back", tag, reason };
+		// S33: a swap that renamed nothing cannot have failed to restore anything.
+		// The only true statement is that nothing was replaced, and it names the
+		// file that is still where it was.
+		const nothingReplaced = swapped.inPlace
+			? `nothing was replaced — ${swapped.inPlace} is still in place`
+			: "nothing was replaced";
 		return {
 			status: "failed",
 			tag,
-			reason: `${reason}: the install did not prove itself and the old binary was not restored`,
+			reason: `${reason}: the install did not prove itself and ${nothingReplaced}`,
 		};
 	}
 
+	// S38: the build's identity is a fact to record, never a gate to pass. A build
+	// that answers /health without declaring `build.commit` — every release before
+	// that field existed — was installed and then thrown away for not describing
+	// itself, which is the update refusing to keep a binary that works.
 	const commit = await deps.readRunningCommit();
-	if (!commit) {
-		return {
-			status: "failed",
-			tag,
-			reason: "the new build was installed but did not identify itself, so what runs cannot be verified — no record was written",
-		};
-	}
-	deps.writeRecord({ tag, commit });
+	const recorded = commit ?? "unknown";
+	deps.writeRecord({ tag, commit: recorded });
 	let traffic: WarpTraffic = "unknown";
 	if (deps.probeTraffic) {
 		try {
@@ -1809,7 +1894,7 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 			traffic = "no-traffic";
 		}
 	}
-	return { status: "updated", tag, commit, traffic };
+	return { status: "updated", tag, commit: recorded, traffic, identityUnreadable: !commit };
 }
 
 /** T9c: is there anything to install? A release publishes its tag and its
@@ -1935,14 +2020,110 @@ export type StopWarpDeps = {
 	kill: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
 	sleep: (ms: number) => Promise<void>;
 	attempts?: number;
+	/** S31: who holds the port, resolved from the port itself. Without it the
+	 *  D11 record policy is the whole policy, exactly as it was. */
+	holder?: () => WarpPortHolder | undefined;
+	/** S31: every pid that executes the installed binary, wherever the record
+	 *  says it was spawned from. */
+	ours?: () => number[] | undefined;
+	/** S31(b): is the port still held? The last word on whether anything may be
+	 *  started in its place. */
+	portHeld?: () => boolean | Promise<boolean>;
+	/** S31: where a refusal says what it left alone and which pid would not die.
+	 *  A stop that cannot report is quieter than the rule allows, so every caller
+	 *  that swaps a binary passes one. */
+	refuse?: (reason: string) => void;
 };
 
-/** D11: stop the proxy we started, and refuse to guess. Four refusals are more
- *  useful than one wrong kill: nothing answering means nothing to stop; no
- *  record means no pid we can claim; an executable that does not match the
- *  recorded binary means the pid was reused, so it is not ours; and a process
- *  that survives SIGKILL is reported instead of being assumed dead. */
+/** S31: one path, spelled one way. Collapses `.`/`..` and repeated separators,
+ *  lower-cases on Windows (paths are case-insensitive there), and drops Linux's
+ *  ` (deleted)` marker — what the kernel appends to a live process's link after
+ *  the file was renamed underneath it, which is still the binary we own. */
+export function canonicalBinaryPath(path: string | undefined): string {
+	const text = String(path ?? "").trim().replace(/ \(deleted\)$/, "");
+	const absolute = /^[\\/]/.test(text);
+	const parts: string[] = [];
+	for (const segment of text.replace(/\\/g, "/").split("/")) {
+		if (!segment || segment === ".") continue;
+		if (segment === "..") {
+			parts.pop();
+			continue;
+		}
+		parts.push(segment);
+	}
+	const joined = `${absolute ? "/" : ""}${parts.join("/")}`;
+	return process.platform === "win32" ? joined.toLowerCase() : joined;
+}
+
+/** S31: ownership is the path, never the image name. A `warp-minimal` copied
+ *  into another directory is somebody else's process. */
+export function isInstalledWarpBinary(exe: string | undefined, installed: string | undefined): boolean {
+	if (!exe || !installed) return false;
+	return canonicalBinaryPath(exe) === canonicalBinaryPath(installed);
+}
+
+/** S31: the listener on the proxy's port, and whether it is ours. `exe` is kept
+ *  even when it is not ours, because the refusal has to name what it left
+ *  alone. */
+export type WarpPortHolder = { pid: number; exe?: string; ours: boolean };
+
+/** S31: the port decides who holds it. `pids` reads the listening pids for that
+ *  port and `exeOf` the executable behind each; either may answer "I cannot
+ *  know", which is never turned into a claim about ownership. */
+export function resolveWarpPortHolder(deps: {
+	port: number;
+	installed: string;
+	pids: (port: number) => number[] | undefined;
+	exeOf: (pid: number) => string | undefined;
+}): WarpPortHolder | undefined {
+	let pids: number[] | undefined;
+	try {
+		pids = deps.pids(deps.port);
+	} catch {
+		return undefined;
+	}
+	if (!Array.isArray(pids)) return undefined;
+	for (const pid of pids) {
+		if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) continue;
+		let exe: string | undefined;
+		try {
+			exe = deps.exeOf(pid);
+		} catch {
+			exe = undefined;
+		}
+		if (!exe) continue; // an unreadable executable is not ours
+		return { pid, exe, ours: isInstalledWarpBinary(exe, deps.installed) };
+	}
+	return undefined;
+}
+
+/** D11 + S31: stop the proxy, and refuse to guess.
+ *
+ *  The record is a hint, never the identity. Two facts outrank it: the process
+ *  holding the port, and every process executing the installed binary. Both are
+ *  path-scoped, so a same-named binary elsewhere is never touched.
+ *
+ *  S31 states the three conditions this enforces. (a) A process of ours that
+ *  survives the eviction stops the swap before a single rename, and the refusal
+ *  names the pid that would not die. (b) The port has to be observed free, so
+ *  `portHeld` is asked before the answer is "stopped": the caller must never
+ *  start onto a held port, which is exactly how a dead pid became the record.
+ *  (c) Both waits are a fixed number of attempts, and exhausting one is a
+ *  refusal that names what is still there — never a quiet proceed.
+ *
+ *  When the port cannot be identified the D11 record policy is unchanged, and
+ *  that is deliberate: "cannot know" is not a licence to kill by name. That
+ *  policy keeps its five answers, including a process that survives SIGKILL
+ *  being reported as `unverified` instead of assumed dead. */
 export async function stopWarpProxy(deps: StopWarpDeps): Promise<"stopped" | "nothing-to-stop" | "unknown-pid" | "refused" | "unverified"> {
+	const attempts = deps.attempts ?? 20;
+	const report = (reason: string): void => {
+		try {
+			deps.refuse?.(reason);
+		} catch {
+			// Reporting is the last step of a failure; it cannot become the failure.
+		}
+	};
 	const alive = async (): Promise<boolean> => {
 		try {
 			return Boolean(await deps.probe());
@@ -1950,6 +2131,84 @@ export async function stopWarpProxy(deps: StopWarpDeps): Promise<"stopped" | "no
 			return false;
 		}
 	};
+	/** The port when the platform lets us ask, `/health` otherwise: a stop may
+	 *  only claim "gone" about something it actually observed. A check that throws
+	 *  observed nothing, so it counts as still held. */
+	const held = async (): Promise<boolean> => {
+		if (!deps.portHeld) return alive();
+		try {
+			return Boolean(await deps.portHeld());
+		} catch {
+			return true;
+		}
+	};
+	/** SIGTERM, bounded wait, SIGKILL, bounded wait. Bounded on purpose: a wait
+	 *  that can be extended is a hang with a nicer name. */
+	const evict = async (pids: number[]): Promise<boolean> => {
+		for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+			for (const pid of pids) {
+				try {
+					deps.kill(pid, signal);
+				} catch {
+					// already gone, or not ours to signal: the port decides below
+				}
+			}
+			for (let i = 0; i < attempts; i++) {
+				if (!(await held())) return true;
+				await deps.sleep(150);
+			}
+		}
+		return false;
+	};
+
+	let holder: WarpPortHolder | undefined;
+	try {
+		holder = deps.holder?.();
+	} catch {
+		holder = undefined;
+	}
+
+	// S31(a): a listener that is not our binary is the one thing this must not
+	// kill, and nothing may be renamed while it holds the port.
+	if (holder && !holder.ours) {
+		report(
+			`no se pudo detener el proxy: el puerto lo ocupa el pid ${holder.pid}${
+				holder.exe ? ` (${holder.exe})` : ""
+			}, que no es el binario instalado`,
+		);
+		return "refused";
+	}
+
+	if (holder) {
+		const targets = [holder.pid];
+		let others: number[] | undefined;
+		try {
+			others = deps.ours?.();
+		} catch {
+			others = undefined;
+		}
+		for (const pid of others ?? []) {
+			if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) continue;
+			if (targets.includes(pid)) continue;
+			let otherExe: string | undefined;
+			try {
+				otherExe = deps.exeOf(pid);
+			} catch {
+				otherExe = undefined;
+			}
+			// Path-scoped: only a process executing the same binary is ours.
+			if (!isInstalledWarpBinary(otherExe, holder.exe)) continue;
+			targets.push(pid);
+		}
+		if (await evict(targets)) return "stopped";
+		report(
+			`no se pudo detener el proxy: el pid ${targets.join(", ")}${
+				holder.exe ? ` (${holder.exe})` : ""
+			} sigue ocupando el puerto después de SIGKILL`,
+		);
+		return "refused";
+	}
+
 	if (!(await alive())) return "nothing-to-stop";
 	const record = deps.recorded();
 	if (!record) return "unknown-pid";
@@ -1961,7 +2220,6 @@ export async function stopWarpProxy(deps: StopWarpDeps): Promise<"stopped" | "no
 	}
 	if (exe && record.bin && exe !== record.bin) return "refused";
 
-	const attempts = deps.attempts ?? 20;
 	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
 		try {
 			deps.kill(record.pid, signal);
@@ -1969,29 +2227,228 @@ export async function stopWarpProxy(deps: StopWarpDeps): Promise<"stopped" | "no
 			// already gone, or not ours to signal: the probe decides below
 		}
 		for (let i = 0; i < attempts; i++) {
-			if (!(await alive())) return "stopped";
+			if (!(await alive())) {
+				// S31(b): a silent /health is not a free port. Only an observed free
+				// port lets the caller start a new binary here.
+				if (!deps.portHeld) return "stopped";
+				if (!(await held())) return "stopped";
+				report(
+					`no se pudo detener el proxy: el pid ${record.pid} dejó de responder pero el puerto sigue ocupado`,
+				);
+				return "refused";
+			}
 			await deps.sleep(150);
 		}
 	}
 	return "unverified";
 }
 
-/** D11: the executable behind a pid, when the kernel exposes it. Linux only;
- *  everywhere else this answers undefined, which the stop policy reads as "cannot
- *  check" and never as a mismatch. */
+/** D11 / S31: the executable behind a pid, when the platform exposes it. Linux
+ *  reads the kernel's own link and Windows asks the process itself; everywhere
+ *  else this answers undefined, which the stop policy reads as "cannot check"
+ *  and never as a mismatch. */
 function exeBehindPid(pid: number): string | undefined {
+	if (process.platform === "linux") {
+		try {
+			return readlinkSync(`/proc/${pid}/exe`);
+		} catch {
+			return undefined;
+		}
+	}
+	if (process.platform === "win32") {
+		try {
+			const out = execFileSync(
+				"powershell",
+				["-NoProfile", "-Command", `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).Path`],
+				{ encoding: "utf-8", timeout: 4000, windowsHide: true },
+			);
+			const path = out.trim();
+			return path || undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
+/** S31: the pids listening on a local port. Linux reads the kernel's own socket
+ *  table and matches the inode against `/proc/<pid>/fd`; Windows asks
+ *  PowerShell for the listener's owning process. Every other platform answers
+ *  "cannot know", which the stop policy turns into the record policy rather
+ *  than into a guess about who is serving. */
+function warpPidsOnPort(port: number): number[] | undefined {
+	if (!Number.isInteger(port) || port <= 0) return undefined;
+	if (process.platform === "linux") return linuxPidsOnPort(port);
+	if (process.platform === "win32") return windowsPidsOnPort(port);
+	return undefined;
+}
+
+function linuxPidsOnPort(port: number): number[] | undefined {
+	const wanted = port.toString(16).toUpperCase().padStart(4, "0");
+	const inodes = new Set<string>();
+	let tableRead = false;
+	for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+		let text: string;
+		try {
+			text = readFileSync(table, "utf-8");
+		} catch {
+			continue; // that family is not in use on this kernel
+		}
+		tableRead = true;
+		for (const line of text.split("\n").slice(1)) {
+			const columns = line.trim().split(/\s+/);
+			if (columns.length < 10) continue;
+			const local = columns[1] ?? "";
+			if (!local.toUpperCase().endsWith(`:${wanted}`)) continue;
+			if ((columns[3] ?? "").toUpperCase() !== "0A") continue; // LISTEN
+			const inode = columns[9];
+			if (inode && inode !== "0") inodes.add(inode);
+		}
+	}
+	if (!tableRead) return undefined;
+	if (inodes.size === 0) return [];
+
+	let entries: string[];
 	try {
-		return readlinkSync(`/proc/${pid}/exe`);
+		entries = readdirSync("/proc");
+	} catch {
+		return undefined;
+	}
+	const pids: number[] = [];
+	for (const entry of entries) {
+		if (!/^\d+$/.test(entry)) continue;
+		let fds: string[];
+		try {
+			fds = readdirSync(`/proc/${entry}/fd`);
+		} catch {
+			continue; // another user's process: not ours to inspect
+		}
+		for (const fd of fds) {
+			let target: string;
+			try {
+				target = readlinkSync(`/proc/${entry}/fd/${fd}`);
+			} catch {
+				continue;
+			}
+			const match = /^socket:\[(\d+)\]$/.exec(target);
+			if (match && inodes.has(match[1]!)) {
+				pids.push(Number.parseInt(entry, 10));
+				break;
+			}
+		}
+	}
+	return pids;
+}
+
+function windowsPidsOnPort(port: number): number[] | undefined {
+	try {
+		const out = execFileSync(
+			"powershell",
+			[
+				"-NoProfile",
+				"-Command",
+				`(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue).OwningProcess | Sort-Object -Unique`,
+			],
+			{ encoding: "utf-8", timeout: 4000, windowsHide: true },
+		);
+		return out
+			.split(/\r?\n/)
+			.map((line) => Number.parseInt(line.trim(), 10))
+			.filter((pid) => Number.isInteger(pid) && pid > 0);
 	} catch {
 		return undefined;
 	}
 }
 
-/** D11: the only place the proxy is stopped is the menu switching WARP off (and
- *  an update, which stops it to replace the binary). Closing the relay leaves it
- *  running on purpose: stopping it costs two enrollments, new addresses and the
- *  matching of every parked entry. */
-async function stopWarpFromMenu(healthUrl: string): Promise<"stopped" | "nothing-to-stop" | "unknown-pid" | "refused" | "unverified"> {
+/** S31: every process executing the installed binary. Linux scans the kernel's
+ *  own `/proc/<pid>/exe` links; Windows asks PowerShell for each process's image
+ *  path. A lookup that cannot run answers undefined, and then the caller falls
+ *  back to the record instead of killing by name. */
+function warpProcessesUnderInstall(installed: string): number[] | undefined {
+	if (process.platform === "linux") {
+		let entries: string[];
+		try {
+			entries = readdirSync("/proc");
+		} catch {
+			return undefined;
+		}
+		const pids: number[] = [];
+		for (const entry of entries) {
+			if (!/^\d+$/.test(entry)) continue;
+			const pid = Number.parseInt(entry, 10);
+			if (isInstalledWarpBinary(exeBehindPid(pid), installed)) pids.push(pid);
+		}
+		return pids;
+	}
+	if (process.platform === "win32") {
+		try {
+			const out = execFileSync(
+				"powershell",
+				[
+					"-NoProfile",
+					"-Command",
+					'Get-Process -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Id)\t$($_.Path)" }',
+				],
+				{ encoding: "utf-8", timeout: 5000, windowsHide: true },
+			);
+			const pids: number[] = [];
+			for (const line of out.split(/\r?\n/)) {
+				const [rawPid, rawPath] = line.split("\t");
+				if (!rawPid || !rawPath) continue;
+				const pid = Number.parseInt(rawPid.trim(), 10);
+				if (Number.isInteger(pid) && isInstalledWarpBinary(rawPath.trim(), installed)) pids.push(pid);
+			}
+			return pids;
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
+/** S31(b) / S32: is anything holding this port right now? A completed connect
+ *  means somebody is listening; a refused connect means nobody is. A timeout
+ *  observed neither, so it counts as held — "could not tell" is never permission
+ *  to bind. The socket is opened and closed, nothing is sent. */
+export function observePortHeld(host: string, port: number, timeoutMs = 700): Promise<boolean> {
+	return new Promise((done) => {
+		const socket = netConnect({ host: host.replace(/^\[|\]$/g, ""), port });
+		let settled = false;
+		const finish = (held: boolean): void => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			done(held);
+		};
+		socket.setTimeout(timeoutMs);
+		socket.once("connect", () => finish(true));
+		socket.once("timeout", () => finish(true));
+		socket.once("error", () => finish(false));
+	});
+}
+
+/** The host and port a health URL names, when it names one. */
+function warpAddressOf(healthUrl: string): { host: string; port: number } | undefined {
+	try {
+		const url = new URL(healthUrl);
+		const port = Number.parseInt(url.port, 10);
+		if (Number.isInteger(port) && port > 0) return { host: url.hostname, port };
+		return { host: url.hostname, port: url.protocol === "https:" ? 443 : 80 };
+	} catch {
+		return undefined;
+	}
+}
+
+/** D11 + S31: the only place the proxy is stopped is the menu switching WARP off
+ *  (and an update, which stops it to replace the binary). Closing the relay
+ *  leaves it running on purpose: stopping it costs two enrollments, new
+ *  addresses and the matching of every parked entry.
+ *
+ *  `refuse` receives the sentence a refusal produced, so the swap that asked for
+ *  the stop can show the pid and the executable it left alone (S31, S33). */
+async function stopWarpFromMenu(healthUrl: string, refuse?: (reason: string) => void): Promise<WarpStopResult> {
+	const installed = warpInstallPath();
+	const where = warpAddressOf(healthUrl);
 	return stopWarpProxy({
 		probe: async () => {
 			try {
@@ -2005,6 +2462,13 @@ async function stopWarpFromMenu(healthUrl: string): Promise<"stopped" | "nothing
 		exeOf: exeBehindPid,
 		kill: (pid, signal) => process.kill(pid, signal),
 		sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+		// S31: the port decides who is evicted and the executable decides whether
+		// it is ours. The record cannot pre-empt either: it once named a corpse.
+		holder: () =>
+			where ? resolveWarpPortHolder({ port: where.port, installed, pids: warpPidsOnPort, exeOf: exeBehindPid }) : undefined,
+		ours: () => warpProcessesUnderInstall(installed),
+		portHeld: where ? () => observePortHeld(where.host, where.port) : undefined,
+		refuse,
 	});
 }
 
@@ -2014,8 +2478,13 @@ export type WarpStopResult = "stopped" | "nothing-to-stop" | "unknown-pid" | "re
 
 /** D11: a swap replaces the binary underneath the proxy, so it may go ahead only
  *  when the old process is provably gone. "nothing-to-stop" is fine — there is
- *  nothing to replace underneath. The three refusals are not: an unstopped proxy
- *  still serving an old binary is exactly the wrong kill this policy forbids. */
+ *  nothing to replace underneath. The refusals are not: an unstopped proxy still
+ *  serving an old binary is exactly the wrong kill this policy forbids.
+ *
+ *  S31: the answer is only as good as what the stop observed, so the stop itself
+ *  asks the port whether it came free and refuses when it did not. The sentence a
+ *  refusal produced is handed to the caller that passed a `refuse` sink, which is
+ *  how the pid that would not die reaches the message (S33). */
 export async function warpStopForSwap(healthUrl: string, stop: (url: string) => Promise<WarpStopResult> = stopWarpFromMenu): Promise<boolean> {
 	try {
 		const result = await stop(healthUrl);
@@ -2089,7 +2558,18 @@ export function warpReadyFact(body: unknown): boolean {
 	if (!commit || commit === "unknown") return false;
 	if (!b.capabilities || b.capabilities.exits !== true) return false;
 	const exits = Array.isArray(b.exits) ? b.exits : [];
-	return exits.some((exit) => Boolean(exit) && typeof exit === "object" && Boolean((exit as { ip?: unknown }).ip));
+	// S42: the proxy declares its pool as text — "warp-<id> (in_use, served=2,
+	// streams=2)" — not as objects with an `ip`. Requiring an object made this
+	// function return false against every real `/health`, so no update could ever
+	// pass its own readiness check, whatever the binary did. Both shapes are read:
+	// what matters is that the pool reports at least one exit.
+	return exits.some((exit) => {
+		if (typeof exit === "string") return exit.trim().length > 0;
+		if (!exit || typeof exit !== "object") return false;
+		// An id alone is not an address, so an object still has to name one.
+		const named = exit as { ip?: unknown; address?: unknown };
+		return Boolean(named.ip ?? named.address);
+	});
 }
 
 /** Where the traffic probe asks.
@@ -2128,21 +2608,101 @@ export function parseTraceFact(body: unknown): { traffic: boolean; tunnel: boole
  */
 export async function probeWarpTraffic(deps: {
 	request: () => Promise<{ status: number; body: string }>;
+	/** S41: a proxy that just started answers 503 until its pool is enrolled, which
+	 *  the laboratory measured at ~3 s and six answers in a row. A single request
+	 *  cannot tell "not serving" from "not ready yet", so the caller may allow a
+	 *  bounded wait. Default is one attempt: no waiting unless it was asked for. */
+	intervalMs?: number;
+	budgetMs?: number;
 }): Promise<WarpTraffic> {
-	let answer: { status: number; body: string };
-	try {
-		answer = await deps.request();
-	} catch {
-		return "no-traffic";
+	const interval = deps.intervalMs ?? 0;
+	const budget = deps.budgetMs ?? 0;
+	const from = Date.now();
+	for (;;) {
+		let answer: { status: number; body: string } | undefined;
+		try {
+			answer = await deps.request();
+		} catch {
+			answer = undefined;
+		}
+		if (answer && answer.status === 200) {
+			const fact = parseTraceFact(answer.body);
+			if (fact.traffic) return fact.tunnel ? "traffics" : "not-tunnelling";
+		}
+		if (interval <= 0 || Date.now() - from + interval > budget) return "no-traffic";
+		await new Promise((done) => setTimeout(done, interval));
 	}
-	if (answer.status !== 200) return "no-traffic";
-	const fact = parseTraceFact(answer.body);
-	if (!fact.traffic) return "no-traffic";
-	return fact.tunnel ? "traffics" : "not-tunnelling";
+}
+
+/** S34: the traffic answer read together with `/health`, because either one on
+ *  its own blames the wrong thing. Exits declared plus a request that did not
+ *  come back means the binary is not carrying traffic; no exits declared plus no
+ *  answer means the pool is empty, so there was no tunnel to cross and the
+ *  download is not to blame.
+ *
+ *  A report, never a verdict: this returns lines to show and nothing else. No
+ *  caller may block, retry or roll back on it, and the install stands either way.
+ *  `unknown` is "nobody asked", which is not a finding. */
+export function warpTrafficReport({ health, traffic }: { health: unknown; traffic: WarpTraffic }): string[] {
+	const body = health as { exits?: unknown } | undefined;
+	const exits = Array.isArray(body?.exits) ? body.exits.length : 0;
+	if (traffic === "not-tunnelling") {
+		return [
+			"  El proxy nuevo responde y lleva tráfico, pero ese tráfico no va por el túnel:",
+			"  Cloudflare informa warp=off. El binario quedó instalado; conviene revisarlo.",
+		];
+	}
+	if (traffic !== "no-traffic") return [];
+	return exits > 0
+		? [
+				`  El proxy nuevo declara ${exits} salida${exits === 1 ? "" : "s"} y una petición a través suyo`,
+				"  no volvió: el binario instalado es la parte que no está llevando tráfico.",
+				"  La instalación queda, y este informe no decide nada.",
+			]
+		: [
+				"  El proxy nuevo no declara ninguna salida, así que no hay túnel por donde cruzar:",
+				"  el pool está vacío y el binario no tiene la culpa.",
+				"  La instalación queda, y este informe no decide nada.",
+			];
 }
 
 /** One absolute-form GET sent to the proxy. No CONNECT, no TLS, no dependency:
  *  the proxy takes `GET http://host/path` and answers it through the tunnel. */
+/** A loopback read that cannot leave through the tunnel (S40).
+ *  The extension's global fetch can carry the egress dispatcher: a request to
+ *  127.0.0.1:8789 is then dialled inside the tunnel, and an IPv6-only MASQUE
+ *  tunnel has no loopback, so the read fails while the proxy serves fine.
+ *  node:http with no agent always dials the address it was given. */
+export function directLoopbackGet(url: string, timeoutMs = 1500): Promise<{ status: number; body: string }> {
+	return new Promise((done, fail) => {
+		let target: URL;
+		try {
+			target = new URL(url);
+		} catch (error) {
+			fail(error);
+			return;
+		}
+		const req = httpRequest(
+			{
+				host: target.hostname.replace(/^\[|\]$/g, ""),
+				port: target.port || 80,
+				path: `${target.pathname}${target.search}`,
+				method: "GET",
+				headers: { accept: "application/json" },
+			},
+			(res) => {
+				let body = "";
+				res.setEncoding("utf8");
+				res.on("data", (chunk) => (body += chunk));
+				res.on("end", () => done({ status: res.statusCode ?? 0, body }));
+			},
+		);
+		req.setTimeout(timeoutMs, () => req.destroy(new Error("timeout")));
+		req.on("error", fail);
+		req.end();
+	});
+}
+
 export function proxyHttpRequest(
 	proxyUrl: string,
 	target = WARP_TRAFFIC_URL,
@@ -2182,11 +2742,35 @@ export function proxyHttpRequest(
 	});
 }
 
-export async function ensureWarp(): Promise<boolean> {
-	const target = resolveWarpTarget();
+export type EnsureWarpDeps = {
+	target: WarpTarget;
+	probe: (healthUrl: string, attempts: number) => Promise<boolean>;
+	bin: () => string | undefined;
+	configPath: () => string;
+	configExists: () => boolean;
+	/** Start the binary and hand back the process that was started; the caller
+	 *  owns the detaching and the unref. */
+	spawn: (bin: string, args: string[]) => { pid?: number } | undefined;
+	record: (pid: number | undefined, bin: string) => void;
+	/** S32: whether something already listens on the proxy port. */
+	portTaken: (port: number) => Promise<boolean>;
+	/** S31: who that listener is, when the platform can say. */
+	holder?: (port: number) => WarpPortHolder | undefined;
+};
+
+/** D11 + S32: bring the proxy up, or report honestly that it is not up.
+ *
+ *  The record this writes has to describe the process that actually serves. A
+ *  spawn onto a port somebody else already holds dies on bind, and recording
+ *  its pid is how a corpse became the identity that every later stop then
+ *  refused to touch. So the port is asked before anything is spawned: when it
+ *  is already held, the record is corrected to the listener when that listener
+ *  is provably ours, and nothing new is started. */
+export async function ensureWarpWithDeps(deps: EnsureWarpDeps): Promise<boolean> {
+	const target = deps.target;
 
 	// (a) Probe the resolved health endpoint — if WARP answers, we are done.
-	if (await probeWarp(target.healthUrl, 2)) return true;
+	if (await deps.probe(target.healthUrl, 2)) return true;
 
 	// (b) The target lives on another machine: nothing can be started from here,
 	//     so report the miss silently and let the relay degrade per its mode.
@@ -2194,36 +2778,80 @@ export async function ensureWarp(): Promise<boolean> {
 
 	// (c) No health response from a local target: try to find a binary. If none
 	//     exists, stay completely silent (startup must not warn or download).
-	const bin = resolveWarpBin();
+	const bin = deps.bin();
 	if (!bin) return false;
 
-	// (d) Spawn the binary, handing it the shared config file when it exists so
+	// (d) S32: is the port already somebody's? A spawn that cannot bind would die
+	//     and its pid would overwrite the record of the process still serving.
+	let taken = true;
+	try {
+		taken = Boolean(await deps.portTaken(target.port));
+	} catch {
+		taken = true; // a check that failed observed nothing, so nothing is spawned
+	}
+	if (taken) {
+		let holder: WarpPortHolder | undefined;
+		try {
+			holder = deps.holder?.(target.port);
+		} catch {
+			holder = undefined;
+		}
+		// Only a listener that is provably our binary may become the record; a
+		// foreign one is reported by the stop path, not adopted here.
+		if (holder?.ours) deps.record(holder.pid, holder.exe ?? bin);
+		// The holder may still be coming up: give it the same probe instead of a
+		// spawn that could never have bound.
+		return await deps.probe(target.healthUrl, 6);
+	}
+
+	// (e) Spawn the binary, handing it the shared config file when it exists so
 	//     both sides read the same listen address and health path.
 	try {
-		const installConfig = warpConfigPath();
-		const args = existsSync(installConfig) ? ["-config", installConfig] : [];
-		const child = spawn(bin, args, {
-			stdio: "ignore",
-			detached: true,
-			windowsHide: true,
-		});
-		child.once("error", () => undefined); // surface via probe failure
+		const installConfig = deps.configPath();
+		const args = deps.configExists() ? ["-config", installConfig] : [];
+		const child = deps.spawn(bin, args);
 		// D11: remember what was started, so a later update can stop exactly this
 		// process instead of hunting a pid by name or leaving it serving an old
 		// binary while a new one sits on disk.
-		recordWarpProcess(child.pid, bin);
-		child.unref();
+		deps.record(child?.pid, bin);
 
-		// (e) Probe again up to 6 attempts.
-		return await probeWarp(target.healthUrl, 6);
+		// (f) Probe again up to 6 attempts.
+		return await deps.probe(target.healthUrl, 6);
 	} catch (err) {
-		// (f) Log once via warpWarned.
+		// (g) Log once via warpWarned.
 		if (!warpWarned) {
 			console.error(`pi-free-bridge: could not start warp-minimal — ${(err as Error).message}`);
 			warpWarned = true;
 		}
 		return false;
 	}
+}
+
+export async function ensureWarp(): Promise<boolean> {
+	const target = resolveWarpTarget();
+	const installed = warpInstallPath();
+	return ensureWarpWithDeps({
+		target,
+		probe: probeWarp,
+		bin: resolveWarpBin,
+		configPath: warpConfigPath,
+		configExists: () => existsSync(warpConfigPath()),
+		spawn: (bin, args) => {
+			const child = spawn(bin, args, {
+				stdio: "ignore",
+				detached: true,
+				windowsHide: true,
+			});
+			child.once("error", () => undefined); // surface via probe failure
+			child.unref();
+			return child;
+		},
+		record: recordWarpProcess,
+		// S31/S32: the port and the executable behind it are the facts; the record
+		// this may write is only a claim about the process that serves.
+		portTaken: (port) => observePortHeld(target.host, port),
+		holder: (port) => resolveWarpPortHolder({ port, installed, pids: warpPidsOnPort, exeOf: exeBehindPid }),
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -2389,14 +3017,53 @@ function warpAssetKey(): string | undefined {
 	return `${os}_${arch}`;
 }
 
+/** Why the last release read failed, in words an owner can act on.
+ *
+ *  "GitHub did not answer" is not a diagnosis: the measured failure was a 403
+ *  saying the unauthenticated limit for this IP was spent, and the only useful
+ *  part of that answer — which limit, and when it comes back — was being thrown
+ *  away. It is kept here so the message can name the cause and the wait. */
+/** Turn a failed release read into a sentence that names the cause and the wait.
+ *
+ *  Pure, because the interesting part is the text and the text is what was wrong:
+ *  it said "GitHub did not answer" for a 403 that said exactly what was spent and
+ *  when it comes back. */
+export function releaseReadFailure(
+	status: number,
+	body: string,
+	header: (name: string) => string | null,
+): string {
+	const message = /"message"\s*:\s*"([^"]{0,200})"/.exec(String(body ?? ""))?.[1] ?? "";
+	const parts = [`GitHub answered ${status}${message ? `: ${message}` : ""}`];
+	const reset = header("x-ratelimit-reset");
+	if (reset && /^\d+$/.test(reset)) {
+		parts.push(`the limit comes back at ${new Date(Number(reset) * 1000).toISOString().slice(11, 16)} UTC`);
+	}
+	if (header("x-ratelimit-remaining") === "0") parts.push("requests remaining: 0");
+	return parts.join("; ");
+}
+
+let lastReleaseReadFailure: string | undefined;
+
 /** Latest platform asset from the release API. */
 async function findWarpAsset(): Promise<{ tag: string; url: string; name: string; size: number } | undefined> {
+	lastReleaseReadFailure = undefined;
 	try {
 		const res = await fetch(WARP_RELEASE_API, {
 			headers: { "user-agent": "pi-free-bridge" },
 			signal: AbortSignal.timeout(10000),
 		});
-		if (!res.ok) return undefined;
+		if (!res.ok) {
+			// The body carries the reason; the reset header carries the wait.
+			let body = "";
+			try {
+				body = (await res.text()).slice(0, 300);
+			} catch {
+				body = "";
+			}
+			lastReleaseReadFailure = releaseReadFailure(res.status, body, (name) => res.headers.get(name));
+			return undefined;
+		}
 		const release = (await res.json()) as {
 			tag_name?: unknown;
 			assets?: { name?: unknown; browser_download_url?: unknown; size?: unknown }[];
@@ -2584,6 +3251,13 @@ export type SwapDeps = {
 	stopRelay: () => Promise<boolean>;
 	startRelay: () => Promise<boolean>;
 	askContinue: () => Promise<"wait" | "rollback" | "none">;
+	/** S33: what this swap is replacing. The helper is shared by the relay and by
+	 *  the proxy, so the noun in its messages comes from the caller and is never
+	 *  baked in as "the relay". */
+	label?: "relay" | "proxy";
+	/** S31/S33: the sentence the stop itself produced. It wins over the generic
+	 *  one, because only it can name the pid and the executable left alone. */
+	stopReason?: () => string | undefined;
 	logPath?: string;
 	now?: () => Date;
 };
@@ -2593,6 +3267,9 @@ export type SwapResult = {
 	rolledBack: boolean;
 	reason?: string;
 	installed?: string;
+	/** S33: set only when nothing was replaced. It names the file still in place,
+	 *  which is the whole truth a caller may report — never "not restored". */
+	inPlace?: string;
 };
 
 /** Remove leftovers from the version-in-filename scheme.
@@ -2674,12 +3351,16 @@ export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
 	const previous = `${current}.prev`;
 	const logPath = deps.logPath ?? join(deps.dir, "failed.log");
 	const now = deps.now ?? (() => new Date());
+	// S33: this helper serves the relay and the proxy, so it names the one its
+	// caller is replacing — never a noun baked into the helper.
+	const label = deps.label ?? "relay";
 
 	if (!existsSync(deps.downloaded)) {
 		return { ok: false, rolledBack: false, reason: `no está el binario descargado en ${deps.downloaded}` };
 	}
 
-	// S3.2-3: a relay that will not stop must not be replaced underneath itself.
+	// S3.2-3 / S31(a): a process that will not stop must not be replaced
+	// underneath itself. Nothing was renamed, so the file it runs is still there.
 	let stopped = false;
 	try {
 		stopped = await deps.stopRelay();
@@ -2687,7 +3368,20 @@ export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
 		stopped = false;
 	}
 	if (!stopped) {
-		return { ok: false, rolledBack: false, reason: "no se pudo detener el relay que corre" };
+		// S33: the stop's own sentence wins, because only it can name the pid and
+		// the executable it left alone.
+		let own: string | undefined;
+		try {
+			own = deps.stopReason?.()?.trim() || undefined;
+		} catch {
+			own = undefined;
+		}
+		return {
+			ok: false,
+			rolledBack: false,
+			reason: own ?? `no se pudo detener el ${label} que corre`,
+			inPlace: existsSync(current) ? current : undefined,
+		};
 	}
 
 	// S3.4: keep one known-good binary as the rollback target, never a pile.
@@ -2755,7 +3449,7 @@ export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
 	//   3. restore, then delete the failed copy.
 	// The only binary this function removes is one whose bytes already failed, and
 	// only after a known-good one is back in place.
-	const reason = `el relay ${deps.version} no respondió /health`;
+	const reason = `el ${label} ${deps.version} no respondió /health`;
 	appendFailedLog(logPath, `${now().toISOString()}\t${deps.version}\t${reason}`);
 
 	// The build we just started is **still running** — that is the whole reason we
@@ -3889,12 +4583,19 @@ export default async function (pi: ExtensionAPI) {
 		let staged: string | undefined;
 		let swapAttempted = false;
 		let stoppedForSwap: boolean | undefined;
+		// True when the swap accepted the port as proof because /health never came.
+		let servedBoundOnly = false;
 		let swapOk = false;
+		let swapInPlace: string | undefined;
+		let stopReason: string | undefined;
+		let proxyHealthBody: unknown;
 
 		const proxyHealth = async (): Promise<unknown> => {
 			try {
-				const res = await fetch(target.healthUrl, { signal: AbortSignal.timeout(1500) });
-				return res.ok ? await res.json() : undefined;
+				// S40: direct, never through the tunnel. This is the probe that read
+				// "no respondió /health" for two healthy builds in a row.
+				const res = await directLoopbackGet(target.healthUrl, 1500);
+				return res.status >= 200 && res.status < 300 ? JSON.parse(res.body) : undefined;
 			} catch {
 				return undefined;
 			}
@@ -3904,10 +4605,12 @@ export default async function (pi: ExtensionAPI) {
 		/** Where the old binary stands after an attempt that installed no verified
 		 *  build. Never a bare verdict: every branch names a file. */
 		const restoreNote = (): string[] => {
-			if (!swapAttempted) return [`  nothing was swapped: ${binPath} is the binary it already was.`];
-			if (stoppedForSwap === false) return [`  the proxy could not be stopped, so ${binPath} was not replaced.`];
-			if (swapOk) return [`  the new binary is at ${binPath}; the previous one is kept as ${binPath}.prev.`];
-			return [`  the previous binary was not restored: ${binPath} does not hold it.`];
+			if (!swapAttempted) return [`  No se cambió nada: ${binPath} sigue siendo el binario que ya estaba.`];
+			if (stoppedForSwap === false) return [`  No se pudo detener el proxy, así que ${binPath} no se reemplazó.`];
+			if (swapOk) return [`  El binario nuevo está en ${binPath}; el anterior quedó guardado como ${binPath}.prev.`];
+			// S33: a swap that renamed nothing never "failed to restore" anything.
+			if (swapInPlace) return [`  No se reemplazó nada: ${swapInPlace} sigue en su lugar.`];
+			return [`  No se pudo restaurar el binario anterior: ${binPath} no lo contiene.`];
 		};
 
 		let result: UpdateWarpBinaryResult | undefined;
@@ -3920,7 +4623,18 @@ export default async function (pi: ExtensionAPI) {
 				// Proof, not declaration: one request through the proxy. It talks to
 				// the proxy directly, so the relay's egress mode never enters it.
 				probeTraffic: () =>
-					probeWarpTraffic({ request: () => proxyHttpRequest(target.url) }),
+					probeWarpTraffic({
+						request: () => proxyHttpRequest(target.url),
+						// S41: the pool takes seconds to enroll; a cold start must not read
+						// as "the build carries no traffic".
+						intervalMs: 500,
+						budgetMs: WARP_START_ATTEMPTS * WARP_RESTART_POLL_MS,
+					}),
+				// The published build is compared with the installed one before
+				// anything is stopped: an update that has nothing to install must not
+				// evict a working proxy, and must not spend an exit proving it.
+				installedPath: binPath,
+				sameFile: sameBinaryFile,
 				latestTag: async () => {
 					asset = await findWarpAsset();
 					return asset?.tag ?? null;
@@ -3932,6 +4646,7 @@ export default async function (pi: ExtensionAPI) {
 				confirm: async () => {
 					const lines = [
 						`${asset?.tag ?? "the latest release"} — warp-minimal from github.com/Deury08/warp-minimal`,
+						"  update path: S41 — direct /health, cold-pool wait, eviction by path",
 						`  installs to ${binPath}`,
 						"  the published sha256 is verified before anything is executed",
 						"",
@@ -3961,14 +4676,36 @@ export default async function (pi: ExtensionAPI) {
 						downloaded,
 						version: String(tag).replace(/^v/, "") || "unknown",
 						timeoutMs: RELAY_SWAP_TIMEOUT_MS,
+						// S33: this command replaces the proxy, so the shared helper says so and
+						// repeats whatever the stop itself reported (S31: only that sentence
+						// can name the pid and the executable left alone).
+						label: "proxy",
+						stopReason: () => stopReason,
 						stopRelay: async () => {
-							stoppedForSwap = await warpStopForSwap(target.healthUrl);
+							stopReason = undefined;
+							stoppedForSwap = await warpStopForSwap(target.healthUrl, (url) =>
+								stopWarpFromMenu(url, (reason) => {
+									stopReason = reason;
+								}),
+							);
 							return stoppedForSwap;
 						},
 						startRelay: () =>
 							warpStartAndVerify({
 								start: () => ensureWarp(),
-								probe: proxyHealth,
+								// The port is a fact the OS owns; /health is a request that, on a
+								// measured machine, never arrives while the proxy serves fine.
+								probe: async () => {
+									const evidence = await warpServed({
+										health: proxyHealth,
+										held: async () => {
+											const where = warpAddressOf(target.healthUrl);
+											return where ? observePortHeld(where.host, where.port) : false;
+										},
+									});
+									if (evidence && (evidence as { bound?: unknown }).bound === true) servedBoundOnly = true;
+									return evidence;
+								},
 								sleep: (ms) => new Promise<void>((done) => setTimeout(done, ms)),
 							}),
 						askContinue: async () => {
@@ -3987,10 +4724,19 @@ export default async function (pi: ExtensionAPI) {
 						},
 					});
 					swapOk = swapped.ok;
-					return { ok: swapped.ok, rolledBack: swapped.rolledBack, reason: swapped.reason };
+					swapInPlace = swapped.inPlace;
+					return {
+						ok: swapped.ok,
+						rolledBack: swapped.rolledBack,
+						reason: swapped.reason,
+						inPlace: swapped.inPlace,
+					};
 				},
 				readRunningCommit: async () => {
 					const body = (await proxyHealth()) as { build?: { commit?: unknown } } | undefined;
+					// S34: the /health read that proves the commit is also what the traffic
+					// report is read with; one answer alone blames the wrong thing.
+					proxyHealthBody = body;
 					const commit = body?.build && typeof body.build.commit === "string" ? body.build.commit.trim() : "";
 					return commit && commit !== "unknown" ? commit : null;
 				},
@@ -4010,10 +4756,10 @@ export default async function (pi: ExtensionAPI) {
 			}
 		}
 
-		const lines = ["free-bridge-warp-update", `  target:  ${describeWarpTarget(target)}`];
+		const lines = ["Actualización de warp-minimal", `  proxy:   ${describeWarpTarget(target)}`];
 
 		if (!result) {
-			lines.push(`  the update stopped on an error: ${thrown ?? "no result was reported"}.`, ...restoreNote());
+			lines.push(`  La actualización se detuvo con un error: ${thrown ?? "no se informó ningún resultado"}.`, ...restoreNote());
 			ctx.ui.notify(lines.join("\n"), "error");
 			return;
 		}
@@ -4021,47 +4767,63 @@ export default async function (pi: ExtensionAPI) {
 		switch (result.status) {
 			case "up-to-date":
 				lines.push(
-					`  ${result.tag} is already the release this extension installed${
+					`  ${result.tag} ya es la versión que instaló esta extensión${
 						result.commit ? ` (commit ${result.commit})` : ""
-					}: nothing was downloaded.`,
+					}: no se descargó nada.`,
 				);
 				break;
 			case "unknown":
 				lines.push(
-					"  the Deury08/warp-minimal release could not be read, so nothing was",
-					"  downloaded and nothing was touched: the proxy keeps the binary it has.",
-					"  Run this command again once GitHub answers.",
+					"  No se pudieron leer las versiones publicadas de Deury08/warp-minimal:",
+					"  no se descargó nada y no se tocó nada. El proxy sigue con el binario que tiene.",
+					`  ${result.reason ?? "no se informó el motivo"}`,
+					"  GitHub permite 60 consultas por hora por IP sin cuenta; el proxy no se ve",
+					"  afectado, y este comando se puede volver a ejecutar cuando pase la espera.",
 				);
 				break;
 			case "declined":
-				lines.push("  you answered no: nothing was downloaded and nothing was stopped.");
+				lines.push("  Respondiste que no: no se descargó nada y no se detuvo nada.");
 				break;
+			case "same-build": {
+				// The honest report for a machine that was already right: the file was
+				// replaced by the same bytes, so nothing was touched and nothing spent.
+				const hash = createHash("sha256").update(readFileSync(binPath)).digest("hex").slice(0, 12);
+				lines.push(
+					`  La versión publicada es idéntica, byte por byte, al archivo que ya está en ${binPath}`,
+					`  (sha256 ${hash}…): no hay nada que instalar y nada que reemplazar.`,
+					"  No se detuvo el proxy, no se renombró ningún archivo y no se gastó ninguna salida.",
+				);
+				break;
+			}
 			case "updated":
-				// The row said "hay X" before installing X. It must not keep saying it
+				// S39: the proof is the request, not the declaration. One real request
+				// through the proxy says the new build serves, and it says so whatever
+				// the relay's egress mode happens to be, because it talks to the proxy.
+				if (result.traffic === "traffics") {
+					lines.push("  La petición de prueba cruzó el túnel: el proxy nuevo está sirviendo.");
+				}
+				if (result.identityUnreadable) {
+					lines.push(
+						`  El proxy en ${binPath} está corriendo pero no declara su versión, y un binario`,
+						"  que no declara su versión es anterior a la que incorporó ese dato:",
+						"  la instalación queda, el registro dice «desconocida» y conviene reemplazarlo.",
+					);
+				}
 				// until the next restart: after this point the installed tag is a fact
 				// this session produced.
 				if (result.tag) noteInstalledTag(WARP_RELEASE_API, result.tag);
-				if (result.traffic === "not-tunnelling") {
-					lines.push(
-						"  the new proxy answers and carries traffic, but that traffic is not tunnelling:",
-						"  Cloudflare reports warp=off. The binary is installed; it is worth a look.",
-					);
-				}
-				if (result.traffic === "no-traffic") {
-					lines.push(
-						"  the new proxy started and declared its exits, but a request through it did not",
-						"  come back: the install stands, and the tunnel still has to prove itself.",
-					);
-				}
+				// S34: reported together with /health and nothing more. It never blocks
+				// the install, never rolls back and is never retried.
+				lines.push(...warpTrafficReport({ health: proxyHealthBody, traffic: result.traffic ?? "unknown" }));
 				lines.push(
-					`  ${result.tag} is installed, and ${target.healthUrl} answers /health`,
-					`  with commit ${result.commit}: this extension recorded what now runs.`,
+					`  ${result.tag} quedó instalado, y ${target.healthUrl} responde /health`,
+					`  con el commit ${result.commit}: esta extensión registró lo que ahora corre.`,
 				);
 				break;
 			case "rolled-back":
 				lines.push(
-					`  the new build did not prove itself: ${result.reason}.`,
-					`  the previous binary was put back at ${binPath}; the build that failed was deleted.`,
+					`  La versión nueva no llegó a probar que sirve: ${result.reason}.`,
+					`  Se dejó el binario anterior en ${binPath}; el que falló se borró.`,
 				);
 				break;
 			case "failed":
