@@ -7744,3 +7744,28 @@ test("an update whose published file is the installed file touches nothing (S35)
 		"nothing is stopped, swapped or probed for a file that is already installed",
 	);
 });
+
+test("a vacuous comparison is never reported as the same file (S35)", async () => {
+	// The message claims the published build is byte-identical to what is already
+	// installed. That is a fact only when both files exist and were both read; a
+	// missing installed file is a first install, and a downloaded path that is the
+	// installed path is the file compared with itself.
+	const { sameBinaryFile } = await import("../index.ts");
+	const dir = mkdtempSync(join(tmpdir(), "pi-bridge-same-"));
+	try {
+		const installed = join(dir, "warp-minimal");
+		const downloaded = join(dir, "warp-minimal.tmp");
+		writeFileSync(installed, "binary-bytes");
+		writeFileSync(downloaded, "binary-bytes");
+
+		assert.equal(await sameBinaryFile(downloaded, installed), true, "same bytes is a match");
+		assert.equal(await sameBinaryFile(downloaded, downloaded), false, "a file is not its own published build");
+		assert.equal(await sameBinaryFile(join(dir, "missing"), installed), false, "a missing download proves nothing");
+		assert.equal(await sameBinaryFile(downloaded, join(dir, "missing")), false, "a first install is not a match");
+
+		writeFileSync(downloaded, "other-bytes");
+		assert.equal(await sameBinaryFile(downloaded, installed), false, "different bytes is not a match");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

@@ -4,7 +4,7 @@ import { request as httpRequest } from "node:http";
 import { connect as netConnect } from "node:net";
 import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
@@ -1763,6 +1763,32 @@ export type UpdateWarpBinaryResult = {
  *  running proxy reports — a swap that returns ok but no identity proved
  *  nothing. Every effect is a dependency so this can be measured without a
  *  network, a binary or a running proxy. */
+/** Is the downloaded file byte-identical to the file already installed?
+ *
+ *  Two comparisons are refused, because a vacuous "same" is worse than no answer:
+ *  a missing installed file is a first install, not a match, and a downloaded path
+ *  that is the installed path is the file compared with itself — which would let
+ *  the update claim it verified something it never looked at.
+ */
+export async function sameBinaryFile(downloadedFile: string, installedFile: string): Promise<boolean> {
+	let a: string;
+	let b: string;
+	try {
+		a = resolve(downloadedFile);
+		b = resolve(installedFile);
+	} catch {
+		return false;
+	}
+	if (a === b) return false;
+	if (!existsSync(a) || !existsSync(b)) return false;
+	try {
+		return createHash("sha256").update(readFileSync(a)).digest("hex") ===
+			createHash("sha256").update(readFileSync(b)).digest("hex");
+	} catch {
+		return false;
+	}
+}
+
 export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<UpdateWarpBinaryResult> {
 	const latestTag = await deps.latestTag();
 	const installed = deps.installedRecord();
@@ -4467,15 +4493,7 @@ export default async function (pi: ExtensionAPI) {
 				// anything is stopped: an update that has nothing to install must not
 				// evict a working proxy, and must not spend an exit proving it.
 				installedPath: binPath,
-				sameFile: async (downloadedFile, installedFile) => {
-					const hashOf = (path: string): string =>
-						createHash("sha256").update(readFileSync(path)).digest("hex");
-					try {
-						return hashOf(downloadedFile) === hashOf(installedFile);
-					} catch {
-						return false;
-					}
-				},
+				sameFile: sameBinaryFile,
 				latestTag: async () => {
 					asset = await findWarpAsset();
 					return asset?.tag ?? null;
@@ -4615,8 +4633,9 @@ export default async function (pi: ExtensionAPI) {
 				// replaced by the same bytes, so nothing was touched and nothing spent.
 				const hash = createHash("sha256").update(readFileSync(binPath)).digest("hex").slice(0, 12);
 				lines.push(
-					`  the published build is byte-identical to the installed one (sha256 ${hash}…):`,
-					`  nothing was stopped, nothing was renamed and nothing was probed. ${binPath} is unchanged.`,
+					`  the published build is byte-identical to the file already at ${binPath}`,
+					`  (sha256 ${hash}…), so there is nothing to install and nothing to replace:`,
+					"  nothing was stopped, nothing was renamed and nothing was probed.",
 				);
 				break;
 			}
