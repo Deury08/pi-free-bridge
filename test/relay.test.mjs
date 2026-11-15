@@ -7195,3 +7195,14 @@ test("the release tag is read at startup, not when the menu opens (T9d)", async 
 	// A URL nobody warmed is "no answer" — never a live read from the menu path.
 	assert.equal(await latestPublishedTag("https://example.invalid/never"), null);
 });
+
+test("a sector keeps its declared order, not the ascending index order", () => {
+	const { sectorActions, MENU_SECTIONS } = releaseMod;
+	const warp = MENU_SECTIONS.find((section) => section.label === "WARP");
+
+	// Every action visible: the sector's own reading order wins.
+	assert.deepEqual(sectorActions(warp.actions, [2, 3, 7]), [2, 7, 3]);
+	// Hidden ones drop out without disturbing the order of the rest.
+	assert.deepEqual(sectorActions(warp.actions, [7, 2]), [2, 7]);
+	assert.deepEqual(sectorActions(warp.actions, []), []);
+});
