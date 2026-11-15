@@ -3374,35 +3374,58 @@ export function menuUpdateSuffix({
 	return ` — hay ${latest}, corre ${current}`;
 }
 
-/** The latest published tag, cached. The menu opens far more often than a
- *  release is published, and an unauthenticated GitHub API tolerates sixty reads
- *  an hour: without this, opening the menu a few times would spend them. A
- *  failure is cached too, as "no answer", so a broken network does not turn every
- *  menu open into an eight-second wait. */
-const LATEST_TAG_TTL_MS = 5 * 60 * 1000;
-const latestTagCache = new Map<string, { at: number; tag: string | null }>();
+/** The latest published tag, read once when the extension loads. A menu open must
+ *  spend nothing: the API allows sixty unauthenticated reads an hour, and a menu
+ *  is opened far more often than a release is published. The read is a promise
+ *  stored at startup, so the first menu open waits for it at most once and every
+ *  later one is already settled. A failure stays a failure — "no answer" is a
+ *  fact this row is allowed to state. */
+const latestTagReads = new Map<string, Promise<string | null>>();
 
-export async function latestPublishedTag(url: string, now = Date.now()): Promise<string | null> {
-	const hit = latestTagCache.get(url);
-	if (hit && now - hit.at < LATEST_TAG_TTL_MS) return hit.tag;
-	let tag: string | null = null;
+export async function readLatestTag(
+	url: string,
+	fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
 	try {
-		const res = await fetch(url, {
+		const res = await fetchImpl(url, {
 			headers: { "user-agent": "pi-free-bridge" },
 			signal: AbortSignal.timeout(8000),
 		});
-		if (res.ok) {
-			const body = (await res.json()) as { tag_name?: unknown };
-			tag = typeof body.tag_name === "string" ? body.tag_name : null;
-		}
+		if (!res.ok) return null;
+		const body = (await res.json()) as { tag_name?: unknown };
+		return typeof body.tag_name === "string" ? body.tag_name : null;
 	} catch {
-		tag = null;
+		return null;
 	}
-	latestTagCache.set(url, { at: now, tag });
-	return tag;
+}
+
+/** Starts the one read per URL, at startup. Calling it twice is harmless. */
+export function warmLatestTags(urls: readonly string[], fetchImpl: typeof fetch = fetch): void {
+	for (const url of urls) {
+		if (!latestTagReads.has(url)) latestTagReads.set(url, readLatestTag(url, fetchImpl));
+	}
+}
+
+/** The startup answer, or "no answer" when nothing was read for this URL. */
+export async function latestPublishedTag(url: string): Promise<string | null> {
+	const pending = latestTagReads.get(url);
+	return pending ? await pending : null;
+}
+
+/** After an install we know the tag better than any read does: the row must not
+ *  keep saying "hay 0.4.1" about the release we just installed. */
+export function noteInstalledTag(url: string, tag: string): void {
+	latestTagReads.set(url, Promise.resolve(tag));
 }
 
 export default async function (pi: ExtensionAPI) {
+	// One read per release, at startup, in the background: the menu must not wait
+	// for the network, but it must have the fact when it opens.
+	try {
+		warmLatestTags([WARP_RELEASE_API, RELAY_RELEASE_API]);
+	} catch {
+		// A release read that cannot even start is "no answer", not a crash.
+	}
 	const g = globalThis as Record<symbol, unknown>;
 	if (g[REG_KEY]) return;
 
@@ -3856,6 +3879,10 @@ export default async function (pi: ExtensionAPI) {
 				lines.push("  you answered no: nothing was downloaded and nothing was stopped.");
 				break;
 			case "updated":
+				// The row said "hay X" before installing X. It must not keep saying it
+				// until the next restart: after this point the installed tag is a fact
+				// this session produced.
+				if (result.tag) noteInstalledTag(WARP_RELEASE_API, result.tag);
 				lines.push(
 					`  ${result.tag} is installed, and ${target.healthUrl} answers /health`,
 					`  with commit ${result.commit}: this extension recorded what now runs.`,
