@@ -3354,6 +3354,13 @@ export function visibleMenuIndices(state: {
 	return visible;
 }
 
+/** The sector's own order, filtered by what this machine can use. Filtering the
+ *  ascending visible list instead would silently reorder the sector: the declared
+ *  order is the reading order, not an implementation detail. */
+export function sectorActions(actions: readonly number[], visible: readonly number[]): number[] {
+	return actions.filter((index) => visible.includes(index));
+}
+
 /** What a row can honestly say about being behind. The label carries a fact, not
  *  a promise: with no installed tag there is nothing to compare, so it names the
  *  published version instead of claiming "up to date". A row that cannot read
@@ -4189,7 +4196,7 @@ export default async function (pi: ExtensionAPI) {
 		// not offered at all, so the menu never opens on a dead end.
 		const sections = MENU_SECTIONS.map((section) => ({
 			label: section.label,
-			actions: visible.filter((index) => section.actions.includes(index)),
+			actions: sectorActions(section.actions, visible),
 		})).filter((section) => section.actions.length > 0);
 
 		const pickedSector = await pickMenuItem(
