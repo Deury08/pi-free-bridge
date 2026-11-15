@@ -1835,7 +1835,9 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 	if (decision === "unknown") {
 		return {
 			status: "unknown",
-			reason: "the release could not be read: with no published tag there is nothing to install and nothing to claim",
+			reason: lastReleaseReadFailure
+				? `the release could not be read — ${lastReleaseReadFailure}`
+				: "the release could not be read: with no published tag there is nothing to install and nothing to claim",
 		};
 	}
 	if (decision === "up-to-date" && !deps.force) {
@@ -2967,14 +2969,53 @@ function warpAssetKey(): string | undefined {
 	return `${os}_${arch}`;
 }
 
+/** Why the last release read failed, in words an owner can act on.
+ *
+ *  "GitHub did not answer" is not a diagnosis: the measured failure was a 403
+ *  saying the unauthenticated limit for this IP was spent, and the only useful
+ *  part of that answer — which limit, and when it comes back — was being thrown
+ *  away. It is kept here so the message can name the cause and the wait. */
+/** Turn a failed release read into a sentence that names the cause and the wait.
+ *
+ *  Pure, because the interesting part is the text and the text is what was wrong:
+ *  it said "GitHub did not answer" for a 403 that said exactly what was spent and
+ *  when it comes back. */
+export function releaseReadFailure(
+	status: number,
+	body: string,
+	header: (name: string) => string | null,
+): string {
+	const message = /"message"\s*:\s*"([^"]{0,200})"/.exec(String(body ?? ""))?.[1] ?? "";
+	const parts = [`GitHub answered ${status}${message ? `: ${message}` : ""}`];
+	const reset = header("x-ratelimit-reset");
+	if (reset && /^\d+$/.test(reset)) {
+		parts.push(`the limit comes back at ${new Date(Number(reset) * 1000).toISOString().slice(11, 16)} UTC`);
+	}
+	if (header("x-ratelimit-remaining") === "0") parts.push("requests remaining: 0");
+	return parts.join("; ");
+}
+
+let lastReleaseReadFailure: string | undefined;
+
 /** Latest platform asset from the release API. */
 async function findWarpAsset(): Promise<{ tag: string; url: string; name: string; size: number } | undefined> {
+	lastReleaseReadFailure = undefined;
 	try {
 		const res = await fetch(WARP_RELEASE_API, {
 			headers: { "user-agent": "pi-free-bridge" },
 			signal: AbortSignal.timeout(10000),
 		});
-		if (!res.ok) return undefined;
+		if (!res.ok) {
+			// The body carries the reason; the reset header carries the wait.
+			let body = "";
+			try {
+				body = (await res.text()).slice(0, 300);
+			} catch {
+				body = "";
+			}
+			lastReleaseReadFailure = releaseReadFailure(res.status, body, (name) => res.headers.get(name));
+			return undefined;
+		}
 		const release = (await res.json()) as {
 			tag_name?: unknown;
 			assets?: { name?: unknown; browser_download_url?: unknown; size?: unknown }[];
@@ -4679,7 +4720,9 @@ export default async function (pi: ExtensionAPI) {
 				lines.push(
 					"  the Deury08/warp-minimal release could not be read, so nothing was",
 					"  downloaded and nothing was touched: the proxy keeps the binary it has.",
-					"  Run this command again once GitHub answers.",
+					`  ${result.reason ?? "no reason was reported"}`,
+					"  An anonymous GitHub read allows 60 requests an hour per IP; the proxy is",
+					"  unaffected either way, and this command can be run again after the wait.",
 				);
 				break;
 			case "declined":

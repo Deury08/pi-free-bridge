@@ -7795,3 +7795,25 @@ test("a proxy that holds its port counts as started even without /health (S36)",
 		"a health read that threw is the same as one that did not answer",
 	);
 });
+
+test("a rate-limited release read says which limit and when it returns (S37)", async () => {
+	// "GitHub did not answer" names no cause and no wait. The measured failure was a
+	// 403 whose body and reset header carry both.
+	const { releaseReadFailure } = await import("../index.ts");
+	const reset = String(Math.floor(Date.UTC(2026, 10, 15, 3, 0, 0) / 1000));
+	const headers = { "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset };
+	const header = (name) => headers[name] ?? null;
+
+	const said = releaseReadFailure(
+		403,
+		JSON.stringify({ message: "API rate limit exceeded for 186.1.90.133." }),
+		header,
+	);
+	assert.match(said, /GitHub answered 403/);
+	assert.match(said, /API rate limit exceeded for 186\.1\.90\.133/);
+	assert.match(said, /03:00 UTC/);
+	assert.match(said, /requests remaining: 0/);
+
+	const plain = releaseReadFailure(500, "", () => null);
+	assert.equal(plain, "GitHub answered 500", "a bare status is still a fact and never a guess");
+});
