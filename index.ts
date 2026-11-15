@@ -1737,11 +1737,6 @@ export type UpdateWarpBinaryDeps = {
 	sameFile?: (downloaded: string, installed: string) => Promise<boolean>;
 	/** Where the installed binary lives, so `sameFile` has something to compare to. */
 	installedPath?: string;
-	/** Did the swap observe the proxy holding its port without answering /health?
-	 *  Then the install stands even though the build cannot name its own commit:
-	 *  the operating system says something bound the port, and the thing that binds
-	 *  it is the binary this update just started. */
-	servedWithoutHealth?: () => boolean;
 	/** The menu installs on request even when the tag matches: what the owner asks
 	 *  for there is the file on disk replaced with the published one, not a
 	 *  comparison. Without it, an update that only reports "up to date" would
@@ -1884,17 +1879,11 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 		};
 	}
 
+	// S38: the build's identity is a fact to record, never a gate to pass. A build
+	// that answers /health without declaring `build.commit` — every release before
+	// that field existed — was installed and then thrown away for not describing
+	// itself, which is the update refusing to keep a binary that works.
 	const commit = await deps.readRunningCommit();
-	const served = deps.servedWithoutHealth?.() === true;
-	if (!commit && !served) {
-		return {
-			status: "failed",
-			tag,
-			reason: "the new build was installed but did not identify itself, so what runs cannot be verified — no record was written",
-		};
-	}
-	// "unknown" is what an unreadable identity is called. It is recorded honestly
-	// rather than invented, and the message says so.
 	const recorded = commit ?? "unknown";
 	deps.writeRecord({ tag, commit: recorded });
 	let traffic: WarpTraffic = "unknown";
@@ -4683,7 +4672,6 @@ export default async function (pi: ExtensionAPI) {
 					const commit = body?.build && typeof body.build.commit === "string" ? body.build.commit.trim() : "";
 					return commit && commit !== "unknown" ? commit : null;
 				},
-				servedWithoutHealth: () => servedBoundOnly,
 				writeRecord: ({ tag, commit }) => writeWarpInstallRecord({ tag, commit }),
 			});
 		} catch (err) {
@@ -4742,8 +4730,9 @@ export default async function (pi: ExtensionAPI) {
 			case "updated":
 				if (result.identityUnreadable) {
 					lines.push(
-						`  the proxy holds ${binPath} and its port, but it never answered /health,`,
-						"  so it could not name its own commit: the record says unknown, and the install stands.",
+						`  the proxy at ${binPath} is running but did not name its build, and a proxy`,
+						"  that does not name its build is older than the release that introduced it:",
+						"  the install stands, the record says unknown, and the binary is worth replacing.",
 					);
 				}
 				// until the next restart: after this point the installed tag is a fact

@@ -7384,9 +7384,10 @@ test("updateWarpBinary: a rolled-back swap reports the rollback with its reason 
 	assert.deepEqual(notRestored.written, []);
 });
 
-// Success is not the swap returning ok: it is the proxy reporting the commit it
-// runs, and that commit is what the record keeps. A null commit is not success.
-test("updateWarpBinary: success writes the record with the commit read from the proxy, and a null commit writes nothing (T9c)", async () => {
+// S38: the identity is recorded, not required. A build that answers /health without
+// declaring `build.commit` — every release before that field existed — was installed
+// and then thrown away for not describing itself.
+test("updateWarpBinary: the record keeps the reported commit, and records unknown when the build cannot say (T9c, S38)", async () => {
 	const fakes = updateFakes();
 	const result = await releaseMod.updateWarpBinary(fakes.deps);
 	assert.equal(result.status, "updated");
@@ -7405,11 +7406,15 @@ test("updateWarpBinary: success writes the record with the commit read from the 
 	);
 
 	const anonymous = updateFakes({ runningCommit: null });
-	const failed = await releaseMod.updateWarpBinary(anonymous.deps);
-	assert.equal(failed.status, "failed", "a build that does not identify itself is not a success");
-	assert.match(failed.reason, /identif/i, "it says the new build did not identify itself");
-	assert.equal(anonymous.calls.writeRecord, 0, "no record is written without a commit");
-	assert.deepEqual(anonymous.written, []);
+	const unnamed = await releaseMod.updateWarpBinary(anonymous.deps);
+	assert.equal(unnamed.status, "updated", "a build that answers without naming its commit is still installed");
+	assert.equal(unnamed.commit, "unknown", "an unreadable identity is called unknown, never invented");
+	assert.equal(unnamed.identityUnreadable, true, "the message can say the identity was unreadable");
+	assert.deepEqual(
+		anonymous.written,
+		[{ tag: "v0.5.0", commit: "unknown" }],
+		"the record keeps the tag and says unknown for what could not be read",
+	);
 });
 
 // S33: the swap helper serves both the relay and the proxy, so the noun it
