@@ -118,41 +118,61 @@ paso 1.
 Dentro de Pi escribí `/free-bridge`. Con el `/` aparece el autocompletado; Enter
 abre el menú.
 
-![El menú de /free-bridge](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/03-abriendo-el-menu-de-configuracion.png)
+El menú tiene **dos niveles, por sectores**, porque siete filas sueltas no se
+leen: primero elegís de qué hablás, después qué hacés.
 
-En una máquina recién instalada **sin Bun** el menú muestra un solo ítem,
-«Instalar / actualizar relay», porque los demás solo podrían fallar. En cuanto
-el relay corre aparecen los demás, y «Reciclar WARP» se suma recién cuando hay un
-binario de WARP al cual pedirle la rotación.
+```
+Relay    → Instalar / actualizar relay · Estado del relay
+WARP     → Modo: on / off · Instalar/actualizar warp · Reciclar WARP
+Red      → Protocolo: v1 / v2
+Sesión   → Modelos · Refrescar sesión
+```
 
-Con Bun instalado el menú arranca ya con los seis restantes: la instalación del
-relay no aparece ni antes ni después, porque no hay nada que instalar.
+![El menú por sectores](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/03-menu-por-sectores.png)
+
+Qué filas aparecen depende de tu máquina, y las ausencias son información:
+
+- **Sin Bun y sin relay**, el menú es **una sola fila**: «Instalar / actualizar
+  relay». Todo lo demás sólo podría fallar.
+- **Con Bun**, esa fila no aparece ni antes ni después: el relay ya corre con tu
+  Bun, no hay nada que instalar. En el sector **Relay** te queda «Estado del
+  relay».
+- **Con un relay corriendo**, «Instalar/actualizar warp» aparece aunque no haya
+  binario de WARP todavía: esa fila es cómo se instala.
+- «Reciclar WARP» se suma recién cuando hay un binario al cual pedirle una salida
+  nueva.
+
+Las filas de instalación dicen además en qué estado estás: `al día (0.4.0)`,
+`hay 0.4.1, corre 0.4.0`, o que no se pudo verificar la última versión. Elegirlas
+**siempre descarga**, aunque digan que estás al día.
 
 ### 4. Instalar el relay — **sólo si no tenés Bun**
 
 **Si ya tenés Bun instalado, salteá este paso entero.** El menú ni siquiera te
 ofrece «Instalar / actualizar relay», porque no hay nada que instalar: el relay
-ya corre con tu Bun. Los otros seis ítems aparecen igual, y el puente funciona
-sin bajar un solo byte.
+ya corre con tu Bun. Los tres sectores restantes aparecen igual, y el puente
+funciona sin bajar un solo byte. En el sector Relay, «Instalar / actualizar
+relay» simplemente no está:
 
-Sin Bun, elegí «Instalar / actualizar relay». Antes de bajar nada te muestra la
+![El sector Relay con Bun instalado: no hay fila para descargar el relay](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/04-sector-relay-con-bun.png)
+
+Sin Bun, entrá a **Relay → Instalar / actualizar relay**. Antes de bajar nada te muestra la
 versión, el tamaño, de dónde lo baja y dónde lo instala, y te avisa que
 **detiene el relay que esté corriendo —lo haya arrancado esta extensión o vos—**.
 Elegí `Yes`: el `SHA256SUMS` publicado se verifica solo y, si no coincide, no se
 reemplaza nada.
 
-![Seleccionando Instalar / actualizar relay](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/04-seleccionando-instalar-actualizar-relay.png)
-
 ![Confirmación de la descarga del binario del relay](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/05-aceptando-la-descarga-del-binario-del-relay.png)
 
 ### 5. Activar WARP (opcional)
 
-Con el relay instalado ya aparecen los demás ítems. Si querés salir por WARP, abrí
-«WARP: on / off». Si no tenés WARP corriendo ni el binario instalado, Pi te lo
+Con el relay corriendo ya aparecen los demás sectores. Si querés salir por WARP,
+abrí **WARP → Modo: on / off**.
+
+![El sector WARP: modo, instalar/actualizar warp, y reciclar](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/06-sector-warp-modo.png)
+ Si no tenés WARP corriendo ni el binario instalado, Pi te lo
 pregunta antes de bajar nada: versión, tamaño, origen y destino. Elegí **`Yes`** y
 el checksum se verifica solo contra el `checksums.txt` del release.
-
-![Encendiendo WARP desde el menú](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/06-encendiendo-warp.png)
 
 ![Confirmación de la descarga de warp-minimal](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/07-confirmando-la-descarga-de-warp.png)
 
@@ -165,7 +185,9 @@ el checksum se verifica solo contra el `checksums.txt` del release.
 
 El cambio aplica en el próximo pedido, sin reiniciar nada.
 
-![Modo de WARP configurado en el menú](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/08-configuracion-de-warp.png)
+![El modo elegido, y la fila diciendo cuál está activo](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/08-modo-de-warp-elegido.png)
+
+La fila vuelve a decir lo que está pasando: `Modo: on / off — ahora: auto`.
 
 ### Alternativa: desde el repo clonado
 
