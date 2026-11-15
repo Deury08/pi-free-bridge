@@ -1729,6 +1729,14 @@ export type UpdateWarpBinaryDeps = {
 	 *  declaration said the pool is ready; this is the only thing that proves the
 	 *  binary actually serves, and it never depends on the relay's egress mode. */
 	probeTraffic?: () => Promise<WarpTraffic>;
+	/** Is the downloaded file byte-identical to the installed one? The update is
+	 *  asked to install the published build; when the published build is already
+	 *  what is installed, the safe and honest answer is not to touch anything. It
+	 *  used to evict, swap and probe in that case, which cost an exit and reported
+	 *  a failure for a machine that was already correct. */
+	sameFile?: (downloaded: string, installed: string) => Promise<boolean>;
+	/** Where the installed binary lives, so `sameFile` has something to compare to. */
+	installedPath?: string;
 	/** The menu installs on request even when the tag matches: what the owner asks
 	 *  for there is the file on disk replaced with the published one, not a
 	 *  comparison. Without it, an update that only reports "up to date" would
@@ -1737,7 +1745,7 @@ export type UpdateWarpBinaryDeps = {
 };
 
 export type UpdateWarpBinaryResult = {
-	status: "up-to-date" | "unknown" | "declined" | "updated" | "rolled-back" | "failed";
+	status: "up-to-date" | "unknown" | "declined" | "same-build" | "updated" | "rolled-back" | "failed";
 	tag?: string;
 	commit?: string;
 	reason?: string;
@@ -1780,6 +1788,17 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 			tag,
 			reason: "the download failed and nothing was changed: the proxy keeps the binary it already had",
 		};
+	}
+
+	// Nothing is stopped, renamed or probed for a file that is already in place.
+	if (deps.sameFile && deps.installedPath) {
+		let same = false;
+		try {
+			same = await deps.sameFile(downloaded, deps.installedPath);
+		} catch {
+			same = false;
+		}
+		if (same) return { status: "same-build", tag };
 	}
 
 	const swapped = await deps.swap(downloaded, tag);
@@ -4444,6 +4463,19 @@ export default async function (pi: ExtensionAPI) {
 				// the proxy directly, so the relay's egress mode never enters it.
 				probeTraffic: () =>
 					probeWarpTraffic({ request: () => proxyHttpRequest(target.url) }),
+				// The published build is compared with the installed one before
+				// anything is stopped: an update that has nothing to install must not
+				// evict a working proxy, and must not spend an exit proving it.
+				installedPath: binPath,
+				sameFile: async (downloadedFile, installedFile) => {
+					const hashOf = (path: string): string =>
+						createHash("sha256").update(readFileSync(path)).digest("hex");
+					try {
+						return hashOf(downloadedFile) === hashOf(installedFile);
+					} catch {
+						return false;
+					}
+				},
 				latestTag: async () => {
 					asset = await findWarpAsset();
 					return asset?.tag ?? null;
@@ -4578,6 +4610,16 @@ export default async function (pi: ExtensionAPI) {
 			case "declined":
 				lines.push("  you answered no: nothing was downloaded and nothing was stopped.");
 				break;
+			case "same-build": {
+				// The honest report for a machine that was already right: the file was
+				// replaced by the same bytes, so nothing was touched and nothing spent.
+				const hash = createHash("sha256").update(readFileSync(binPath)).digest("hex").slice(0, 12);
+				lines.push(
+					`  the published build is byte-identical to the installed one (sha256 ${hash}…):`,
+					`  nothing was stopped, nothing was renamed and nothing was probed. ${binPath} is unchanged.`,
+				);
+				break;
+			}
 			case "updated":
 				// The row said "hay X" before installing X. It must not keep saying it
 				// until the next restart: after this point the installed tag is a fact

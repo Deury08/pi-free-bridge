@@ -7706,3 +7706,41 @@ test("loopback never crosses the tunnel (S30g)", async () => {
 	assert.equal(isLoopbackDestination("http://10.0.0.5:8789/health"), false, "a LAN address is not loopback");
 	assert.equal(isLoopbackDestination("not a url"), false, "unparseable is not a loopback claim");
 });
+
+test("an update whose published file is the installed file touches nothing (S35)", async () => {
+	// The published build was already on disk, yet the update evicted the proxy,
+	// swapped a byte-identical file and probed the tunnel — spending an exit to
+	// report a failure for a machine that was already correct.
+	const calls = [];
+	const result = await releaseMod.updateWarpBinary({
+		latestTag: async () => "v0.4.0",
+		installedRecord: () => ({ tag: "v0.4.0", commit: "b396732" }),
+		confirm: async () => true,
+		download: async () => "/tmp/warp-minimal.tmp",
+		installedPath: "/home/u/.pi/agent/pi-free-bridge/warp/warp-minimal",
+		sameFile: async (a, b) => {
+			calls.push([a, b]);
+			return true;
+		},
+		swap: async () => {
+			calls.push("swap");
+			return { ok: true, rolledBack: false };
+		},
+		readRunningCommit: async () => {
+			calls.push("readRunningCommit");
+			return "b396732";
+		},
+		writeRecord: () => calls.push("writeRecord"),
+		probeTraffic: async () => {
+			calls.push("probeTraffic");
+			return "traffics";
+		},
+		force: true,
+	});
+	assert.equal(result.status, "same-build", JSON.stringify(result));
+	assert.deepEqual(
+		calls.filter((c) => c === "swap" || c === "probeTraffic" || c === "readRunningCommit"),
+		[],
+		"nothing is stopped, swapped or probed for a file that is already installed",
+	);
+});
