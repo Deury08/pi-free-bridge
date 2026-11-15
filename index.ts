@@ -4728,6 +4728,12 @@ export default async function (pi: ExtensionAPI) {
 				break;
 			}
 			case "updated":
+				// S39: the proof is the request, not the declaration. One real request
+				// through the proxy says the new build serves, and it says so whatever
+				// the relay's egress mode happens to be, because it talks to the proxy.
+				if (result.traffic === "traffics") {
+					lines.push("  the published build carries traffic through the tunnel: the install stands.");
+				}
 				if (result.identityUnreadable) {
 					lines.push(
 						`  the proxy at ${binPath} is running but did not name its build, and a proxy`,
