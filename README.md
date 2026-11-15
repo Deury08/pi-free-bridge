@@ -30,11 +30,7 @@ El relay necesita un runtime, y hay dos caminos para tenerlo:
 
 **Si ya tenés Bun, no instales el relay.** El código ya lo tenés, y las
 actualizaciones del relay viajan con npm — la misma instalación que actualiza la
-extensión:
-
-```bash
-pi install npm:pi-free-bridge
-```
+extensión, en [Cómo se instala](#cómo-se-instala).
 
 Un binario compilado, en cambio, npm nunca lo toca: se actualiza sólo desde el
 menú. Por eso el menú ofrece «Instalar / actualizar relay» **únicamente si Bun
@@ -79,17 +75,8 @@ funciona igual contra tu conexión directa.
 
 ### 1. Instalar la extensión
 
-Escribí el comando en el terminal y dale Enter:
-
-```bash
-gentle-shell install npm:pi-free-bridge
-```
-
-o, si instalás directo con Pi:
-
-```bash
-pi install npm:pi-free-bridge
-```
+El comando es el de [Cómo se instala](#cómo-se-instala), con la forma que te
+toque: `gentle-shell` o `pi`. Escribilo en el terminal y dale Enter.
 
 ![Escribiendo el comando de instalación](https://raw.githubusercontent.com/Deury08/pi-free-bridge/master/Imagenes/01-escribiendo-el-comando-de-instalacion.png)
 
@@ -235,8 +222,9 @@ ni desactivar WARP.
 - **Falta un modelo en el picker.** Corré `/free-bridge-doctor`: arregla la
   lista de modelos que ve el picker y te dice por qué. Si ya estaba arreglada,
   reiniciá Pi.
-- **El paquete desaparece después de `pi update`.** `pi list`, y después
-  `pi install npm:pi-free-bridge` otra vez.
+- **El paquete desaparece después de `pi update`.** Corré `pi list` y, si no
+  está, volvé a instalarlo con el comando de
+  [Cómo se instala](#cómo-se-instala).
 
 ## El detalle técnico
 
