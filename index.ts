@@ -3137,21 +3137,25 @@ async function runRelayInstallFlow(ctx: WarpPromptContext): Promise<boolean> {
 		timeoutMs: RELAY_SWAP_TIMEOUT_MS,
 		previous,
 		stopRelay: () => stopRelayByHealthPid(RELAY_SWAP_TIMEOUT_MS),
-		startRelay: async () => {
-			const resolved = resolveSessionId();
-			try {
-				await ensureRelay({
-					port: RELAY_PORT,
-					sessionId: resolved.sessionId,
-					sessionSource: resolved.source,
-					upstream: UPSTREAM_URL,
-					cwd: process.cwd(),
-				});
-			} catch {
-				return false;
-			}
-			return !!(await fetchRelayHealth(RELAY_PORT));
-		},
+		// The same deadline as the proxy, because it is the same question: did the
+		// binary we just installed manage to serve? One immediate probe answered
+		// "no" whenever the spawn returned before the port was bound — a relay
+		// that was merely young, rolled back as if it were broken.
+		startRelay: () =>
+			warpStartAndVerify({
+				start: async () => {
+					const resolved = resolveSessionId();
+					await ensureRelay({
+						port: RELAY_PORT,
+						sessionId: resolved.sessionId,
+						sessionSource: resolved.source,
+						upstream: UPSTREAM_URL,
+						cwd: process.cwd(),
+					});
+				},
+				probe: () => fetchRelayHealth(RELAY_PORT),
+				sleep: (ms) => new Promise<void>((done) => setTimeout(done, ms)),
+			}),
 		askContinue: async () => {
 			if (!ctx.hasUI) return "none";
 			const wait = await ctx.ui.confirm(
