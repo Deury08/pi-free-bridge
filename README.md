@@ -33,7 +33,7 @@ actualizaciones del relay viajan con npm — la misma instalación que actualiza
 extensión:
 
 ```bash
-pi install npm:pi-free-bridge@0.7.1
+pi install npm:pi-free-bridge
 ```
 
 Un binario compilado, en cambio, npm nunca lo toca: se actualiza sólo desde el
@@ -65,18 +65,6 @@ gentle-shell install npm:pi-free-bridge
 # comando para pi
 pi install npm:pi-free-bridge
 ```
-
-> ⚠️ **Actualizar no es lo mismo que instalar.** `pi install npm:pi-free-bridge`
-> **no** te sube de versión si ya lo tenés instalado: Pi graba
-> `"pi-free-bridge": "^0.5.0"` en su `package.json`, y el caret en `0.x` sólo
-> mueve parches, así que `0.6.0` queda afuera. Para actualizar, pedí la versión
-> explícita:
->
-> ```bash
-> pi install npm:pi-free-bridge@0.7.1
-> ```
->
-> Una instalación nueva, sin lockfile, resuelve `latest` sin problema.
 
 Reiniciá Pi una vez y escribí `/free-bridge` para abrir el menú.
 
