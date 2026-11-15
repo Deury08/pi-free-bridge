@@ -7420,6 +7420,32 @@ test("updateWarpBinary: the record keeps the reported commit, and records unknow
 // S33: the swap helper serves both the relay and the proxy, so the noun it
 // stopped is the caller's. "the relay" baked into a shared helper tells the
 // user about a process that was never involved.
+// S40: the /health read that keeps failing on the measured machine. The global
+// fetch in an extension process can carry the egress dispatcher, and a loopback
+// dial inside an IPv6-only tunnel fails. node:http with no agent cannot do that.
+test("directLoopbackGet reaches a loopback listener even when an HTTP proxy is configured (S40)", async () => {
+	const { createServer } = await import("node:http");
+	const server = createServer((req, res) => {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ ok: true, path: req.url }));
+	});
+	await new Promise((done) => server.listen(0, "127.0.0.1", done));
+	const port = server.address().port;
+	const before = process.env.HTTP_PROXY;
+	process.env.HTTP_PROXY = "http://127.0.0.1:1";
+	process.env.http_proxy = "http://127.0.0.1:1";
+	try {
+		const res = await releaseMod.directLoopbackGet(`http://127.0.0.1:${port}/health`);
+		assert.equal(res.status, 200, "the loopback read answers from the listener it named");
+		assert.deepEqual(JSON.parse(res.body), { ok: true, path: "/health" }, "it returns the body the proxy sent");
+	} finally {
+		if (before === undefined) delete process.env.HTTP_PROXY;
+		else process.env.HTTP_PROXY = before;
+		delete process.env.http_proxy;
+		server.close();
+	}
+});
+
 test("swap: a failed stop names the process the caller says it stopped (S33)", async () => {
 	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
 	const reasonFor = async (over) =>

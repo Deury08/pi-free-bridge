@@ -2644,6 +2644,41 @@ export function warpTrafficReport({ health, traffic }: { health: unknown; traffi
 
 /** One absolute-form GET sent to the proxy. No CONNECT, no TLS, no dependency:
  *  the proxy takes `GET http://host/path` and answers it through the tunnel. */
+/** A loopback read that cannot leave through the tunnel (S40).
+ *  The extension's global fetch can carry the egress dispatcher: a request to
+ *  127.0.0.1:8789 is then dialled inside the tunnel, and an IPv6-only MASQUE
+ *  tunnel has no loopback, so the read fails while the proxy serves fine.
+ *  node:http with no agent always dials the address it was given. */
+export function directLoopbackGet(url: string, timeoutMs = 1500): Promise<{ status: number; body: string }> {
+	return new Promise((done, fail) => {
+		let target: URL;
+		try {
+			target = new URL(url);
+		} catch (error) {
+			fail(error);
+			return;
+		}
+		const req = httpRequest(
+			{
+				host: target.hostname.replace(/^\[|\]$/g, ""),
+				port: target.port || 80,
+				path: `${target.pathname}${target.search}`,
+				method: "GET",
+				headers: { accept: "application/json" },
+			},
+			(res) => {
+				let body = "";
+				res.setEncoding("utf8");
+				res.on("data", (chunk) => (body += chunk));
+				res.on("end", () => done({ status: res.statusCode ?? 0, body }));
+			},
+		);
+		req.setTimeout(timeoutMs, () => req.destroy(new Error("timeout")));
+		req.on("error", fail);
+		req.end();
+	});
+}
+
 export function proxyHttpRequest(
 	proxyUrl: string,
 	target = WARP_TRAFFIC_URL,
@@ -4533,8 +4568,10 @@ export default async function (pi: ExtensionAPI) {
 
 		const proxyHealth = async (): Promise<unknown> => {
 			try {
-				const res = await fetch(target.healthUrl, { signal: AbortSignal.timeout(1500) });
-				return res.ok ? await res.json() : undefined;
+				// S40: direct, never through the tunnel. This is the probe that read
+				// "no respondió /health" for two healthy builds in a row.
+				const res = await directLoopbackGet(target.healthUrl, 1500);
+				return res.status >= 200 && res.status < 300 ? JSON.parse(res.body) : undefined;
 			} catch {
 				return undefined;
 			}
