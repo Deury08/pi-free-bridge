@@ -6902,6 +6902,281 @@ test("warpStopForSwap: only a stop it can prove lets the binary be replaced (D11
 	}
 });
 
+// S31: the listener is the fact, the record is only a hint. A record whose pid
+// has died must not block stopping the process that really holds the port.
+test("stopWarpProxy: a port holder running the installed binary is stopped even when the record's pid is gone (S31)", async () => {
+	const installed = "/home/u/.pi/agent/pi-free-bridge/warp/warp-minimal";
+	const signals = [];
+	let alive = true;
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			// The record names the spawn that died; its executable cannot be read.
+			recorded: () => ({ pid: 41918, bin: installed }),
+			exeOf: () => undefined,
+			holder: () => ({ pid: 34153, exe: installed, ours: true }),
+			probe: async () => (alive ? { ok: true } : undefined),
+			kill: (pid, signal) => {
+				signals.push(`${signal}:${pid}`);
+				alive = false;
+			},
+		}),
+	);
+	assert.equal(result, "stopped");
+	assert.deepEqual(signals, ["SIGTERM:34153"], "the listener is stopped, never the dead recorded pid");
+});
+
+// S31: a holder that is not our binary is never touched, not even when the
+// record claims a matching pid: a pid that does not hold the port is not the
+// thing to kill. The refusal has to name the executable it left alone.
+test("stopWarpProxy: a port holder that is not the installed binary is left alone and the refusal names it (S31)", async () => {
+	const installed = "/home/u/.pi/agent/pi-free-bridge/warp/warp-minimal";
+	let killed = 0;
+	const refusals = [];
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			recorded: () => ({ pid: 4242, bin: installed }),
+			exeOf: () => installed,
+			holder: () => ({ pid: 34153, exe: "/usr/bin/something-else", ours: false }),
+			refuse: (reason) => {
+				refusals.push(reason);
+			},
+			kill: () => {
+				killed += 1;
+			},
+		}),
+	);
+	assert.equal(result, "refused");
+	assert.equal(killed, 0, "a foreign listener is never signalled");
+	assert.equal(refusals.length, 1, "the refusal is reported exactly once");
+	assert.match(refusals[0], /\/usr\/bin\/something-else/, "the refusal names the executable it left alone");
+});
+
+// S31: the resolver decides ownership from canonical paths, so a Linux
+// " (deleted)" marker — what the kernel reports after a rename replaced a live
+// process's file — is the same binary, while anything else is not ours.
+test("resolveWarpPortHolder: the port decides who holds it, and a deleted marker is the same binary (S31)", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pfb-holder-"));
+	try {
+		const installed = join(dir, "warp-minimal");
+		writeFileSync(installed, "binary");
+		const resolve = (over = {}) =>
+			releaseMod.resolveWarpPortHolder({
+				port: 8789,
+				installed,
+				pids: () => [34153],
+				exeOf: () => installed,
+				...over,
+			});
+
+		const holder = resolve();
+		assert.ok(holder, "the listener is identified");
+		assert.equal(holder.pid, 34153);
+		assert.equal(holder.ours, true, "the installed binary is ours");
+
+		assert.equal(resolve({ exeOf: () => `${installed} (deleted)` }).ours, true, "a renamed binary is still the same binary");
+		assert.equal(resolve({ exeOf: () => join(dir, ".", "warp-minimal") }).ours, true, "another spelling of one path is one file");
+
+		const foreign = resolve({ exeOf: () => join(dir, "another-program") });
+		assert.equal(foreign.ours, false, "any other executable is not ours to stop");
+		assert.match(foreign.exe, /another-program/, "and the holder keeps the path that will be named");
+
+		assert.equal(resolve({ pids: () => [] }), undefined, "nobody listening is nobody identified");
+		assert.equal(resolve({ pids: () => undefined }), undefined, "a lookup nobody can answer is not a claim");
+		assert.equal(resolve({ exeOf: () => undefined }), undefined, "an unreadable executable is not ours");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// S31: the updater owns the binary, so every process executing the installed one
+// is its to stop — not only the port holder, and never a same-named binary from
+// another directory.
+test("stopWarpProxy: every process running the installed binary is evicted, path-scoped (S31)", async () => {
+	const installed = "/home/u/.pi/agent/pi-free-bridge/warp/warp-minimal";
+	const signals = [];
+	const live = new Set([34153, 41918]);
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			recorded: () => undefined,
+			holder: () => ({ pid: 34153, exe: installed, ours: true }),
+			ours: () => [34153, 41918, 999],
+			exeOf: (pid) => (pid === 999 ? "/usr/bin/warp-minimal" : installed),
+			probe: async () => (live.size > 0 ? { ok: true } : undefined),
+			kill: (pid, signal) => {
+				signals.push(`${signal}:${pid}`);
+				live.delete(pid);
+			},
+		}),
+	);
+	assert.equal(result, "stopped");
+	assert.deepEqual(
+		signals,
+		["SIGTERM:34153", "SIGTERM:41918"],
+		"each process of our binary is stopped once, and the same-named foreign binary is untouched",
+	);
+});
+
+// S31(b,c): the port is the last word. A holder that survives the bounded wait is
+// a failure that names the pid, never a quiet proceed onto a held port.
+test("stopWarpProxy: a port still held after the bounded wait is a refusal that names the holder (S31)", async () => {
+	const installed = "/home/u/.pi/agent/pi-free-bridge/warp/warp-minimal";
+	const signals = [];
+	const refusals = [];
+	const result = await releaseMod.stopWarpProxy(
+		stopDeps({
+			attempts: 2,
+			holder: () => ({ pid: 34153, exe: installed, ours: true }),
+			portHeld: async () => true,
+			refuse: (reason) => {
+				refusals.push(reason);
+			},
+			kill: (pid, signal) => {
+				signals.push(`${signal}:${pid}`);
+			},
+		}),
+	);
+	assert.equal(result, "refused", "a port that never came free is no permission to replace");
+	assert.deepEqual(signals, ["SIGTERM:34153", "SIGKILL:34153"], "the wait is bounded and exhausted, never extended");
+	assert.equal(refusals.length, 1, "the refusal is reported exactly once");
+	assert.match(refusals[0], /34153/, "it names the pid that would not die");
+	assert.match(refusals[0], /warp-minimal/, "and the executable still holding the port");
+});
+
+// S31 preserve: for a caller that cannot identify the listener, the D11 record
+// policy is untouched — the recorded pid is stopped, a mismatched executable is
+// still refused.
+test("stopWarpProxy: without a port holder the record still decides, as before (S31 preserve)", async () => {
+	const signals = [];
+	let alive = true;
+	const stopped = await releaseMod.stopWarpProxy(
+		stopDeps({
+			probe: async () => (alive ? { ok: true } : undefined),
+			kill: (pid, signal) => {
+				signals.push(`${signal}:${pid}`);
+				alive = false;
+			},
+		}),
+	);
+	assert.equal(stopped, "stopped");
+	assert.deepEqual(signals, ["SIGTERM:4242"], "the recorded pid is still what stops");
+	assert.equal(
+		await releaseMod.stopWarpProxy(stopDeps({ exeOf: () => "/usr/bin/something-else" })),
+		"refused",
+		"a reused pid is still refused",
+	);
+});
+
+const warpTargetFixture = () => ({
+	host: "127.0.0.1",
+	port: 8789,
+	healthPath: "/health",
+	url: "http://127.0.0.1:8789",
+	healthUrl: "http://127.0.0.1:8789/health",
+	isLoopback: true,
+	source: "default",
+});
+
+const WARP_BIN_FIXTURE = "/home/u/.pi/agent/pi-free-bridge/warp/warp-minimal";
+
+const ensureWarpDeps = (over = {}) => ({
+	target: warpTargetFixture(),
+	probe: async () => false,
+	bin: () => WARP_BIN_FIXTURE,
+	configPath: () => "/home/u/.pi/agent/pi-free-bridge/warp/config.json",
+	configExists: () => false,
+	spawn: () => undefined,
+	record: () => undefined,
+	portTaken: async () => false,
+	...over,
+});
+
+// S32: a process started on a port somebody else holds dies on bind, so its pid
+// must never become the record — that corpse is exactly what made every later
+// stop refuse. When nothing answers and the port is held, nothing is spawned.
+test("ensureWarp: a port that is already taken never turns the spawn into the record (S32)", async () => {
+	const spawns = [];
+	const records = [];
+	const probes = [];
+	const started = await releaseMod.ensureWarpWithDeps(
+		ensureWarpDeps({
+			probe: async (_url, attempts) => {
+				probes.push(attempts);
+				return false;
+			},
+			spawn: (bin, args) => {
+				spawns.push({ bin, args });
+				return { pid: 41918 };
+			},
+			record: (pid, bin) => {
+				records.push({ pid, bin });
+			},
+			portTaken: async () => true,
+			holder: () => undefined,
+		}),
+	);
+	assert.equal(started, false, "nothing answers yet, so nothing is claimed");
+	assert.deepEqual(spawns, [], "a spawn that cannot bind is never started");
+	assert.deepEqual(records, [], "and its pid never becomes the record");
+	assert.ok(probes.length >= 2, "the process that holds the port gets another chance to answer");
+});
+
+// S32: the record must keep describing the process that is actually serving. A
+// holder that is provably our binary is recorded; the port is what proves it.
+test("ensureWarp: a taken port keeps the record on the process that is actually serving (S32)", async () => {
+	const records = [];
+	await releaseMod.ensureWarpWithDeps(
+		ensureWarpDeps({
+			record: (pid, bin) => {
+				records.push({ pid, bin });
+			},
+			portTaken: async () => true,
+			holder: () => ({ pid: 34153, exe: WARP_BIN_FIXTURE, ours: true }),
+		}),
+	);
+	assert.deepEqual(
+		records,
+		[{ pid: 34153, bin: WARP_BIN_FIXTURE }],
+		"the record names the listener that serves, never a process that was not even started",
+	);
+});
+
+// S32 preserve: a free port is still started the way it always was — one spawn
+// with the shared config, and that pid recorded.
+test("ensureWarp: a free port still spawns once and records that pid (S32 preserve)", async () => {
+	const spawns = [];
+	const records = [];
+	let healthy = false;
+	const started = await releaseMod.ensureWarpWithDeps(
+		ensureWarpDeps({
+			probe: async () => healthy,
+			configExists: () => true,
+			spawn: (bin, args) => {
+				spawns.push({ bin, args });
+				healthy = true;
+				return { pid: 4242 };
+			},
+			record: (pid, bin) => {
+				records.push({ pid, bin });
+			},
+			portTaken: async () => false,
+		}),
+	);
+	assert.equal(started, true, "the proxy that answers is a successful start");
+	assert.deepEqual(spawns, [{ bin: WARP_BIN_FIXTURE, args: ["-config", "/home/u/.pi/agent/pi-free-bridge/warp/config.json"] }]);
+	assert.deepEqual(records, [{ pid: 4242, bin: WARP_BIN_FIXTURE }], "the pid that was started is the pid recorded");
+});
+
+// ---------------------------------------------------------------------------
+// Identifying the proxy by the port it holds (spec odd/tasks/warp-per-exit-quota.md
+// T8, S31-S32).
+//
+// The record in warp-process.json is a hint: it once named a pid that had
+// already died on a bind it could never win, while the real proxy kept serving.
+// So identity comes from the listener on the port and from its executable, and
+// every process/port fact below is injected — no test reads a live port, spawns
+// anything or signals anything.
+// ---------------------------------------------------------------------------
+
 // D11: the restarted proxy must prove it is the new binary. One not-ready probe
 // is a restart still coming up, not a failure, so the poll must continue.
 test("warpStartAndVerify: the restarted proxy is ready on the second probe (D11)", async () => {
@@ -7101,7 +7376,10 @@ test("updateWarpBinary: a rolled-back swap reports the rollback with its reason 
 	const failed = await releaseMod.updateWarpBinary(notRestored.deps);
 	assert.equal(failed.status, "failed");
 	assert.match(failed.reason, /did not prove itself/, "it says the install did not prove itself");
-	assert.match(failed.reason, /(was not restored|not restored)/, "and that the old binary was not restored");
+	// S33 retired the old claim here: with no file in place reported, the honest
+	// sentence is that nothing was replaced — never that a restore failed.
+	assert.match(failed.reason, /nothing was replaced/, "and that nothing was replaced");
+	assert.doesNotMatch(failed.reason, /not restored/, "it never claims the old binary was not restored");
 	assert.equal(notRestored.calls.writeRecord, 0);
 	assert.deepEqual(notRestored.written, []);
 });
@@ -7132,6 +7410,72 @@ test("updateWarpBinary: success writes the record with the commit read from the 
 	assert.match(failed.reason, /identif/i, "it says the new build did not identify itself");
 	assert.equal(anonymous.calls.writeRecord, 0, "no record is written without a commit");
 	assert.deepEqual(anonymous.written, []);
+});
+
+// S33: the swap helper serves both the relay and the proxy, so the noun it
+// stopped is the caller's. "the relay" baked into a shared helper tells the
+// user about a process that was never involved.
+test("swap: a failed stop names the process the caller says it stopped (S33)", async () => {
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	const reasonFor = async (over) =>
+		(
+			await releaseMod.swapRelayBinary({
+				dir,
+				name: "relay-linux-x64",
+				downloaded: join(dir, "relay-linux-x64.tmp"),
+				version: "0.5.1",
+				timeoutMs: 50,
+				stopRelay: async () => false,
+				startRelay: async () => {
+					throw new Error("a stop that failed must never be followed by a start");
+				},
+				askContinue: async () => "rollback",
+				...over,
+			})
+		).reason;
+
+	const proxy = await reasonFor({ label: "proxy" });
+	assert.match(proxy, /no se pudo detener el proxy/, "the proxy caller hears about the proxy");
+	assert.doesNotMatch(proxy, /relay/, "the shared helper never claims to have stopped the relay");
+
+	const relay = await reasonFor({ label: "relay" });
+	assert.match(relay, /no se pudo detener el relay/, "the relay caller hears about the relay");
+
+	// S31 + S33: the sentence the stop itself produced wins, because only it can
+	// name the executable that was left alone.
+	const named = await reasonFor({
+		label: "proxy",
+		stopReason: () => "no se pudo detener el proxy: lo ocupa el pid 34153 (/usr/bin/something-else)",
+	});
+	assert.match(named, /\/usr\/bin\/something-else/, "the executable nobody would touch is named");
+	assert.equal(readOr(dir, "relay-linux-x64"), "OLD", "nothing moved in any of the three cases");
+});
+
+// S33: a swap that renamed nothing cannot have failed to restore anything. The
+// only true statement is that nothing was replaced, and it names the file that
+// is still where it was.
+test("updateWarpBinary: a swap that renamed nothing claims no restoration and names the file in place (S33)", async () => {
+	const inPlace = "/home/u/.pi/agent/pi-free-bridge/warp/warp-minimal";
+	const fakes = updateFakes({
+		swapResult: {
+			ok: false,
+			rolledBack: false,
+			reason: "no se pudo detener el proxy que corre",
+			inPlace,
+		},
+	});
+	const result = await releaseMod.updateWarpBinary(fakes.deps);
+	assert.equal(result.status, "failed");
+	assert.match(result.reason, /did not prove itself/, "it still says the install did not prove itself");
+	assert.match(result.reason, /nothing was replaced/, "and that nothing was replaced");
+	assert.doesNotMatch(
+		result.reason,
+		/(was not restored|not restored)/,
+		"a swap that renamed nothing must never claim a restore failed",
+	);
+	assert.ok(result.reason.includes(inPlace), "it names the file that is still in place");
+	assert.equal(fakes.calls.writeRecord, 0, "no record is written for a swap that replaced nothing");
+	assert.deepEqual(fakes.written, []);
 });
 
 test("menuUpdateSuffix: the label states a fact, never a wish (T9d)", () => {
@@ -7313,6 +7657,40 @@ test("an install that starts and declares exits but carries no traffic still sta
 	});
 	assert.equal(result.status, "updated", JSON.stringify(result));
 	assert.equal(result.traffic, "no-traffic");
+});
+
+test("the traffic report is read together with /health, so an empty pool is never blamed on the binary (S34)", () => {
+	const { warpTrafficReport } = releaseMod;
+	const declaredHealth = { build: { commit: "b04459a" }, capabilities: { exits: true }, exits: [{ id: "warp-1", ip: "2a09::1" }] };
+	const emptyHealth = { build: { commit: "b04459a" }, capabilities: { exits: true }, exits: [] };
+
+	// Exits declared and no answer: the binary is the part that did not deliver.
+	const declared = warpTrafficReport({ health: declaredHealth, traffic: "no-traffic" }).join("\n");
+	assert.match(declared, /declares 1 exit/, "it repeats what /health declared");
+	assert.match(declared, /does not carry traffic/, "and then blames the binary that carried nothing");
+
+	// No exits declared and no answer: the pool is empty, so there was nothing to
+	// carry the request through. Blaming the download here is the defect.
+	const empty = warpTrafficReport({ health: emptyHealth, traffic: "no-traffic" }).join("\n");
+	assert.match(empty, /declares no exit/, "it says the pool declared nothing");
+	assert.match(empty, /pool is empty/, "and names the empty pool as the reason");
+	assert.match(empty, /not to blame/, "exonerating the binary it cannot judge");
+	assert.doesNotMatch(empty, /does not carry traffic/, "the two answers are never conflated");
+	assert.notEqual(empty, declared, "an empty pool and a broken binary read differently");
+
+	// A report, never a verdict: no line may threaten the install.
+	for (const text of [declared, empty]) {
+		assert.doesNotMatch(text, /(roll ?back|rolled back|will be replaced|reinstalled|fail)/i, "the traffic report decides nothing");
+	}
+
+	// Nothing asked is nothing to report, and traffic that arrived is not an alarm.
+	assert.deepEqual(warpTrafficReport({ health: declaredHealth, traffic: "unknown" }), []);
+	assert.deepEqual(warpTrafficReport({ health: declaredHealth, traffic: "traffics" }), []);
+	assert.match(
+		warpTrafficReport({ health: declaredHealth, traffic: "not-tunnelling" }).join("\n"),
+		/warp=off/,
+		"traffic that is not tunnelling is its own answer",
+	);
 });
 
 test("loopback never crosses the tunnel (S30g)", async () => {

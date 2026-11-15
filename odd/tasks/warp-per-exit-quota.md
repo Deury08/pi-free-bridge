@@ -223,6 +223,40 @@ interpretation ever crosses into the proxy. Round 2 is the relay asking for a
 rotation and then *reading* what the pool publishes afterwards; the proxy is not
 told why, and must not be able to tell.
 
+S31. The update evicts, it does not identify. Replacing the proxy is not a
+comparison: the updater owns the binary, so every process executing the binary
+inside the install directory is the updater's to stop — whatever pid the record
+names, and whether or not the record names anything at all. Ownership scoped by
+path, never by image name: a process running a copy from another directory is not
+ours and is not touched. Three conditions guard the replacement. (a) If any such
+process survives the eviction, nothing is renamed, and the message names the pid
+that would not die — renaming over a live executable fails on Windows and leaves
+an orphan holding the port on Unix. (b) The port must be observed free before the
+new binary starts; starting onto a held port is what produced a dead pid recorded
+as the serving process. (c) The wait for both is bounded, and exhausting it is a
+failure that names what is still there, never a quiet proceed.
+
+S32. A spawn that cannot bind does not own the port, so it must not become the
+record. When the proxy's port is already taken, the extension must not overwrite
+the process record with the process it just started; the record must keep
+describing the process that is actually serving.
+
+S33. A message names the thing it stopped. The shared swap helper is used for both
+the relay and the proxy, so its wording is supplied by the caller, never baked in
+as "the relay". And a swap that renamed nothing must never report that the old
+binary "was not restored": the only true statement is that nothing was replaced,
+and the message names the file that is still in place.
+
+S34. The install reports whether the new binary carries traffic, and that report
+decides nothing. After the new proxy answers /health, one real request goes through
+it to a public endpoint that publishes its tunnel state; the answer is reported as
+traffic, no-traffic or not-tunnelling. It never blocks, never rolls back, never
+retries, and never prevents the install from standing. It is read together with
+/health, because the two answers together mean different things: exits declared
+plus no answer means the binary does not carry traffic, while no exits declared plus
+no answer means the pool is empty and the binary is not to blame. A report that
+conflates those two blames the download for a quarantined exit.
+
 ## Defects found in review
 
 These are defects, not footnotes: each one either produces silently wrong state or
@@ -258,6 +292,8 @@ name — and D7 means the pool can lose an exit to a malformed request.
 | T5 | `/health` reports the ledger and whether routing is live | S12 | relay | f92c990 |
 | T6 | `warp-minimal`: `GET /exits`, `GET /exit/<id>`, credential read, silent fallback, no 407 | S1, S8, S13, S14, S15 | warp-minimal (peer) | peer's tree |
 | T7 | Two-round ladder: free cross-exit rung, one gated rotation, terminal 429 | S20, S21, S22, S23, S24 | relay | pending |
+
+| T8 | Evict every process running the installed binary, wait for the port, replace, start, verify /health, and report traffic without letting it decide | S31, S32, S33, S34 | extension | pending |
 
 ## Log
 
@@ -628,3 +664,20 @@ round-1 non-429 4xx is no longer adopted either. One honest note from the worker
 tree the "unclean for another reason" leg cannot actually name anything, because the
 fallback is fed by choosable exits only — that test is a preserve case, not new behaviour.
 
+L44 (owner, verbatim): "Implementar la identidad por puerto primero"
+
+L45. Observed failure that motivates S31-S33. After an update attempt the record
+said pid 41918 while the real listener was pid 34153: `ensureWarp` had spawned a
+process, written its pid, and that process died because the port was taken. The
+stop then found a dead pid, returned `unknown-pid`, and refused to rename — correct
+behaviour with a broken record. The message it produced said "no se pudo detener el
+relay que corre" (the shared helper's baked-in noun) and then "the install did not
+prove itself and the old binary was not restored" (false: nothing was renamed, and
+`warp-minimal` kept its 17:16 mtime).
+L46 (owner): "osea que el update no revise qeu el warp sirve, solo qeu reemplaces
+y mate topdos los procesos del warp no importa el id y levante el nuevo warp, crees
+qeu esto es funcional?" — answered: functional, with path-scoped eviction, no rename
+while any process survives, and the port observed free before starting.
+
+L47 (owner): "crees qu ea esa idea le podemos poner para ver si trafica o no es
+necesario" — kept, as S34: a report that decides nothing.
