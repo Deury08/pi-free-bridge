@@ -600,8 +600,30 @@ function egressFetch(config, pathname, { body, proxyUrl } = {}, egress) {
 	// S3: an override names one exit (the credential is the only channel that
 	// survives CONNECT, L5). Every caller that passes no override gets exactly the
 	// proxy URL it got before, byte for byte — an older binary sees no difference.
-	if (egress === "warp") opts.proxy = proxyUrl ?? config.warpProxy;
-	return fetch(toUpstreamUrl(config.upstream, pathname), opts);
+	// Loopback never crosses the tunnel. An IPv6-only MASQUE stack has no loopback
+	// to reach, so a proxied request to 127.0.0.1/localhost can only fail — and
+	// failing it through the proxy costs far more than the request: the exit that
+	// carried it is marked unhealthy and benched, which burns an enrollment and
+	// leaves the pool thinner than the request deserved. Whatever upstream is
+	// configured, a loopback destination is fetched directly.
+	const upstreamUrl = toUpstreamUrl(config.upstream, pathname);
+	if (egress === "warp" && !isLoopbackDestination(upstreamUrl)) {
+		opts.proxy = proxyUrl ?? config.warpProxy;
+	}
+	return fetch(upstreamUrl, opts);
+}
+
+/** Is this destination the machine itself? Loopback is not reachable through an
+ *  IPv6-only tunnel, so it must never be handed to a proxy. */
+export function isLoopbackDestination(value) {
+	try {
+		const host = new URL(String(value)).hostname.toLowerCase();
+		return host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host);
+	} catch {
+		// An unparseable destination is not a loopback claim; let the caller fail
+		// on its own terms instead of silently changing how it is fetched.
+		return false;
+	}
 }
 
 /** Pure: per-request warp mode (relay-warp-hot-reload). Precedence: the
