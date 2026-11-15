@@ -380,7 +380,7 @@ corrompería la respuesta SSE.
 
 ### Modo del cable (v1 / v2)
 
-El ítem «Cable: v1 / v2» del menú abre un selector con las dos versiones y marca
+El ítem «Protocolo: v1 / v2» del menú abre un selector con las dos versiones y marca
 cuál está activa, igual que el comando directo que ya no existe. Se guarda como
 `wireMode` en el mismo config y el relay lo relee en cada request, igual que el
 warp: no hay que reiniciar ni reiniciar Pi. Por defecto es `v1`, los cinco
