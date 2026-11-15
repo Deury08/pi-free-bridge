@@ -1737,6 +1737,11 @@ export type UpdateWarpBinaryDeps = {
 	sameFile?: (downloaded: string, installed: string) => Promise<boolean>;
 	/** Where the installed binary lives, so `sameFile` has something to compare to. */
 	installedPath?: string;
+	/** Did the swap observe the proxy holding its port without answering /health?
+	 *  Then the install stands even though the build cannot name its own commit:
+	 *  the operating system says something bound the port, and the thing that binds
+	 *  it is the binary this update just started. */
+	servedWithoutHealth?: () => boolean;
 	/** The menu installs on request even when the tag matches: what the owner asks
 	 *  for there is the file on disk replaced with the published one, not a
 	 *  comparison. Without it, an update that only reports "up to date" would
@@ -1753,6 +1758,8 @@ export type UpdateWarpBinaryResult = {
 	 *  It informs, it never rolls back — a flaky network must not condemn a
 	 *  binary that started and declared its exits. */
 	traffic?: WarpTraffic;
+	/** The proxy ran but never described itself, so the record had to say "unknown". */
+	identityUnreadable?: boolean;
 };
 
 /** T9c: the update, in the only order that is safe. The decision first, because
@@ -1763,6 +1770,37 @@ export type UpdateWarpBinaryResult = {
  *  running proxy reports — a swap that returns ok but no identity proved
  *  nothing. Every effect is a dependency so this can be measured without a
  *  network, a binary or a running proxy. */
+/** Did the proxy start? Two ways to know, and the weaker one is enough.
+ *
+ *  `/health` is the strong answer: the process is up, serving and willing to
+ *  describe itself. But it is an HTTP request made from inside the host, and on a
+ *  measured machine that request never arrives while the proxy serves traffic
+ *  perfectly — so gating the install on it reported a working proxy as broken, and
+ *  the rollback that followed threw away a good build.
+ *
+ *  The port is the weak answer, and it is a fact the operating system owns: if the
+ *  proxy's port is held, something bound it, and the swap only starts the binary
+ *  it installed. A gate that accepts either can no longer fail an install that
+ *  worked; it only reports which evidence it got.
+ */
+export async function warpServed(deps: {
+	health: () => Promise<unknown>;
+	held: () => Promise<boolean>;
+}): Promise<unknown> {
+	try {
+		const body = await deps.health();
+		if (body) return body;
+	} catch {
+		// A health read that threw is the same as one that did not answer.
+	}
+	try {
+		if (await deps.held()) return { bound: true, health: "did not answer" };
+	} catch {
+		return undefined;
+	}
+	return undefined;
+}
+
 /** Is the downloaded file byte-identical to the file already installed?
  *
  *  Two comparisons are refused, because a vacuous "same" is worse than no answer:
@@ -1845,14 +1883,18 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 	}
 
 	const commit = await deps.readRunningCommit();
-	if (!commit) {
+	const served = deps.servedWithoutHealth?.() === true;
+	if (!commit && !served) {
 		return {
 			status: "failed",
 			tag,
 			reason: "the new build was installed but did not identify itself, so what runs cannot be verified — no record was written",
 		};
 	}
-	deps.writeRecord({ tag, commit });
+	// "unknown" is what an unreadable identity is called. It is recorded honestly
+	// rather than invented, and the message says so.
+	const recorded = commit ?? "unknown";
+	deps.writeRecord({ tag, commit: recorded });
 	let traffic: WarpTraffic = "unknown";
 	if (deps.probeTraffic) {
 		try {
@@ -1861,7 +1903,7 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 			traffic = "no-traffic";
 		}
 	}
-	return { status: "updated", tag, commit, traffic };
+	return { status: "updated", tag, commit: recorded, traffic, identityUnreadable: !commit };
 }
 
 /** T9c: is there anything to install? A release publishes its tag and its
@@ -4452,6 +4494,8 @@ export default async function (pi: ExtensionAPI) {
 		let staged: string | undefined;
 		let swapAttempted = false;
 		let stoppedForSwap: boolean | undefined;
+		// True when the swap accepted the port as proof because /health never came.
+		let servedBoundOnly = false;
 		let swapOk = false;
 		let swapInPlace: string | undefined;
 		let stopReason: string | undefined;
@@ -4551,7 +4595,19 @@ export default async function (pi: ExtensionAPI) {
 						startRelay: () =>
 							warpStartAndVerify({
 								start: () => ensureWarp(),
-								probe: proxyHealth,
+								// The port is a fact the OS owns; /health is a request that, on a
+								// measured machine, never arrives while the proxy serves fine.
+								probe: async () => {
+									const evidence = await warpServed({
+										health: proxyHealth,
+										held: async () => {
+											const where = warpAddressOf(target.healthUrl);
+											return where ? observePortHeld(where.host, where.port) : false;
+										},
+									});
+									if (evidence && (evidence as { bound?: unknown }).bound === true) servedBoundOnly = true;
+									return evidence;
+								},
 								sleep: (ms) => new Promise<void>((done) => setTimeout(done, ms)),
 							}),
 						askContinue: async () => {
@@ -4586,6 +4642,7 @@ export default async function (pi: ExtensionAPI) {
 					const commit = body?.build && typeof body.build.commit === "string" ? body.build.commit.trim() : "";
 					return commit && commit !== "unknown" ? commit : null;
 				},
+				servedWithoutHealth: () => servedBoundOnly,
 				writeRecord: ({ tag, commit }) => writeWarpInstallRecord({ tag, commit }),
 			});
 		} catch (err) {
@@ -4640,7 +4697,12 @@ export default async function (pi: ExtensionAPI) {
 				break;
 			}
 			case "updated":
-				// The row said "hay X" before installing X. It must not keep saying it
+				if (result.identityUnreadable) {
+					lines.push(
+						`  the proxy holds ${binPath} and its port, but it never answered /health,`,
+						"  so it could not name its own commit: the record says unknown, and the install stands.",
+					);
+				}
 				// until the next restart: after this point the installed tag is a fact
 				// this session produced.
 				if (result.tag) noteInstalledTag(WARP_RELEASE_API, result.tag);

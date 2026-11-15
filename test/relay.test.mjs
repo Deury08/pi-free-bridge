@@ -7769,3 +7769,29 @@ test("a vacuous comparison is never reported as the same file (S35)", async () =
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("a proxy that holds its port counts as started even without /health (S36)", async () => {
+	// Measured: the proxy served traffic and answered /health from a shell while the
+	// install's own health read never arrived, so the gate failed a working proxy and
+	// the rollback threw the good build away. The port is a fact the OS owns.
+	const { warpServed } = await import("../index.ts");
+	const body = { active: 2 };
+
+	assert.deepEqual(await warpServed({ health: async () => body, held: async () => false }), body);
+	assert.deepEqual(
+		await warpServed({ health: async () => undefined, held: async () => true }),
+		{ bound: true, health: "did not answer" },
+		"a held port is enough evidence, and it says which evidence it got",
+	);
+	assert.equal(await warpServed({ health: async () => undefined, held: async () => false }), undefined);
+	assert.deepEqual(
+		await warpServed({
+			health: async () => {
+				throw new Error("fetch failed");
+			},
+			held: async () => true,
+		}),
+		{ bound: true, health: "did not answer" },
+		"a health read that threw is the same as one that did not answer",
+	);
+});
