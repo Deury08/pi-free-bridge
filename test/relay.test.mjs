@@ -7159,3 +7159,39 @@ test("menuUpdateSuffix: the label states a fact, never a wish (T9d)", () => {
 		" — hay 0.8.0, corre 0.7.0",
 	);
 });
+
+test("the release tag is read at startup, not when the menu opens (T9d)", async () => {
+	const { readLatestTag, latestPublishedTag, warmLatestTags } = releaseMod;
+	const calls = [];
+	const ok = async (url) => {
+		calls.push(url);
+		return { ok: true, json: async () => ({ tag_name: "v9.9.9" }) };
+	};
+
+	// The pure read: a tag, "no answer" on a bad status, "no answer" on a throw.
+	assert.equal(await readLatestTag("https://example.invalid/a", ok), "v9.9.9");
+	assert.equal(
+		await readLatestTag("https://example.invalid/b", async () => ({ ok: false, json: async () => ({}) })),
+		null,
+	);
+	assert.equal(
+		await readLatestTag("https://example.invalid/c", async () => {
+			throw new Error("offline");
+		}),
+		null,
+		"a network that never answers is \"no answer\", not an exception",
+	);
+
+	// Warming reads each URL once; asking again must not spend another read.
+	warmLatestTags(["https://example.invalid/warm"], ok);
+	warmLatestTags(["https://example.invalid/warm"], ok);
+	assert.equal(await latestPublishedTag("https://example.invalid/warm"), "v9.9.9");
+	assert.equal(
+		calls.filter((url) => url === "https://example.invalid/warm").length,
+		1,
+		"one read per URL, no matter how often the menu opens",
+	);
+
+	// A URL nobody warmed is "no answer" — never a live read from the menu path.
+	assert.equal(await latestPublishedTag("https://example.invalid/never"), null);
+});
