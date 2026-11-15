@@ -33,9 +33,6 @@
     "LICENSE"
   ],
   "type": "module",
-  "scripts": {
-    "test": "node --test test/relay.test.mjs"
-  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
