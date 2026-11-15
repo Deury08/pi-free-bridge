@@ -7206,3 +7206,64 @@ test("a sector keeps its declared order, not the ascending index order", () => {
 	assert.deepEqual(sectorActions(warp.actions, [7, 2]), [2, 7]);
 	assert.deepEqual(sectorActions(warp.actions, []), []);
 });
+
+test("swap: the failed build is stopped before any file is renamed (S3.6-7)", async () => {
+	// The order is the defect: renaming a binary that a live process is running
+	// leaves an orphan on Unix and fails outright on Windows.
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	const stops = [];
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => {
+			stops.push(stops.length + 1);
+			return true;
+		},
+		startRelay: async () => false,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, true, JSON.stringify(result));
+	assert.deepEqual(stops, [1, 2], "stopped the old relay and then the failed one");
+	assert.equal(readOr(dir, "relay-linux-x64"), "OLD", "the known-good binary is back in place");
+	assert.equal(readOr(dir, "relay-linux-x64.failed"), undefined, "the failed build leaves no corpse");
+});
+
+test("swap: a failed build that cannot be stopped renames nothing (S3.6-7)", async () => {
+	// Refusing to move files is the safe failure: better a stale update than an
+	// orphan holding the port that no stop can identify.
+	const dir = swapFixture({ "relay-linux-x64": "OLD", "relay-linux-x64.tmp": "NEW" });
+	let call = 0;
+	const result = await releaseMod.swapRelayBinary({
+		dir,
+		name: "relay-linux-x64",
+		downloaded: join(dir, "relay-linux-x64.tmp"),
+		version: "0.5.1",
+		timeoutMs: 50,
+		stopRelay: async () => {
+			call += 1;
+			return call === 1;
+		},
+		startRelay: async () => false,
+		askContinue: async () => "rollback",
+	});
+
+	assert.equal(result.ok, false);
+	assert.equal(result.rolledBack, false, "nothing was renamed, so nothing was rolled back");
+	assert.match(String(result.reason), /no se pudo detener el build nuevo/);
+	assert.equal(readOr(dir, "relay-linux-x64"), "NEW", "the file that failed is still at its name");
+	assert.equal(readOr(dir, "relay-linux-x64.prev"), "OLD", "the spare is untouched");
+});
+
+test("the proxy startup deadline outlasts a real MASQUE start (S30c)", async () => {
+	// Measured on this machine: `WARP masque tunnel up` arrived 11 s after launch,
+	// and the pool was still reporting cooling. A five-second deadline called that
+	// a broken build, so the deadline must be longer than the observed start.
+	const { WARP_START_ATTEMPTS, WARP_RESTART_POLL_MS } = releaseMod;
+	const deadlineMs = WARP_START_ATTEMPTS * WARP_RESTART_POLL_MS;
+	assert.ok(deadlineMs >= 15000, `the deadline is ${deadlineMs} ms, shorter than an 11 s tunnel`);
+});
