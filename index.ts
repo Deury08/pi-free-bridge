@@ -4635,6 +4635,7 @@ export default async function (pi: ExtensionAPI) {
 				confirm: async () => {
 					const lines = [
 						`${asset?.tag ?? "the latest release"} — warp-minimal from github.com/Deury08/warp-minimal`,
+						"  update path: S41 — direct /health, cold-pool wait, eviction by path",
 						`  installs to ${binPath}`,
 						"  the published sha256 is verified before anything is executed",
 						"",
@@ -4810,6 +4811,7 @@ export default async function (pi: ExtensionAPI) {
 				break;
 			case "rolled-back":
 				lines.push(
+					"  update path: S41 — direct /health, cold-pool wait, eviction by path",
 					`  the new build did not prove itself: ${result.reason}.`,
 					`  the previous binary was put back at ${binPath}; the build that failed was deleted.`,
 				);
