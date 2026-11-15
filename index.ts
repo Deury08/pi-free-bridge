@@ -2011,7 +2011,18 @@ export async function warpStopForSwap(healthUrl: string, stop: (url: string) => 
 
 /** How long the poll waits between probes. Together with the attempt count this
  *  is the whole deadline: no probe can extend it. */
-const WARP_RESTART_POLL_MS = 250;
+export const WARP_RESTART_POLL_MS = 250;
+
+/** The whole startup deadline: 80 × 250 ms = 20 s.
+ *
+ *  It used to be 20 probes, five seconds, and five seconds is shorter than the
+ *  truth: a measured MASQUE start reached `WARP masque tunnel up` eleven seconds
+ *  after launch, with the exit pool still cooling. Every update therefore
+ *  "failed" against a build that was merely slow, and the rollback that followed
+ *  could not even restore a binary it had never replaced. A deadline that is too
+ *  short does not make startup faster; it only makes a working binary look
+ *  broken. */
+export const WARP_START_ATTEMPTS = 80;
 
 export type StartAndVerifyDeps = {
 	start: () => Promise<unknown>;
@@ -2032,7 +2043,7 @@ export async function warpStartAndVerify(deps: StartAndVerifyDeps): Promise<bool
 		// Nothing was launched, so there is nothing that could turn ready.
 		return false;
 	}
-	const attempts = deps.attempts ?? 20;
+	const attempts = deps.attempts ?? WARP_START_ATTEMPTS;
 	for (let i = 0; i < attempts; i++) {
 		try {
 			if (warpReadyFact(await deps.probe())) return true;
@@ -2639,6 +2650,31 @@ export async function swapRelayBinary(deps: SwapDeps): Promise<SwapResult> {
 	// only after a known-good one is back in place.
 	const reason = `el relay ${deps.version} no respondió /health`;
 	appendFailedLog(logPath, `${now().toISOString()}\t${deps.version}\t${reason}`);
+
+	// The build we just started is **still running** — that is the whole reason we
+	// are here: nothing answered, but nothing died either. It must be stopped
+	// before a single file moves, for two different reasons:
+	//   - on Windows a running executable cannot be renamed or deleted at all, so
+	//     the order below would fail with EBUSY and leave the update half done;
+	//   - on Unix the rename succeeds and the process keeps running a file that no
+	//     longer has a name. That orphan then holds the port, and no later stop can
+	//     identify it as ours, because `/proc/<pid>/exe` points at a deleted
+	//     `…​.failed`: every future update is refused before it starts.
+	// So: stop, then rename, then start. In that order and no other.
+	let stoppedNew = false;
+	try {
+		stoppedNew = await deps.stopRelay();
+	} catch {
+		stoppedNew = false;
+	}
+	if (!stoppedNew) {
+		return {
+			ok: false,
+			rolledBack: false,
+			reason: `${reason}; no se pudo detener el build nuevo, así que no se renombró ningún archivo`,
+		};
+	}
+
 	if (!existsSync(previous)) {
 		// Nothing to restore, so nothing good can be lost: the only binary here is
 		// the one that just failed, and a corpse at the canonical name would be
