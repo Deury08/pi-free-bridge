@@ -7425,6 +7425,22 @@ test("updateWarpBinary: the record keeps the reported commit, and records unknow
 // dial inside an IPv6-only tunnel fails. node:http with no agent cannot do that.
 // S41: measured in the laboratory — a proxy that has just started answers 503 six
 // times in a row before its pool enrolls. One request would call that "no traffic".
+// S42: the proxy declares exits as text. A readiness check that demanded objects
+// with `ip` could never pass against the real /health — every update rolled back
+// against a proxy that was already serving.
+test("warpReadyFact: the proxy's own exit shape is ready, and an empty pool is not (S42)", () => {
+	const shape = { build: { commit: "b396732" }, capabilities: { exits: true } };
+	assert.equal(
+		releaseMod.warpReadyFact({ ...shape, exits: ["warp-18e83c051e64aef6 (in_use, served=2, streams=2)"] }),
+		true,
+		"a text exit is what the proxy really sends",
+	);
+	assert.equal(releaseMod.warpReadyFact({ ...shape, exits: [{ ip: "2606:4700:110::1" }] }), true, "an object with an address is still ready");
+	assert.equal(releaseMod.warpReadyFact({ ...shape, exits: [] }), false, "an empty pool is not ready");
+	assert.equal(releaseMod.warpReadyFact({ ...shape, exits: ["   "] }), false, "a blank exit is not an exit");
+	assert.equal(releaseMod.warpReadyFact({ ...shape, exits: "warp-1" }), false, "a non-array is not a pool");
+});
+
 test("probeWarpTraffic: a cold pool is waited for within the budget, and the budget ends the wait (S41)", async () => {
 	const cold = ["503", "503", "200"];
 	let calls = 0;

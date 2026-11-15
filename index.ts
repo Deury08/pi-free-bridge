@@ -2558,7 +2558,18 @@ export function warpReadyFact(body: unknown): boolean {
 	if (!commit || commit === "unknown") return false;
 	if (!b.capabilities || b.capabilities.exits !== true) return false;
 	const exits = Array.isArray(b.exits) ? b.exits : [];
-	return exits.some((exit) => Boolean(exit) && typeof exit === "object" && Boolean((exit as { ip?: unknown }).ip));
+	// S42: the proxy declares its pool as text — "warp-<id> (in_use, served=2,
+	// streams=2)" — not as objects with an `ip`. Requiring an object made this
+	// function return false against every real `/health`, so no update could ever
+	// pass its own readiness check, whatever the binary did. Both shapes are read:
+	// what matters is that the pool reports at least one exit.
+	return exits.some((exit) => {
+		if (typeof exit === "string") return exit.trim().length > 0;
+		if (!exit || typeof exit !== "object") return false;
+		// An id alone is not an address, so an object still has to name one.
+		const named = exit as { ip?: unknown; address?: unknown };
+		return Boolean(named.ip ?? named.address);
+	});
 }
 
 /** Where the traffic probe asks.

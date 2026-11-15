@@ -681,3 +681,21 @@ while any process survives, and the port observed free before starting.
 
 L47 (owner): "crees qu ea esa idea le podemos poner para ver si trafica o no es
 necesario" — kept, as S34: a report that decides nothing.
+
+L48 (verbatim): «pero dale en el lab hasta que tengas la solucion»
+
+L49: el laboratorio (`/tmp/warp-update-lab/button.mjs`) corre `updateWarpBinary` +
+`swapRelayBinary` reales contra archivos y procesos reales en `:8899`, con releases
+cacheadas servidas por un GitHub falso. Ahí se reprodujo el fallo de producción:
+ochenta sondas con el proxy sirviendo y `warpReadyFact` siempre falso.
+
+L50: causa raíz (S42): `/health` declara `exits` como texto — `"warp-<id> (in_use,
+served=2, streams=2)"` — y `warpReadyFact` exigía objetos con `ip`. Ningún update
+podía aprobar su propia comprobación de arranque, por más que el binario arrancara,
+escuchara y tunelizara. El test D11 fijaba la forma equivocada con un fixture que
+el proxy nunca produce.
+
+L51: corregido aceptando la forma real (texto no vacío, u objeto con `ip`/`address`;
+un `id` solo no cuenta). 366 tests verdes. Laboratorio: `updated`, archivo
+reemplazado, `.prev` conservado, registro `{tag, commit}`, tráfico `traffics`, y
+segunda pasada `same-build` sin reiniciar el proceso.
