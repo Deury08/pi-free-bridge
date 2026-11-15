@@ -7752,21 +7752,21 @@ test("the traffic report is read together with /health, so an empty pool is neve
 
 	// Exits declared and no answer: the binary is the part that did not deliver.
 	const declared = warpTrafficReport({ health: declaredHealth, traffic: "no-traffic" }).join("\n");
-	assert.match(declared, /declares 1 exit/, "it repeats what /health declared");
-	assert.match(declared, /does not carry traffic/, "and then blames the binary that carried nothing");
+	assert.match(declared, /declara 1 salida/, "it repeats what /health declared");
+	assert.match(declared, /no está llevando tráfico/, "and then blames the binary that carried nothing");
 
 	// No exits declared and no answer: the pool is empty, so there was nothing to
 	// carry the request through. Blaming the download here is the defect.
 	const empty = warpTrafficReport({ health: emptyHealth, traffic: "no-traffic" }).join("\n");
-	assert.match(empty, /declares no exit/, "it says the pool declared nothing");
-	assert.match(empty, /pool is empty/, "and names the empty pool as the reason");
-	assert.match(empty, /not to blame/, "exonerating the binary it cannot judge");
-	assert.doesNotMatch(empty, /does not carry traffic/, "the two answers are never conflated");
+	assert.match(empty, /no declara ninguna salida/, "it says the pool declared nothing");
+	assert.match(empty, /pool está vacío/, "and names the empty pool as the reason");
+	assert.match(empty, /no tiene la culpa/, "exonerating the binary it cannot judge");
+	assert.doesNotMatch(empty, /no está llevando tráfico/, "the two answers are never conflated");
 	assert.notEqual(empty, declared, "an empty pool and a broken binary read differently");
 
 	// A report, never a verdict: no line may threaten the install.
 	for (const text of [declared, empty]) {
-		assert.doesNotMatch(text, /(roll ?back|rolled back|will be replaced|reinstalled|fail)/i, "the traffic report decides nothing");
+		assert.doesNotMatch(text, /(roll ?back|rolled back|will be replaced|reinstalled|fail|se revierte|se reemplaz|se reinstal)/i, "the traffic report decides nothing");
 	}
 
 	// Nothing asked is nothing to report, and traffic that arrived is not an alarm.

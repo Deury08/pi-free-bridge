@@ -2648,21 +2648,21 @@ export function warpTrafficReport({ health, traffic }: { health: unknown; traffi
 	const exits = Array.isArray(body?.exits) ? body.exits.length : 0;
 	if (traffic === "not-tunnelling") {
 		return [
-			"  the new proxy answers and carries traffic, but that traffic is not tunnelling:",
-			"  Cloudflare reports warp=off. The binary is installed; it is worth a look.",
+			"  El proxy nuevo responde y lleva tráfico, pero ese tráfico no va por el túnel:",
+			"  Cloudflare informa warp=off. El binario quedó instalado; conviene revisarlo.",
 		];
 	}
 	if (traffic !== "no-traffic") return [];
 	return exits > 0
 		? [
-				`  the new proxy declares ${exits} exit${exits === 1 ? "" : "s"} and a request through it did not come`,
-				"  back: the installed binary is the part that does not carry traffic.",
-				"  the install stands, and this report decides nothing.",
+				`  El proxy nuevo declara ${exits} salida${exits === 1 ? "" : "s"} y una petición a través suyo`,
+				"  no volvió: el binario instalado es la parte que no está llevando tráfico.",
+				"  La instalación queda, y este informe no decide nada.",
 			]
 		: [
-				"  the new proxy declares no exit, so there is no tunnel for a request to cross:",
-				"  the pool is empty and the binary is not to blame.",
-				"  the install stands, and this report decides nothing.",
+				"  El proxy nuevo no declara ninguna salida, así que no hay túnel por donde cruzar:",
+				"  el pool está vacío y el binario no tiene la culpa.",
+				"  La instalación queda, y este informe no decide nada.",
 			];
 }
 
@@ -4605,12 +4605,12 @@ export default async function (pi: ExtensionAPI) {
 		/** Where the old binary stands after an attempt that installed no verified
 		 *  build. Never a bare verdict: every branch names a file. */
 		const restoreNote = (): string[] => {
-			if (!swapAttempted) return [`  nothing was swapped: ${binPath} is the binary it already was.`];
-			if (stoppedForSwap === false) return [`  the proxy could not be stopped, so ${binPath} was not replaced.`];
-			if (swapOk) return [`  the new binary is at ${binPath}; the previous one is kept as ${binPath}.prev.`];
+			if (!swapAttempted) return [`  No se cambió nada: ${binPath} sigue siendo el binario que ya estaba.`];
+			if (stoppedForSwap === false) return [`  No se pudo detener el proxy, así que ${binPath} no se reemplazó.`];
+			if (swapOk) return [`  El binario nuevo está en ${binPath}; el anterior quedó guardado como ${binPath}.prev.`];
 			// S33: a swap that renamed nothing never "failed to restore" anything.
-			if (swapInPlace) return [`  nothing was replaced: ${swapInPlace} is still in place.`];
-			return [`  the previous binary was not restored: ${binPath} does not hold it.`];
+			if (swapInPlace) return [`  No se reemplazó nada: ${swapInPlace} sigue en su lugar.`];
+			return [`  No se pudo restaurar el binario anterior: ${binPath} no lo contiene.`];
 		};
 
 		let result: UpdateWarpBinaryResult | undefined;
@@ -4756,10 +4756,10 @@ export default async function (pi: ExtensionAPI) {
 			}
 		}
 
-		const lines = ["free-bridge-warp-update", `  target:  ${describeWarpTarget(target)}`];
+		const lines = ["Actualización de warp-minimal", `  proxy:   ${describeWarpTarget(target)}`];
 
 		if (!result) {
-			lines.push(`  the update stopped on an error: ${thrown ?? "no result was reported"}.`, ...restoreNote());
+			lines.push(`  La actualización se detuvo con un error: ${thrown ?? "no se informó ningún resultado"}.`, ...restoreNote());
 			ctx.ui.notify(lines.join("\n"), "error");
 			return;
 		}
@@ -4767,31 +4767,31 @@ export default async function (pi: ExtensionAPI) {
 		switch (result.status) {
 			case "up-to-date":
 				lines.push(
-					`  ${result.tag} is already the release this extension installed${
+					`  ${result.tag} ya es la versión que instaló esta extensión${
 						result.commit ? ` (commit ${result.commit})` : ""
-					}: nothing was downloaded.`,
+					}: no se descargó nada.`,
 				);
 				break;
 			case "unknown":
 				lines.push(
-					"  the Deury08/warp-minimal release could not be read, so nothing was",
-					"  downloaded and nothing was touched: the proxy keeps the binary it has.",
-					`  ${result.reason ?? "no reason was reported"}`,
-					"  An anonymous GitHub read allows 60 requests an hour per IP; the proxy is",
-					"  unaffected either way, and this command can be run again after the wait.",
+					"  No se pudieron leer las versiones publicadas de Deury08/warp-minimal:",
+					"  no se descargó nada y no se tocó nada. El proxy sigue con el binario que tiene.",
+					`  ${result.reason ?? "no se informó el motivo"}`,
+					"  GitHub permite 60 consultas por hora por IP sin cuenta; el proxy no se ve",
+					"  afectado, y este comando se puede volver a ejecutar cuando pase la espera.",
 				);
 				break;
 			case "declined":
-				lines.push("  you answered no: nothing was downloaded and nothing was stopped.");
+				lines.push("  Respondiste que no: no se descargó nada y no se detuvo nada.");
 				break;
 			case "same-build": {
 				// The honest report for a machine that was already right: the file was
 				// replaced by the same bytes, so nothing was touched and nothing spent.
 				const hash = createHash("sha256").update(readFileSync(binPath)).digest("hex").slice(0, 12);
 				lines.push(
-					`  the published build is byte-identical to the file already at ${binPath}`,
-					`  (sha256 ${hash}…), so there is nothing to install and nothing to replace:`,
-					"  nothing was stopped, nothing was renamed and nothing was probed.",
+					`  La versión publicada es idéntica, byte por byte, al archivo que ya está en ${binPath}`,
+					`  (sha256 ${hash}…): no hay nada que instalar y nada que reemplazar.`,
+					"  No se detuvo el proxy, no se renombró ningún archivo y no se gastó ninguna salida.",
 				);
 				break;
 			}
@@ -4800,13 +4800,13 @@ export default async function (pi: ExtensionAPI) {
 				// through the proxy says the new build serves, and it says so whatever
 				// the relay's egress mode happens to be, because it talks to the proxy.
 				if (result.traffic === "traffics") {
-					lines.push("  the published build carries traffic through the tunnel: the install stands.");
+					lines.push("  La petición de prueba cruzó el túnel: el proxy nuevo está sirviendo.");
 				}
 				if (result.identityUnreadable) {
 					lines.push(
-						`  the proxy at ${binPath} is running but did not name its build, and a proxy`,
-						"  that does not name its build is older than the release that introduced it:",
-						"  the install stands, the record says unknown, and the binary is worth replacing.",
+						`  El proxy en ${binPath} está corriendo pero no declara su versión, y un binario`,
+						"  que no declara su versión es anterior a la que incorporó ese dato:",
+						"  la instalación queda, el registro dice «desconocida» y conviene reemplazarlo.",
 					);
 				}
 				// until the next restart: after this point the installed tag is a fact
@@ -4816,15 +4816,14 @@ export default async function (pi: ExtensionAPI) {
 				// the install, never rolls back and is never retried.
 				lines.push(...warpTrafficReport({ health: proxyHealthBody, traffic: result.traffic ?? "unknown" }));
 				lines.push(
-					`  ${result.tag} is installed, and ${target.healthUrl} answers /health`,
-					`  with commit ${result.commit}: this extension recorded what now runs.`,
+					`  ${result.tag} quedó instalado, y ${target.healthUrl} responde /health`,
+					`  con el commit ${result.commit}: esta extensión registró lo que ahora corre.`,
 				);
 				break;
 			case "rolled-back":
 				lines.push(
-					"  update path: S41 — direct /health, cold-pool wait, eviction by path",
-					`  the new build did not prove itself: ${result.reason}.`,
-					`  the previous binary was put back at ${binPath}; the build that failed was deleted.`,
+					`  La versión nueva no llegó a probar que sirve: ${result.reason}.`,
+					`  Se dejó el binario anterior en ${binPath}; el que falló se borró.`,
 				);
 				break;
 			case "failed":
