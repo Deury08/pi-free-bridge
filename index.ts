@@ -2597,17 +2597,30 @@ export function parseTraceFact(body: unknown): { traffic: boolean; tunnel: boole
  */
 export async function probeWarpTraffic(deps: {
 	request: () => Promise<{ status: number; body: string }>;
+	/** S41: a proxy that just started answers 503 until its pool is enrolled, which
+	 *  the laboratory measured at ~3 s and six answers in a row. A single request
+	 *  cannot tell "not serving" from "not ready yet", so the caller may allow a
+	 *  bounded wait. Default is one attempt: no waiting unless it was asked for. */
+	intervalMs?: number;
+	budgetMs?: number;
 }): Promise<WarpTraffic> {
-	let answer: { status: number; body: string };
-	try {
-		answer = await deps.request();
-	} catch {
-		return "no-traffic";
+	const interval = deps.intervalMs ?? 0;
+	const budget = deps.budgetMs ?? 0;
+	const from = Date.now();
+	for (;;) {
+		let answer: { status: number; body: string } | undefined;
+		try {
+			answer = await deps.request();
+		} catch {
+			answer = undefined;
+		}
+		if (answer && answer.status === 200) {
+			const fact = parseTraceFact(answer.body);
+			if (fact.traffic) return fact.tunnel ? "traffics" : "not-tunnelling";
+		}
+		if (interval <= 0 || Date.now() - from + interval > budget) return "no-traffic";
+		await new Promise((done) => setTimeout(done, interval));
 	}
-	if (answer.status !== 200) return "no-traffic";
-	const fact = parseTraceFact(answer.body);
-	if (!fact.traffic) return "no-traffic";
-	return fact.tunnel ? "traffics" : "not-tunnelling";
 }
 
 /** S34: the traffic answer read together with `/health`, because either one on
@@ -4599,7 +4612,13 @@ export default async function (pi: ExtensionAPI) {
 				// Proof, not declaration: one request through the proxy. It talks to
 				// the proxy directly, so the relay's egress mode never enters it.
 				probeTraffic: () =>
-					probeWarpTraffic({ request: () => proxyHttpRequest(target.url) }),
+					probeWarpTraffic({
+						request: () => proxyHttpRequest(target.url),
+						// S41: the pool takes seconds to enroll; a cold start must not read
+						// as "the build carries no traffic".
+						intervalMs: 500,
+						budgetMs: WARP_START_ATTEMPTS * WARP_RESTART_POLL_MS,
+					}),
 				// The published build is compared with the installed one before
 				// anything is stopped: an update that has nothing to install must not
 				// evict a working proxy, and must not spend an exit proving it.

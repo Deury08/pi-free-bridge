@@ -7423,6 +7423,45 @@ test("updateWarpBinary: the record keeps the reported commit, and records unknow
 // S40: the /health read that keeps failing on the measured machine. The global
 // fetch in an extension process can carry the egress dispatcher, and a loopback
 // dial inside an IPv6-only tunnel fails. node:http with no agent cannot do that.
+// S41: measured in the laboratory — a proxy that has just started answers 503 six
+// times in a row before its pool enrolls. One request would call that "no traffic".
+test("probeWarpTraffic: a cold pool is waited for within the budget, and the budget ends the wait (S41)", async () => {
+	const cold = ["503", "503", "200"];
+	let calls = 0;
+	const warmed = await releaseMod.probeWarpTraffic({
+		request: async () => {
+			const status = Number(cold[Math.min(calls, cold.length - 1)]);
+			calls += 1;
+			return { status, body: status === 200 ? "ip=2a09:bac5::1\nwarp=on\n" : "not ready" };
+		},
+		intervalMs: 1,
+		budgetMs: 200,
+	});
+	assert.equal(warmed, "traffics", "the request that finally returns crosses the tunnel");
+	assert.equal(calls, 3, "it stops asking as soon as the pool answers");
+
+	let coldCalls = 0;
+	const starved = await releaseMod.probeWarpTraffic({
+		request: async () => {
+			coldCalls += 1;
+			return { status: 503, body: "not ready" };
+		},
+		intervalMs: 1,
+		budgetMs: 20,
+	});
+	assert.equal(starved, "no-traffic", "a proxy that never answers is no-traffic, not a longer wait");
+	assert.ok(coldCalls > 1, "it did ask more than once inside the budget");
+
+	let once = 0;
+	await releaseMod.probeWarpTraffic({
+		request: async () => {
+			once += 1;
+			return { status: 503, body: "not ready" };
+		},
+	});
+	assert.equal(once, 1, "without a budget it asks exactly once: no waiting by default");
+});
+
 test("directLoopbackGet reaches a loopback listener even when an HTTP proxy is configured (S40)", async () => {
 	const { createServer } = await import("node:http");
 	const server = createServer((req, res) => {
