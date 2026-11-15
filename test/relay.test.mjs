@@ -7267,3 +7267,50 @@ test("the proxy startup deadline outlasts a real MASQUE start (S30c)", async () 
 	const deadlineMs = WARP_START_ATTEMPTS * WARP_RESTART_POLL_MS;
 	assert.ok(deadlineMs >= 15000, `the deadline is ${deadlineMs} ms, shorter than an 11 s tunnel`);
 });
+
+test("the install is proven by traffic, not by a declaration (S30f)", async () => {
+	const { probeWarpTraffic, parseTraceFact } = releaseMod;
+
+	// A real body from the proxy: one key=value per line, warp on.
+	const body = "fl=17f|h=www.cloudflare.com\nip=2a09:bac5::1\nloc=DO\nwarp=on\n";
+	assert.deepEqual(parseTraceFact(body), { traffic: true, tunnel: true });
+	// Forwarded without the tunnel: traffic exists, the tunnel does not.
+	assert.deepEqual(parseTraceFact("ip=1.2.3.4\nwarp=off\n"), { traffic: true, tunnel: false });
+	assert.deepEqual(parseTraceFact(""), { traffic: false, tunnel: false });
+	assert.deepEqual(parseTraceFact(undefined), { traffic: false, tunnel: false });
+
+	const ok = await probeWarpTraffic({ request: async () => ({ status: 200, body }) });
+	assert.equal(ok, "traffics");
+	assert.equal(
+		await probeWarpTraffic({ request: async () => ({ status: 200, body: "warp=off\nip=1.2.3.4\n" }) }),
+		"not-tunnelling",
+	);
+	assert.equal(await probeWarpTraffic({ request: async () => ({ status: 204, body: "" }) }), "no-traffic");
+	assert.equal(
+		await probeWarpTraffic({
+			request: async () => {
+				throw new Error("connection refused");
+			},
+		}),
+		"no-traffic",
+		"a proxy that is not there is no traffic, not an exception",
+	);
+});
+
+test("an install that starts and declares exits but carries no traffic still stands", async () => {
+	// Inform, never roll back: a flaky network must not condemn a binary that did
+	// everything it could prove locally.
+	const result = await releaseMod.updateWarpBinary({
+		latestTag: async () => "v0.4.0",
+		installedRecord: () => ({ tag: "v0.4.0", commit: "abc1234" }),
+		confirm: async () => true,
+		download: async () => "/tmp/warp-minimal.tmp",
+		swap: async () => ({ ok: true, rolledBack: false }),
+		readRunningCommit: async () => "abc1234",
+		writeRecord: () => {},
+		probeTraffic: async () => "no-traffic",
+		force: true,
+	});
+	assert.equal(result.status, "updated", JSON.stringify(result));
+	assert.equal(result.traffic, "no-traffic");
+});

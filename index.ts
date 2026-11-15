@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { appendFileSync, existsSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
@@ -1723,6 +1724,10 @@ export type UpdateWarpBinaryDeps = {
 	/** The commit the running proxy reports for itself, or null when it has none. */
 	readRunningCommit: () => Promise<string | null>;
 	writeRecord: (record: { tag: string; commit: string }) => void;
+	/** A request that crosses the tunnel, or "no-traffic" when it cannot. The
+	 *  declaration said the pool is ready; this is the only thing that proves the
+	 *  binary actually serves, and it never depends on the relay's egress mode. */
+	probeTraffic?: () => Promise<WarpTraffic>;
 	/** The menu installs on request even when the tag matches: what the owner asks
 	 *  for there is the file on disk replaced with the published one, not a
 	 *  comparison. Without it, an update that only reports "up to date" would
@@ -1735,6 +1740,10 @@ export type UpdateWarpBinaryResult = {
 	tag?: string;
 	commit?: string;
 	reason?: string;
+	/** Only for a successful install: did the new binary carry real traffic?
+	 *  It informs, it never rolls back — a flaky network must not condemn a
+	 *  binary that started and declared its exits. */
+	traffic?: WarpTraffic;
 };
 
 /** T9c: the update, in the only order that is safe. The decision first, because
@@ -1792,7 +1801,15 @@ export async function updateWarpBinary(deps: UpdateWarpBinaryDeps): Promise<Upda
 		};
 	}
 	deps.writeRecord({ tag, commit });
-	return { status: "updated", tag, commit };
+	let traffic: WarpTraffic = "unknown";
+	if (deps.probeTraffic) {
+		try {
+			traffic = await deps.probeTraffic();
+		} catch {
+			traffic = "no-traffic";
+		}
+	}
+	return { status: "updated", tag, commit, traffic };
 }
 
 /** T9c: is there anything to install? A release publishes its tag and its
@@ -2073,6 +2090,96 @@ export function warpReadyFact(body: unknown): boolean {
 	if (!b.capabilities || b.capabilities.exits !== true) return false;
 	const exits = Array.isArray(b.exits) ? b.exits : [];
 	return exits.some((exit) => Boolean(exit) && typeof exit === "object" && Boolean((exit as { ip?: unknown }).ip));
+}
+
+/** Where the traffic probe asks.
+ *
+ *  Plain HTTP on purpose: an HTTPS target needs a CONNECT tunnel, and `node:http`
+ *  answers the absolute-form request a proxy accepts without any dependency. The
+ *  body is public — Cloudflare publishes `warp=on` in it — so nothing secret is
+ *  exposed by asking over an unencrypted hop that ends inside the tunnel anyway.
+ */
+export const WARP_TRAFFIC_URL = "http://www.cloudflare.com/cdn-cgi/trace";
+
+/** What a real request through the proxy proved. `unknown` means nobody asked. */
+export type WarpTraffic = "traffics" | "not-tunnelling" | "no-traffic" | "unknown";
+
+/** Cloudflare's trace is one `key=value` per line. Only the tunnel bit matters
+ *  here: which address it used belongs to the quota workflow, not to this. */
+export function parseTraceFact(body: unknown): { traffic: boolean; tunnel: boolean } {
+	const text = typeof body === "string" ? body : "";
+	const lines = text.split("\n").map((line) => line.trim());
+	return {
+		traffic: text.length > 0,
+		tunnel: lines.includes("warp=on"),
+	};
+}
+
+/** S30f: the downloaded binary must carry traffic, not merely declare exits.
+ *
+ *  The startup check reads a declaration; this reads a result. They answer
+ *  different questions and must never be collapsed: a proxy with every exit in
+ *  cooldown declares nothing and says so honestly, while a proxy that declares a
+ *  ready pool and forwards nothing is lying about the only thing it does. Neither
+ *  answer depends on the relay's egress mode, because this talks to the proxy.
+ *
+ *  Never throws: an unreachable proxy is "no-traffic", which the caller reports
+ *  and never rolls back over.
+ */
+export async function probeWarpTraffic(deps: {
+	request: () => Promise<{ status: number; body: string }>;
+}): Promise<WarpTraffic> {
+	let answer: { status: number; body: string };
+	try {
+		answer = await deps.request();
+	} catch {
+		return "no-traffic";
+	}
+	if (answer.status !== 200) return "no-traffic";
+	const fact = parseTraceFact(answer.body);
+	if (!fact.traffic) return "no-traffic";
+	return fact.tunnel ? "traffics" : "not-tunnelling";
+}
+
+/** One absolute-form GET sent to the proxy. No CONNECT, no TLS, no dependency:
+ *  the proxy takes `GET http://host/path` and answers it through the tunnel. */
+export function proxyHttpRequest(
+	proxyUrl: string,
+	target = WARP_TRAFFIC_URL,
+	timeoutMs = 5000,
+): Promise<{ status: number; body: string }> {
+	return new Promise((done, fail) => {
+		let proxy: URL;
+		let destination: URL;
+		try {
+			proxy = new URL(proxyUrl);
+			destination = new URL(target);
+		} catch (error) {
+			fail(error);
+			return;
+		}
+		const req = httpRequest({
+			host: proxy.hostname,
+			port: proxy.port || 80,
+			path: destination.toString(),
+			method: "GET",
+			headers: { host: destination.host, accept: "text/plain" },
+			timeout: timeoutMs,
+		}, (res) => {
+			let body = "";
+			res.setEncoding("utf8");
+			res.on("data", (chunk: string) => {
+				body += chunk;
+			});
+			res.on("end", () => done({ status: res.statusCode ?? 0, body }));
+			res.on("error", fail);
+		});
+		req.on("timeout", () => {
+			req.destroy(new Error(`the proxy did not answer in ${timeoutMs} ms`));
+		});
+		req.on("error", fail);
+		req.end();
+	});
 }
 
 export async function ensureWarp(): Promise<boolean> {
@@ -3810,6 +3917,10 @@ export default async function (pi: ExtensionAPI) {
 				// The menu action means "install the published binary", not "tell me
 				// whether it is newer": the owner asked for the file to be replaced.
 				force: true,
+				// Proof, not declaration: one request through the proxy. It talks to
+				// the proxy directly, so the relay's egress mode never enters it.
+				probeTraffic: () =>
+					probeWarpTraffic({ request: () => proxyHttpRequest(target.url) }),
 				latestTag: async () => {
 					asset = await findWarpAsset();
 					return asset?.tag ?? null;
@@ -3930,6 +4041,18 @@ export default async function (pi: ExtensionAPI) {
 				// until the next restart: after this point the installed tag is a fact
 				// this session produced.
 				if (result.tag) noteInstalledTag(WARP_RELEASE_API, result.tag);
+				if (result.traffic === "not-tunnelling") {
+					lines.push(
+						"  the new proxy answers and carries traffic, but that traffic is not tunnelling:",
+						"  Cloudflare reports warp=off. The binary is installed; it is worth a look.",
+					);
+				}
+				if (result.traffic === "no-traffic") {
+					lines.push(
+						"  the new proxy started and declared its exits, but a request through it did not",
+						"  come back: the install stands, and the tunnel still has to prove itself.",
+					);
+				}
 				lines.push(
 					`  ${result.tag} is installed, and ${target.healthUrl} answers /health`,
 					`  with commit ${result.commit}: this extension recorded what now runs.`,
