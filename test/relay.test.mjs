@@ -7314,3 +7314,17 @@ test("an install that starts and declares exits but carries no traffic still sta
 	assert.equal(result.status, "updated", JSON.stringify(result));
 	assert.equal(result.traffic, "no-traffic");
 });
+
+test("loopback never crosses the tunnel (S30g)", async () => {
+	// An IPv6-only MASQUE stack cannot reach 127.0.0.1, so a proxied loopback
+	// request fails and benches the exit that carried it: two enrollments per
+	// wasted attempt in the observed failure.
+	const { isLoopbackDestination } = await import("../relay.mjs");
+	assert.equal(isLoopbackDestination("http://127.0.0.1:8789/health"), true);
+	assert.equal(isLoopbackDestination("http://127.0.0.2:8789/health"), true);
+	assert.equal(isLoopbackDestination("http://localhost:8789/health"), true);
+	assert.equal(isLoopbackDestination("http://[::1]:8789/health"), true);
+	assert.equal(isLoopbackDestination("https://opencode.ai/inference/v1/chat/completions"), false);
+	assert.equal(isLoopbackDestination("http://10.0.0.5:8789/health"), false, "a LAN address is not loopback");
+	assert.equal(isLoopbackDestination("not a url"), false, "unparseable is not a loopback claim");
+});
