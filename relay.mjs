@@ -2987,6 +2987,25 @@ function trackClient(res) {
 	};
 }
 
+/** Stop pulling upstream while the client buffer is full, but never wait for a
+ * drain after the response has closed or failed. */
+function waitForResponseDrain(res, client) {
+	return new Promise((resolve) => {
+		const finish = (drained) => {
+			res.off("drain", onDrain);
+			res.off("close", onStop);
+			res.off("error", onStop);
+			resolve(drained);
+		};
+		const onDrain = () => finish(true);
+		const onStop = () => finish(false);
+		res.once("drain", onDrain);
+		res.once("close", onStop);
+		res.once("error", onStop);
+		if (client.gone || res.destroyed || res.writableEnded) onStop();
+	});
+}
+
 // Exported for the request-path tests: the counter and the drain order are only
 // observable from a real `forward()` call.
 export async function forward(req, res, pathname, config) {
@@ -3238,7 +3257,13 @@ export async function forward(req, res, pathname, config) {
 				await reader.cancel();
 				return;
 			}
-			res.write(Buffer.from(value));
+			if (!res.write(Buffer.from(value))) {
+				const drained = await waitForResponseDrain(res, client);
+				if (!drained || client.gone) {
+					await reader.cancel();
+					return;
+				}
+			}
 		}
 		res.end();
 	} catch (err) {

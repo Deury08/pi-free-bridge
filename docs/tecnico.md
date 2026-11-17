@@ -78,6 +78,11 @@ los headers del gate, el session id, el bloque `<env>` con `Working directory:`
 y las tools `read`/`bash`. La respuesta vuelve byte por byte, sin parsear y sin
 reescribir ningún chunk.
 
+Si el cliente consume más lento que el relay, la lectura del upstream espera a
+que el búfer de salida emita `drain`. Si la respuesta se cierra o emite un error
+durante esa espera, el relay cancela la lectura upstream y libera la entrega
+activa de WARP.
+
 ### Qué ejecutable elige la extensión
 
 En este orden, y se queda con el primero que sirva:
