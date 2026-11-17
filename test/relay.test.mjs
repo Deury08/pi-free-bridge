@@ -236,8 +236,43 @@ test("ensureGateTools: appends only the missing declaration", () => {
 	assert.deepEqual(names(result.tools), ["bash", "read"]);
 	assert.equal(result.tools[0], existing, "the existing declaration must be kept");
 	assert.equal(result.tools.length, 2, "no duplicates");
-	assert.equal(result.tool_choice, "none");
+	assert.equal(Object.hasOwn(result, "tool_choice"), false, "an omitted choice stays omitted");
 });
+
+for (const tool of ["read", "bash", "search"]) {
+	for (const choice of [undefined, "none", "auto", "required", { type: "function", function: { name: tool } }]) {
+		const label = choice === undefined ? "omitted" : JSON.stringify(choice);
+		test(`ensureGateTools: preserves partial ${tool} tools with ${label} choice`, () => {
+			const existing = { type: "function", function: { name: tool, parameters: {} } };
+			const body = { model: "m", tools: [existing], messages: [] };
+			if (choice !== undefined) body.tool_choice = choice;
+			const snapshot = JSON.stringify(body);
+
+			const result = ensureGateTools(body);
+
+			assert.deepEqual(names(result.tools), tool === "search" ? ["bash", "read", "search"] : ["bash", "read"]);
+			assert.equal(result.tools[0], existing, "caller declarations stay intact");
+			assert.equal(result.tool_choice, choice);
+			assert.equal(Object.hasOwn(result, "tool_choice"), choice !== undefined);
+			assert.equal(JSON.stringify(body), snapshot, "augmentation must not mutate the caller");
+			assert.deepEqual(ensureGateTools(result), result, "augmentation stays idempotent");
+		});
+	}
+}
+
+for (const choice of ["none", "auto", "required", { type: "function", function: { name: "read" } }]) {
+	test(`ensureGateTools: keeps no-tools safety and complete-set choices for ${JSON.stringify(choice)}`, () => {
+		for (const tools of [undefined, []]) {
+			const result = ensureGateTools({ tools, tool_choice: choice });
+			assert.deepEqual(names(result.tools), ["bash", "read"]);
+			assert.equal(result.tool_choice, "none", "injected-only declarations stay disabled");
+		}
+		const tools = [{ name: "read" }, { name: "bash" }];
+		const result = ensureGateTools({ tools, tool_choice: choice });
+		assert.equal(result.tools, tools, "a complete array is reused");
+		assert.equal(result.tool_choice, choice, "complete-set behavior stays unchanged");
+	});
+}
 
 test("ensureGateTools: does not mutate the input body", () => {
 	const body = { tools: [{ name: "read" }], model: "m" };

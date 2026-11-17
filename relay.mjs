@@ -91,8 +91,8 @@ function toolName(tool) {
 /**
  * Make the wire body carry both gate tool names. A missing or empty `tools`
  * array is replaced with minimal `read` + `bash` declarations; a partial set is
- * completed with only the missing names. Whenever the array is augmented,
- * `tool_choice` is pinned to `"none"` so the model cannot call them.
+ * completed with only the missing names, preserving the caller's `tool_choice`.
+ * Only absent or empty tool sets are pinned to `"none"` to disable injected tools.
  */
 export function ensureGateTools(body) {
 	const next = { ...(body && typeof body === "object" ? body : {}) };
@@ -109,7 +109,6 @@ export function ensureGateTools(body) {
 	if (missing.length === 0) return next;
 
 	next.tools = [...tools, ...gateToolDeclarations().filter((tool) => missing.includes(tool.function.name))];
-	next.tool_choice = "none";
 	return next;
 }
 

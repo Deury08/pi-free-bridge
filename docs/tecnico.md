@@ -327,11 +327,15 @@ FreeTierError` mientras el turno normal de conversación funcionaba:
   transcript resuelto trae tools, así que un contexto sin tools no manda el array.
 
 El relay completa el array `tools` en el wire antes de reenviar: si falta o está
-vacío, inyecta declaraciones mínimas de `read` y `bash`; si tiene sólo una de
-las dos, agrega únicamente la que falta. Cuando el array se modifica, fija
-`tool_choice` en `"none"` para que una request de resumen nunca pueda invocarlas.
-Un array que ya trae ambos nombres pasa intacto. La misma regla aplica al bloque
-`<env>`: se agrega sólo si el system prompt no lo tiene.
+vacío, inyecta declaraciones mínimas de `read` y `bash` y fija `tool_choice` en
+`"none"` para impedir que una petición sin herramientas propias las invoque.
+Si ya hay herramientas, agrega únicamente los nombres que faltan y conserva
+`tool_choice` tal como lo envía el cliente, incluso si está omitido. Esto incluye
+`"auto"`, `"required"` y selecciones de funciones específicas: las declaraciones
+añadidas también pueden participar en la selección del modelo. El relay no añade
+implementaciones que ejecuten esas herramientas. Un array que ya trae ambos
+nombres pasa intacto. La misma regla aplica al bloque `<env>`: se agrega sólo si
+el system prompt no lo tiene.
 
 `gateRequestContext` sigue en `index.ts` como implementación de referencia a
 nivel de contexto y la ejercita `test/gate-tools.mjs`; el camino de ejecución de
