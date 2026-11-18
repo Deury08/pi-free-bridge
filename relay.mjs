@@ -453,12 +453,12 @@ const DEFAULT_PORT = 8788;
 const DEFAULT_UPSTREAM = "https://opencode.ai/inference/v1";
 const DEFAULT_USER_AGENT = "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
-function sendJson(res, status, payload) {
+function sendJson(res, status, payload, headers = {}) {
 	if (res.headersSent) {
 		res.end();
 		return;
 	}
-	res.writeHead(status, { "content-type": "application/json" });
+	res.writeHead(status, { ...headers, "content-type": "application/json" });
 	res.end(JSON.stringify(payload));
 }
 
@@ -3027,6 +3027,105 @@ function waitForResponseDrain(res, client) {
 	});
 }
 
+// Only explicit non-streaming clients use this bounded, request-local SSE fold.
+async function aggregateCompletion(response, client) {
+	const completion = { object: "chat.completion" };
+	const choices = new Map();
+	const decoder = new TextDecoder();
+	let pending = "";
+	let data = [];
+	let done = false;
+	function event() {
+		if (!data.length) return;
+		const text = data.join("\n");
+		data = [];
+		if (text === "[DONE]") {
+			done = true;
+			return;
+		}
+		let chunk;
+		try {
+			chunk = JSON.parse(text);
+		} catch {
+			throw new Error("invalid upstream SSE JSON");
+		}
+		for (const key of ["id", "model", "created", "usage", "system_fingerprint", "service_tier"]) {
+			if (chunk[key] !== undefined) completion[key] = chunk[key];
+		}
+		for (const part of chunk.choices ?? []) {
+			let choice = choices.get(part.index);
+			if (!choice) {
+				choice = { index: part.index, message: { role: "assistant", content: null }, finish_reason: null, tools: new Map() };
+				choices.set(part.index, choice);
+			}
+			const delta = part.delta ?? {};
+			if (delta.role !== undefined) choice.message.role = delta.role;
+			if (delta.content != null) choice.message.content = (choice.message.content ?? "") + delta.content;
+			if (part.finish_reason != null) choice.finish_reason = part.finish_reason;
+			for (const fragment of delta.tool_calls ?? []) {
+				let tool = choice.tools.get(fragment.index);
+				if (!tool) {
+					tool = { id: "", type: "function", function: { name: "", arguments: "" } };
+					choice.tools.set(fragment.index, tool);
+				}
+				if (fragment.id) tool.id += fragment.id;
+				if (fragment.type) tool.type = fragment.type;
+				if (fragment.function?.name) tool.function.name += fragment.function.name;
+				if (fragment.function?.arguments) tool.function.arguments += fragment.function.arguments;
+			}
+		}
+	}
+	function consume(text) {
+		pending += text;
+		let newline;
+		while (!done && (newline = pending.indexOf("\n")) !== -1) {
+			const line = pending.slice(0, newline).replace(/\r$/, "");
+			pending = pending.slice(newline + 1);
+			if (!line) event();
+			else if (line === "data" || line.startsWith("data:")) {
+				data.push(line === "data" ? "" : line.slice(5).replace(/^ /, ""));
+			}
+		}
+	}
+	if (!response.body) throw new Error("upstream SSE ended without [DONE]");
+	const reader = response.body.getReader();
+	let bytes = 0;
+	let cancellation;
+	const cancel = () => {
+		// One cancellation for DONE, rejection or departure, even if a read is pending.
+		cancellation ??= Promise.resolve().then(() => reader.cancel()).catch(() => {});
+		return cancellation;
+	};
+	// Bun may expose departure only through the socket endpoint disappearing.
+	const departure = setInterval(() => {
+		if (client.gone) void cancel();
+	}, 25);
+	try {
+		while (!done) {
+			if (client.gone) return;
+			const next = await reader.read();
+			if (client.gone) return;
+			if (next.done) {
+				consume(decoder.decode() + "\n\n");
+				break;
+			}
+			bytes += next.value.byteLength;
+			if (bytes > 32 * 1024 * 1024) throw new Error("upstream SSE exceeds 32 MiB");
+			consume(decoder.decode(next.value, { stream: true }));
+		}
+		if (!done) throw new Error("upstream SSE ended without [DONE]");
+	} finally {
+		clearInterval(departure);
+		await cancel();
+		reader.releaseLock();
+	}
+	completion.choices = [...choices.values()].sort((a, b) => a.index - b.index).map(({ tools, ...choice }) => {
+		if (tools.size) choice.message.tool_calls = [...tools].sort(([a], [b]) => a - b).map(([, tool]) => tool);
+		return choice;
+	});
+	return completion;
+}
+
 // Exported for the request-path tests: the counter and the drain order are only
 // observable from a real `forward()` call.
 export async function forward(req, res, pathname, config) {
@@ -3259,6 +3358,14 @@ export async function forward(req, res, pathname, config) {
 			);
 			res.writeHead(response.status, headers);
 			res.end(errorBody);
+			return;
+		}
+
+		if (source.stream === false && response.status >= 200 && response.status < 300 &&
+			headers["content-type"]?.split(";")[0].trim().toLowerCase() === "text/event-stream") {
+			const completion = await aggregateCompletion(response, client);
+			if (client.gone) return;
+			sendJson(res, response.status, completion, { ...headers, "x-egress-used": egressUsed });
 			return;
 		}
 

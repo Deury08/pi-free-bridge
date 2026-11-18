@@ -1856,8 +1856,9 @@ function fakeRelayRes({ socket } = {}) {
 	// departed-client tests need to model what that connection reports.
 	if (socket) res.socket = socket;
 	const chunks = [];
-	res.writeHead = (status) => {
+	res.writeHead = (status, headers) => {
 		res.status = status;
+		res.headers = { ...(headers ?? {}) };
 		res.headersSent = true;
 		return res;
 	};
@@ -1869,6 +1870,7 @@ function fakeRelayRes({ socket } = {}) {
 		return res;
 	};
 	res.body = () => Buffer.concat(chunks).toString("utf8");
+	res.raw = () => Buffer.concat(chunks);
 	return res;
 }
 
@@ -2023,6 +2025,270 @@ test("forward: accepted writes preserve response bytes without waiting for drain
 		assert.equal(warpStateForTests().deliveringWarpStreams, 0);
 	} finally {
 		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+const nonstreamEvent = (data) => `data: ${JSON.stringify(data)}\r\n\r\n`;
+
+test("nonstream JSON: metadata preserves supplied standard fields without copying arbitrary keys", async () => {
+	const originalFetch = globalThis.fetch;
+	let upstreamBody;
+	globalThis.fetch = async (_url, opts) => {
+		upstreamBody = JSON.parse(opts.body);
+		return new Response(
+			nonstreamEvent({
+				id: "x", model: "m", created: 7, system_fingerprint: "fp_123",
+				service_tier: "default", private_metadata: "not forwarded", choices: [],
+			}) +
+			nonstreamEvent({ choices: [], usage: { prompt_tokens: 2, completion_tokens: 0, total_tokens: 2 } }) +
+			"data: [DONE]\n\n",
+			{ headers: { "content-type": "text/event-stream" } },
+		);
+	};
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await forward(fakeReq({ stream: false }), res, RESEND_PATH, { ...FORWARD_CONFIG, warpMode: "off" });
+		assert.equal(upstreamBody.stream, true);
+		assert.equal(res.status, 200);
+		assert.deepEqual(res.headers, { "content-type": "application/json", "x-egress-used": "local" });
+		assert.deepEqual(JSON.parse(res.body()), {
+			id: "x", object: "chat.completion", model: "m", created: 7,
+			system_fingerprint: "fp_123", service_tier: "default", choices: [],
+			usage: { prompt_tokens: 2, completion_tokens: 0, total_tokens: 2 },
+		});
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+	} finally {
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+test("nonstream JSON: explicit false reconstructs indexed choices, tools and metadata", async () => {
+	const originalFetch = globalThis.fetch;
+	const wire = Buffer.from(
+		": heartbeat\r\n\r\n" +
+		nonstreamEvent({ id: "chat-1", model: "model-1", created: 123, choices: [
+			{ index: 1, delta: { role: "assistant", content: "Other" } },
+			{ index: 0, delta: { role: "assistant", content: "¡Hi 🌍", tool_calls: [
+				{ index: 1, id: "call-", type: "function", function: { name: "sec", arguments: '{"b":' } },
+				{ index: 0, id: "call-", type: "function", function: { name: "fir", arguments: '{"a":' } },
+			] } },
+		] }) +
+		'data: {"choices": [\r\ndata: {"index":0,"delta":{"content":"!"}}]}\r\n\r\n' +
+		nonstreamEvent({ choices: [
+			{ index: 0, delta: { tool_calls: [
+				{ index: 0, id: "a", function: { name: "st", arguments: "1}" } },
+				{ index: 1, id: "b", function: { name: "ond", arguments: "2}" } },
+			] }, finish_reason: "tool_calls" },
+			{ index: 1, delta: {}, finish_reason: "stop" },
+		] }) +
+		nonstreamEvent({ choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 } }) +
+		"data: [DONE]\r\n\r\n",
+	);
+	let upstreamBody;
+	globalThis.fetch = async (_url, opts) => {
+		upstreamBody = JSON.parse(opts.body);
+		let offset = 0;
+		return new Response(new ReadableStream({
+			pull(controller) {
+				if (offset === wire.length) return controller.close();
+				controller.enqueue(wire.subarray(offset, ++offset));
+			},
+		}), { headers: { "content-type": "text/event-stream; charset=utf-8", "retry-after": "7", "x-private": "hidden" } });
+	};
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await forward(fakeReq({ stream: false }), res, RESEND_PATH, { ...FORWARD_CONFIG, warpMode: "off" });
+		assert.equal(upstreamBody.stream, true);
+		assert.equal(res.status, 200);
+		assert.deepEqual(res.headers, { "content-type": "application/json", "retry-after": "7", "x-egress-used": "local" });
+		assert.deepEqual(JSON.parse(res.body()), {
+			id: "chat-1", object: "chat.completion", model: "model-1", created: 123,
+			choices: [
+				{ index: 0, message: { role: "assistant", content: "¡Hi 🌍!", tool_calls: [
+					{ id: "call-a", type: "function", function: { name: "first", arguments: '{"a":1}' } },
+					{ id: "call-b", type: "function", function: { name: "second", arguments: '{"b":2}' } },
+				] }, finish_reason: "tool_calls" },
+				{ index: 1, message: { role: "assistant", content: "Other" }, finish_reason: "stop" },
+			],
+			usage: { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 },
+		});
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+	} finally {
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+for (const [label, chunks, failure, expected] of [
+	["malformed event", ["data: {broken}\n\n"], false, "invalid upstream SSE JSON"],
+	["missing DONE", [nonstreamEvent({ choices: [{ index: 0, delta: { content: "partial" } }] })], false, "upstream SSE ended without [DONE]"],
+	["reader failure", [nonstreamEvent({ choices: [] })], true, "reader failed"],
+	["over byte limit", [":" + "x".repeat(32 * 1024 * 1024 - 1), "\n", "data: [DONE]\n\n"], false, "upstream SSE exceeds 32 MiB"],
+]) {
+	test(`nonstream JSON: ${label} returns only JSON 502 and releases delivery`, async () => {
+		const originalFetch = globalThis.fetch;
+		let offset = 0;
+		let cancelled = 0;
+		const reader = {
+			async read() {
+				assert.equal(warpStateForTests().deliveringWarpStreams, 1, "aggregation keeps WARP protected");
+				if (offset < chunks.length) return { value: Buffer.from(chunks[offset++]), done: false };
+				if (failure) throw new Error("reader failed");
+				return { done: true };
+			},
+			async cancel() { cancelled++; },
+			releaseLock() {},
+		};
+		globalThis.fetch = async (url) => {
+			if (!String(url).includes("/v1/")) return new Response("", { status: 404 });
+			return { status: 200, headers: new Headers({ "content-type": "text/event-stream" }), body: { getReader: () => reader } };
+		};
+		try {
+			resetWarpStateForTests();
+			const res = fakeRelayRes();
+			await forward(fakeReq({ stream: false }), res, RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(res.status, 502);
+			assert.deepEqual(res.headers, { "content-type": "application/json" });
+			assert.equal(res.body(), JSON.stringify({ error: { message: expected } }));
+			assert.equal(cancelled, 1);
+			if (label === "over byte limit") assert.equal(offset, 2, "the unread final chunk is cancelled");
+			assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+		} finally {
+			globalThis.fetch = originalFetch;
+			resetWarpStateForTests();
+		}
+	});
+}
+
+test("nonstream JSON: exactly 32 MiB of incoming bytes is accepted", async () => {
+	const originalFetch = globalThis.fetch;
+	const ending = "\n\ndata: [DONE]\n\n";
+	const wire = Buffer.from(":" + "é".repeat(10) + "x".repeat(32 * 1024 * 1024 - 21 - Buffer.byteLength(ending)) + ending);
+	assert.equal(wire.length, 32 * 1024 * 1024);
+	let cancelled = 0;
+	let offset = 0;
+	globalThis.fetch = async () => new Response(new ReadableStream({
+		pull(c) {
+			if (offset === wire.length) return;
+			const end = Math.min(offset + 1024 * 1024, wire.length);
+			c.enqueue(wire.subarray(offset, end));
+			offset = end;
+		},
+		cancel() { cancelled++; },
+	}), { headers: { "content-type": "text/event-stream" } });
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await forward(fakeReq({ stream: false }), res, RESEND_PATH, { ...FORWARD_CONFIG, warpMode: "off" });
+		assert.equal(res.status, 200);
+		assert.equal(res.body(), '{"object":"chat.completion","choices":[]}');
+		assert.equal(cancelled, 1);
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+	} finally {
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+for (const ending of ["socket departure", "response close", "DONE"]) {
+	test(`nonstream JSON: idle WARP delivery is released on ${ending}`, async () => {
+		const originalFetch = globalThis.fetch;
+		let cancelled = 0;
+		let started;
+		let controller;
+		let timeout;
+		const ready = new Promise((resolve) => { started = resolve; });
+		globalThis.fetch = async (url) => {
+			if (!String(url).includes("/v1/")) return new Response("", { status: 404 });
+			return new Response(new ReadableStream({
+				start(c) {
+					controller = c;
+					c.enqueue(Buffer.from(nonstreamEvent({ choices: [] })));
+					started();
+				},
+				cancel() { cancelled++; },
+			}), { headers: { "content-type": "text/event-stream" } });
+		};
+		try {
+			resetWarpStateForTests();
+			const socket = { remoteAddress: "127.0.0.1" };
+			const res = fakeRelayRes({ socket });
+			const finished = forward(fakeReq({ stream: false }), res, RESEND_PATH, FORWARD_CONFIG);
+			await ready;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(warpStateForTests().deliveringWarpStreams, 1);
+			assert.equal(res.headersSent, false, "no premature success headers");
+			if (ending === "socket departure") socket.remoteAddress = undefined;
+			else if (ending === "response close") res.emit("close");
+			else controller.enqueue(Buffer.from("data: [DONE]\n\n"));
+			await Promise.race([finished, new Promise((_, reject) => {
+				timeout = setTimeout(() => reject(new Error("idle reader was not cancelled")), 1000);
+			})]);
+			assert.equal(cancelled, 1);
+			assert.equal(res.headersSent, ending === "DONE");
+			assert.equal(res.body(), ending === "DONE" ? '{"object":"chat.completion","choices":[]}' : "");
+			assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+		} finally {
+			clearTimeout(timeout);
+			globalThis.fetch = originalFetch;
+			resetWarpStateForTests();
+		}
+	});
+}
+
+test("nonstream JSON: HTTP preserves default SSE, non-SSE and error bytes", async () => {
+	const sse = Buffer.from(nonstreamEvent({ id: "http-chat", choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: "stop" }] }) + "data: [DONE]\n\n");
+	const opaque = Buffer.from([0, 255, 13, 10, 123]);
+	const seen = [];
+	const upstream = createServer(async (req, res) => {
+		const chunks = [];
+		for await (const chunk of req) chunks.push(chunk);
+		const payload = JSON.parse(Buffer.concat(chunks));
+		seen.push(payload.stream);
+		const status = payload.kind === "error" ? 418 : 200;
+		res.writeHead(status, {
+			"content-type": payload.kind === "opaque" ? "application/octet-stream" : "text/event-stream",
+			"retry-after": "9", "x-private": "hidden",
+		});
+		res.end(payload.kind === "sse" ? sse : opaque);
+	});
+	let relay;
+	try {
+		await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+		const config = { ...FORWARD_CONFIG, warpMode: "off", upstream: `http://127.0.0.1:${upstream.address().port}` };
+		relay = createServer((req, res) => { void forward(req, res, RESEND_PATH, config); });
+		await new Promise((resolve) => relay.listen(0, "127.0.0.1", resolve));
+		for (const payload of ["sse", "opaque", "error"].flatMap((kind) => [
+			{ kind }, { kind, stream: true }, { kind, stream: false },
+		])) {
+			const response = await fetch(`http://127.0.0.1:${relay.address().port}/v1/chat/completions`, {
+				method: "POST", body: JSON.stringify(payload),
+			});
+			assert.equal(response.status, payload.kind === "error" ? 418 : 200);
+			assert.equal(response.headers.get("retry-after"), "9");
+			assert.equal(response.headers.get("x-private"), null);
+			assert.equal(response.headers.get("x-egress-used"), payload.kind === "error" ? null : "local");
+			const bytes = Buffer.from(await response.arrayBuffer());
+			if (payload.kind === "sse" && payload.stream === false) {
+				assert.equal(response.headers.get("content-type"), "application/json");
+				assert.deepEqual(JSON.parse(bytes), {
+					id: "http-chat", object: "chat.completion",
+					choices: [{ index: 0, message: { role: "assistant", content: "Hello" }, finish_reason: "stop" }],
+				});
+			} else {
+				assert.equal(response.headers.get("content-type"), payload.kind === "opaque" ? "application/octet-stream" : "text/event-stream");
+				assert.deepEqual(bytes, payload.kind === "sse" ? sse : opaque);
+			}
+			assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+		}
+		assert.deepEqual(seen, Array(9).fill(true));
+	} finally {
+		if (relay) await new Promise((resolve) => relay.close(resolve));
+		await new Promise((resolve) => upstream.close(resolve));
 		resetWarpStateForTests();
 	}
 });
