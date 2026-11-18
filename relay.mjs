@@ -457,10 +457,26 @@ function sendJson(res, status, payload) {
 	res.end(JSON.stringify(payload));
 }
 
+// Fixed cap on incoming bytes, before JSON parsing or any upstream work.
+const MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
+
+class RequestBodyTooLargeError extends Error {
+	constructor() {
+		super(`request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`);
+	}
+}
+
 async function readBody(req) {
 	const chunks = [];
-	for await (const chunk of req) {
-		chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+	let size = 0;
+	// Early iterator exit must not destroy the request before its 413 reply:
+	// Bun otherwise closes the response with an empty 200 during cleanup.
+	const source = typeof req.iterator === "function" ? req.iterator({ destroyOnReturn: false }) : req;
+	for await (const chunk of source) {
+		const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+		size += buffer.length;
+		if (size > MAX_REQUEST_BODY_BYTES) throw new RequestBodyTooLargeError();
+		chunks.push(buffer);
 	}
 	return Buffer.concat(chunks).toString("utf8");
 }
@@ -3242,7 +3258,9 @@ export async function forward(req, res, pathname, config) {
 		}
 		res.end();
 	} catch (err) {
-		sendJson(res, 502, { error: { message: err && err.message ? err.message : String(err) } });
+		// Only our body-limit error changes status; other failures remain 502.
+		const status = err instanceof RequestBodyTooLargeError ? 413 : 502;
+		sendJson(res, status, { error: { message: err && err.message ? err.message : String(err) } });
 	} finally {
 		if (countedDelivering) deliveringWarpStreams -= 1;
 	}

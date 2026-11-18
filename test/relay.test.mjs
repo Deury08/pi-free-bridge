@@ -19,7 +19,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
-import { createServer } from "node:http";
+import { Agent, createServer, request as httpRequest } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7902,4 +7902,238 @@ test("a rate-limited release read says which limit and when it returns (S37)", a
 
 	const plain = releaseReadFailure(500, "", () => null);
 	assert.equal(plain, "GitHub answered 500", "a bare status is still a fact and never a guess");
+});
+
+// ---------------------------------------------------------------------------
+// The fixed request-body limit (S1)
+// ---------------------------------------------------------------------------
+// One request cannot grow without bound: a body over 32 MiB is refused with a
+// JSON 413 before the gate, the egress chain or WARP are touched. The value is
+// deliberately repeated here instead of imported, so a test that starts passing
+// because the implementation changed its own constant fails loudly.
+
+const REQUEST_BODY_LIMIT = 32 * 1024 * 1024;
+
+/** A valid JSON body padded to an exact UTF-8 byte length. */
+function bodyOfBytes(bytes) {
+	const prefix = '{"marker":"request-body-limit","f":"';
+	const suffix = '"}';
+	const fill = bytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix);
+	assert.ok(fill >= 0, "the requested size fits the JSON envelope");
+	return prefix + "a".repeat(fill) + suffix;
+}
+
+/** A request body for `forward()`, delivered as the given buffers. */
+const reqFromChunks = (chunks) => Readable.from(chunks.map((chunk) => Buffer.from(chunk)));
+
+test("forward: request body limit accepts a body of exactly 32 MiB", async () => {
+	const body = bodyOfBytes(REQUEST_BODY_LIMIT);
+	assert.equal(Buffer.byteLength(body), REQUEST_BODY_LIMIT, "the fixture sits on the boundary");
+	const fake = installFakeFetch(
+		() => new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } }),
+	);
+	try {
+		const res = fakeRelayRes();
+		await forward(reqFromChunks([body]), res, RESEND_PATH, { ...WARP_CONFIG, cwd: ".", warpMode: "off" });
+
+		assert.equal(res.status, 200, "exactly at the limit is accepted");
+		assert.equal(fake.calls.length, 1, "one upstream attempt, no retry");
+		assert.equal(
+			JSON.parse(fake.calls[0].body).marker,
+			"request-body-limit",
+			"the accepted request reaches the upstream unchanged",
+		);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("forward: request body limit rejects one byte over with 413 and no upstream attempt", async () => {
+	const body = bodyOfBytes(REQUEST_BODY_LIMIT + 1);
+	assert.equal(Buffer.byteLength(body), REQUEST_BODY_LIMIT + 1, "one byte past the boundary");
+	const fake = installFakeFetch(() => {
+		throw new Error("an over-limit body must never reach fetch");
+	});
+	try {
+		const res = fakeRelayRes();
+		// warpMode "on": a rejection that reaches egress selection would ask the
+		// health endpoint first, so zero calls proves the refusal came earlier.
+		await forward(reqFromChunks([body]), res, RESEND_PATH, FORWARD_CONFIG);
+
+		assert.equal(res.status, 413, "one byte over is refused");
+		assert.deepEqual(JSON.parse(res.body()), {
+			error: { message: `request body exceeds ${REQUEST_BODY_LIMIT} bytes` },
+		});
+		assert.equal(fake.calls.length, 0, "no upstream and no WARP read");
+	} finally {
+		fake.restore();
+	}
+});
+
+test("forward: request body limit counts bytes across chunks, including multibyte input", async () => {
+	// Shorter than 32 MiB as a string, longer than 32 MiB on the wire: only a
+	// byte count can refuse it, and the refusal arrives once the offending chunk
+	// has been read.
+	const body = "é".repeat(Math.ceil(REQUEST_BODY_LIMIT / 2) + 1);
+	assert.ok(body.length < REQUEST_BODY_LIMIT, "the fixture is under the limit in characters");
+	assert.ok(Buffer.byteLength(body) > REQUEST_BODY_LIMIT, "and over it in bytes");
+	const wire = Buffer.from(body);
+	const step = Math.ceil(wire.length / 16);
+	const chunks = [];
+	for (let at = 0; at < wire.length; at += step) chunks.push(wire.subarray(at, at + step));
+	assert.ok(chunks.length > 1, "the body really arrives in several chunks");
+
+	const fake = installFakeFetch(() => {
+		throw new Error("an over-limit body must never reach fetch");
+	});
+	try {
+		const res = fakeRelayRes();
+		await forward(reqFromChunks(chunks), res, RESEND_PATH, FORWARD_CONFIG);
+
+		assert.equal(res.status, 413, "the accumulated byte count crosses the limit");
+		assert.deepEqual(JSON.parse(res.body()), {
+			error: { message: `request body exceeds ${REQUEST_BODY_LIMIT} bytes` },
+		});
+		assert.equal(fake.calls.length, 0, "nothing is forwarded");
+	} finally {
+		fake.restore();
+	}
+});
+
+test("forward: invalid or empty JSON is still a 502 (request body limit baseline)", async () => {
+	// The limit is counted before the body is parsed. The pre-existing parse
+	// failure path must keep its status and JSON shape for anything under it.
+	const fake = installFakeFetch(() => {
+		throw new Error("unparsable input must never reach fetch");
+	});
+	try {
+		for (const raw of ["", "not json"]) {
+			const res = fakeRelayRes();
+			await forward(reqFromChunks([raw]), res, RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(res.status, 502, `"${raw}" keeps the pre-existing 502`);
+			assert.equal(typeof JSON.parse(res.body()).error.message, "string", "the JSON error shape is unchanged");
+		}
+		assert.equal(fake.calls.length, 0, "neither request reaches an egress");
+	} finally {
+		fake.restore();
+	}
+});
+
+test("forward: request body limit preserves request-read errors as 502", async () => {
+	const fake = installFakeFetch(() => {
+		throw new Error("a failed request read must never reach fetch");
+	});
+	try {
+		for (const status of [undefined, 413]) {
+			const req = Readable.from((async function* () {
+				yield Buffer.from("{");
+				throw Object.assign(new Error("request read failed"), { status });
+			})());
+			const res = fakeRelayRes();
+			await forward(req, res, RESEND_PATH, FORWARD_CONFIG);
+			assert.equal(res.status, 502);
+			assert.equal(res.body(), '{"error":{"message":"request read failed"}}');
+			assert.equal(fake.calls.length, 0);
+		}
+	} finally {
+		fake.restore();
+	}
+});
+
+/** One loopback upload; the body is written as chunks and the relay answers. */
+function postChunked(port, chunks, agent) {
+	return new Promise((resolveUpload, rejectUpload) => {
+		const req = httpRequest(
+			{
+				host: "127.0.0.1",
+				port,
+				method: "POST",
+				path: "/v1/chat/completions",
+				agent,
+				headers: { "content-type": "application/json" },
+			},
+			(res) => {
+				const parts = [];
+				res.on("data", (chunk) => parts.push(chunk));
+				res.on("end", () =>
+					resolveUpload({
+						status: res.statusCode,
+						contentType: res.headers["content-type"],
+						body: Buffer.concat(parts).toString("utf8"),
+					}),
+				);
+			},
+		);
+		req.on("error", rejectUpload);
+		for (const chunk of chunks) req.write(Buffer.from(chunk));
+		req.end();
+	});
+}
+
+/** A real relay server in front of a recording upstream, both on loopback. */
+async function withRelayLoopback(run) {
+	const upstreamRequests = [];
+	const upstream = createServer((req, res) => {
+		const parts = [];
+		req.on("data", (chunk) => parts.push(chunk));
+		req.on("end", () => {
+			const body = Buffer.concat(parts);
+			upstreamRequests.push({ bytes: body.length, body: body.toString("utf8") });
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end('{"ok":true}');
+		});
+	});
+	await new Promise((done) => upstream.listen(0, "127.0.0.1", done));
+	const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+	const seen = { chunked: false, ports: [] };
+	const relay = createServer((req, res) => {
+		seen.chunked = req.headers["transfer-encoding"] === "chunked";
+		seen.ports.push(req.socket.remotePort);
+		void forward(req, res, req.url, {
+			...WARP_CONFIG,
+			upstream: `http://127.0.0.1:${upstream.address().port}`,
+			warpMode: "off",
+			cwd: ".",
+		});
+	});
+	await new Promise((done) => relay.listen(0, "127.0.0.1", done));
+	try {
+		return await run({ port: relay.address().port, upstreamRequests, seen, agent });
+	} finally {
+		agent.destroy();
+		await new Promise((done) => relay.close(done));
+		await new Promise((done) => upstream.close(done));
+	}
+}
+
+test("request body limit: a chunked loopback upload over the limit gets a real 413", async () => {
+	const accepted = bodyOfBytes(REQUEST_BODY_LIMIT);
+	const over = bodyOfBytes(REQUEST_BODY_LIMIT + 1);
+	const half = Math.floor(over.length / 2);
+	await withRelayLoopback(async ({ port, upstreamRequests, seen, agent }) => {
+		const ok = await postChunked(port, [accepted], agent);
+		assert.equal(ok.status, 200, "the boundary request is forwarded");
+		assert.equal(ok.contentType, "application/json");
+		assert.equal(upstreamRequests.length, 1, "the upstream served the accepted body");
+		assert.equal(
+			upstreamRequests[0].body.includes("request-body-limit"),
+			true,
+			"the accepted body arrived intact",
+		);
+
+		// Two writes, and the byte that crosses 32 MiB travels in the second one.
+		const refused = await postChunked(port, [over.slice(0, half), over.slice(half)], agent);
+		assert.equal(seen.chunked, true, "the client sent a chunked request");
+		assert.equal(seen.ports[0], seen.ports[1], "the upload reuses the persistent HTTP connection");
+		assert.equal(refused.status, 413, "Bun answers a usable 413, not an empty 200");
+		assert.equal(refused.contentType, "application/json");
+		assert.deepEqual(JSON.parse(refused.body), {
+			error: { message: `request body exceeds ${REQUEST_BODY_LIMIT} bytes` },
+		});
+		assert.equal(upstreamRequests.length, 1, "the refused request never reaches the upstream");
+		const next = await postChunked(port, ['{"marker":"after-rejection"}'], agent);
+		assert.equal(next.status, 200, "a subsequent request is still usable");
+		assert.equal(next.body, '{"ok":true}');
+		assert.equal(upstreamRequests.length, 2, "only the two accepted requests reach upstream");
+	});
 });

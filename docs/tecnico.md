@@ -311,6 +311,13 @@ máquina necesita tener OpenCode para conseguirlo. El paquete **no incluye**
 ningún id: el relay lo resuelve al arrancar, con la cadena de cinco fuentes que
 está en [Cosecha de session id](#cosecha-de-session-id-híbrida).
 
+**Tamaño del cuerpo:** el relay acepta como máximo 32 MiB (`32 * 1024 * 1024`
+bytes) por request, contados a medida que llegan los fragmentos del cuerpo; el
+límite es fijo y no se configura. Un cuerpo mayor se responde con `413` y el
+JSON de error habitual (`{"error":{"message":…}}`) antes de tocar el upstream,
+la selección de egress o WARP, así que esa request nunca sale del proceso. Un
+cuerpo que entra exacto en 32 MiB se reenvía con normalidad.
+
 ### Requests sin tools (compactación, `/compact`, resúmenes de rama)
 
 El requisito de `tools` aplica a **toda** request, y las llamadas one-off de Pi arman
