@@ -1826,6 +1826,158 @@ function fakeRelayRes({ socket } = {}) {
 const fakeReq = (payload) => Readable.from([Buffer.from(JSON.stringify(payload))]);
 const FORWARD_CONFIG = { ...WARP_CONFIG, cwd: ".", warpMode: "on", sessionSource: "test" };
 
+test("forward: backpressure pauses upstream reads until drain", { timeout: 2_000 }, async () => {
+	const originalFetch = globalThis.fetch;
+	const chunks = [Buffer.from("data: first\n\n"), Buffer.from("data: second\n\n")];
+	const written = [];
+	let reads = 0;
+	let firstWrite;
+	const blocked = new Promise((resolve) => { firstWrite = resolve; });
+	const res = fakeRelayRes();
+	let headers;
+	const writeHead = res.writeHead;
+	res.writeHead = (status, values) => {
+		headers = values;
+		return writeHead(status);
+	};
+	const write = res.write;
+	res.write = (chunk) => {
+		written.push(Buffer.from(chunk));
+		write(chunk);
+		if (written.length === 1) {
+			firstWrite();
+			return false;
+		}
+		return true;
+	};
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/health")) return new Response(JSON.stringify({ recycling: false, exits: ["warp-a"] }));
+		if (String(url).endsWith("/exits")) return new Response("", { status: 404 });
+		return new Response(new ReadableStream({
+			pull(controller) {
+				if (reads < chunks.length) controller.enqueue(chunks[reads++]);
+				else controller.close();
+			},
+		}, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } });
+	};
+	resetWarpStateForTests();
+	const done = forward(fakeReq({ stream: true }), res, RESEND_PATH, FORWARD_CONFIG);
+	try {
+		await blocked;
+		await new Promise(setImmediate);
+		assert.equal(reads, 1, "do not pull another chunk while the downstream buffer is full");
+		assert.equal(written.length, 1);
+		assert.equal(warpStateForTests().deliveringWarpStreams, 1);
+		res.emit("drain");
+		await done;
+		assert.deepEqual(Buffer.concat(written), Buffer.concat(chunks), "forward bytes unchanged after drain");
+		assert.equal(res.status, 200);
+		assert.equal(headers["content-type"], "text/event-stream");
+		assert.equal(headers["x-egress-used"], "warp");
+		assert.equal(res.writableEnded, true);
+		assert.equal(res.listenerCount("drain"), 0);
+		assert.equal(res.listenerCount("error"), 0);
+		assert.equal(res.listenerCount("close"), 1, "only the existing client tracker remains");
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+	} finally {
+		res.emit("close");
+		await done;
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
+test("forward: backpressure releases upstream on downstream termination", async (t) => {
+	for (const event of ["close", "error", "close-during-write", "destroyed", "disconnect-at-drain"]) {
+		await t.test(event, { timeout: 2_000 }, async () => {
+			const originalFetch = globalThis.fetch;
+			const socket = { remoteAddress: "127.0.0.1" };
+			const res = fakeRelayRes({ socket });
+			let firstWrite;
+			const blocked = new Promise((resolve) => { firstWrite = resolve; });
+			let reads = 0;
+			let cancelled = false;
+			const write = res.write;
+			res.write = (chunk) => {
+				write(chunk);
+				if (event === "close-during-write") res.emit("close");
+				if (event === "destroyed") res.destroyed = true;
+				firstWrite();
+				return false;
+			};
+			globalThis.fetch = async (url) => {
+				if (String(url).endsWith("/health")) return new Response(JSON.stringify({ recycling: false, exits: ["warp-a"] }));
+				if (String(url).endsWith("/exits")) return new Response("", { status: 404 });
+				return new Response(new ReadableStream({
+					pull(controller) {
+						if (reads++ < 2) controller.enqueue(Buffer.from("data: x\n\n"));
+						else controller.close();
+					},
+					cancel() { cancelled = true; },
+				}, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } });
+			};
+			resetWarpStateForTests();
+			const done = forward(fakeReq({ stream: true }), res, RESEND_PATH, FORWARD_CONFIG);
+			try {
+				await blocked;
+				if (event === "close" || event === "error") res.emit(event);
+				if (event === "disconnect-at-drain") {
+					socket.remoteAddress = undefined;
+					res.emit("drain");
+				}
+				await done;
+				assert.equal(cancelled, true, "cancel the unread upstream body");
+				assert.equal(reads, 1, "do not consume a second chunk after downstream termination");
+				assert.equal(res.status, 200);
+				assert.equal(res.body(), "data: x\n\n");
+				assert.equal(warpStateForTests().deliveringWarpStreams, 0, "release the active WARP delivery");
+				assert.equal(res.listenerCount("drain"), 0);
+				assert.equal(res.listenerCount("error"), 0);
+				assert.equal(res.listenerCount("close"), 1, "remove only the new drain-wait listeners");
+			} finally {
+				res.emit("close");
+				await done;
+				globalThis.fetch = originalFetch;
+				resetWarpStateForTests();
+			}
+		});
+	}
+});
+
+test("forward: accepted writes preserve response bytes without waiting for drain", { timeout: 2_000 }, async () => {
+	const originalFetch = globalThis.fetch;
+	const chunks = [Buffer.from([0, 255, 13]), Buffer.from([10, 195, 169])];
+	const written = [];
+	const res = fakeRelayRes();
+	const write = res.write;
+	res.write = (chunk) => {
+		assert.equal(res.listenerCount("drain"), 0);
+		written.push(Buffer.from(chunk));
+		return write(chunk);
+	};
+	globalThis.fetch = async (url) => {
+		if (String(url).endsWith("/health")) return new Response(JSON.stringify({ recycling: false, exits: ["warp-a"] }));
+		if (String(url).endsWith("/exits")) return new Response("", { status: 404 });
+		return new Response(new ReadableStream({
+			start(controller) {
+				for (const chunk of chunks) controller.enqueue(chunk);
+				controller.close();
+			},
+		}), { headers: { "content-type": "text/event-stream" } });
+	};
+	resetWarpStateForTests();
+	try {
+		await forward(fakeReq({ stream: true }), res, RESEND_PATH, FORWARD_CONFIG);
+		assert.deepEqual(Buffer.concat(written), Buffer.concat(chunks));
+		assert.equal(res.status, 200);
+		assert.equal(res.writableEnded, true);
+		assert.equal(warpStateForTests().deliveringWarpStreams, 0);
+	} finally {
+		globalThis.fetch = originalFetch;
+		resetWarpStateForTests();
+	}
+});
+
 test("forward: a warp delivery is counted once and released on every exit path (S20)", async () => {
 	// C1/C2/C4/C5 have no coverage from the tests above: they set the counter by
 	// hand instead of earning it. A leaked or double-decremented counter would
