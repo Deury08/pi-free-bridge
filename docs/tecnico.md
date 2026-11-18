@@ -280,9 +280,24 @@ cabecera trae los segundos reales hasta el reset, así que el cliente no necesit
 calcular medianoche UTC ni adivinar su zona horaria. El resto de los headers del
 upstream no salen del relay.
 
+**JSON sin streaming:** si el cliente envía explícitamente `stream: false`, el
+relay mantiene `stream: true` hacia upstream y agrega una respuesta exitosa
+`text/event-stream` antes de enviar las cabeceras. Devuelve
+`application/json` con `object: "chat.completion"`, metadatos, elecciones por
+índice, contenido, llamadas a herramientas reconstruidas, motivos de finalización
+y uso de tokens. `stream: true` y el campo omitido conservan los bytes SSE; las
+respuestas no SSE y los errores HTTP se conservan sin transformación.
+
+La agregación acepta hasta **32 MiB inclusive de bytes SSE recibidos**. Si supera
+ese límite, un evento `data` contiene JSON inválido, falla la lectura o termina
+sin `[DONE]`, devuelve un error JSON HTTP **502**, nunca una respuesta parcial
+exitosa. El relay cancela la lectura pendiente al rechazar la respuesta o perder
+al cliente y mantiene el contador de entregas WARP durante toda la agregación.
+No añade opciones de configuración.
+
 **Body:**
 
-- `stream: true` (`stream: false` → 403)
+- `stream: true` hacia upstream (`stream: false` directo al gate → 403)
 - un mensaje inicial `system` o `developer` (contenido y longitud libres)
 - un array `tools` no vacío que contenga **ambos** nombres `read` **y** `bash`
   — los nombres se inspeccionan; `[read, bash]` en cualquier orden pasa,
