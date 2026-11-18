@@ -187,20 +187,20 @@ const names = (tools) =>
 		.filter((name) => typeof name === "string")
 		.sort();
 
-test("ensureGateTools: injects read and bash when tools is absent", () => {
+test("ensureGateTools: injects read when tools is absent", () => {
 	const body = { model: "m", messages: [] };
 
 	const result = ensureGateTools(body);
 
-	assert.deepEqual(names(result.tools), ["bash", "read"]);
+	assert.deepEqual(names(result.tools), ["read"]);
 	assert.equal(result.tool_choice, "none");
 	assert.equal(body.tools, undefined, "the input body must not be mutated");
 });
 
-test("ensureGateTools: injects read and bash when tools is empty", () => {
+test("ensureGateTools: injects read when tools is empty", () => {
 	const result = ensureGateTools({ tools: [] });
 
-	assert.deepEqual(names(result.tools), ["bash", "read"]);
+	assert.deepEqual(names(result.tools), ["read"]);
 	assert.equal(result.tool_choice, "none");
 });
 
@@ -228,18 +228,32 @@ test("ensureGateTools: accepts the bare-name tool shape", () => {
 });
 
 test("ensureGateTools: appends only the missing declaration", () => {
-	const existing = { type: "function", function: { name: "read", parameters: {} } };
+	const existing = { type: "function", function: { name: "grep", parameters: {} } };
 	const body = { tools: [existing] };
 
 	const result = ensureGateTools(body);
 
-	assert.deepEqual(names(result.tools), ["bash", "read"]);
+	assert.deepEqual(names(result.tools), ["grep", "read"]);
 	assert.equal(result.tools[0], existing, "the existing declaration must be kept");
 	assert.equal(result.tools.length, 2, "no duplicates");
 	assert.equal(Object.hasOwn(result, "tool_choice"), false, "an omitted choice stays omitted");
 });
 
-for (const tool of ["read", "bash", "search"]) {
+// A set that already satisfies the gate must come back with nothing added: this is
+// gentle-ai-explore's own set (read + grep + find, no bash).
+test("ensureGateTools: leaves a sufficient restricted set alone", () => {
+	const existing = ["read", "grep", "find"].map((name) => ({ name }));
+	const body = { model: "m", tools: existing, tool_choice: "auto" };
+
+	const result = ensureGateTools(body);
+
+	assert.equal(result.tools, existing, "no phantom tool is injected into a restricted agent");
+	assert.deepEqual(names(result.tools), ["find", "grep", "read"]);
+	assert.equal(result.tool_choice, "auto", "the caller's choice survives");
+});
+
+const EXPECTED_FOR = { read: ["read"], bash: ["bash", "read"], search: ["read", "search"] };
+for (const tool of Object.keys(EXPECTED_FOR)) {
 	for (const choice of [undefined, "none", "auto", "required", { type: "function", function: { name: tool } }]) {
 		const label = choice === undefined ? "omitted" : JSON.stringify(choice);
 		test(`ensureGateTools: preserves partial ${tool} tools with ${label} choice`, () => {
@@ -250,7 +264,7 @@ for (const tool of ["read", "bash", "search"]) {
 
 			const result = ensureGateTools(body);
 
-			assert.deepEqual(names(result.tools), tool === "search" ? ["bash", "read", "search"] : ["bash", "read"]);
+			assert.deepEqual(names(result.tools), EXPECTED_FOR[tool]);
 			assert.equal(result.tools[0], existing, "caller declarations stay intact");
 			assert.equal(result.tool_choice, choice);
 			assert.equal(Object.hasOwn(result, "tool_choice"), choice !== undefined);
@@ -264,7 +278,7 @@ for (const choice of ["none", "auto", "required", { type: "function", function: 
 	test(`ensureGateTools: keeps no-tools safety and complete-set choices for ${JSON.stringify(choice)}`, () => {
 		for (const tools of [undefined, []]) {
 			const result = ensureGateTools({ tools, tool_choice: choice });
-			assert.deepEqual(names(result.tools), ["bash", "read"]);
+			assert.deepEqual(names(result.tools), ["read"]);
 			assert.equal(result.tool_choice, "none", "injected-only declarations stay disabled");
 		}
 		const tools = [{ name: "read" }, { name: "bash" }];
