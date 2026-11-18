@@ -1332,16 +1332,19 @@ function buildPiModels(raw: RegistryModel[]) {
 // that `test/gate-tools.mjs` exercises, so a future relay change cannot quietly
 // break the transcript-level contract.
 
-/** The gate rejects any request whose `tools` array does not carry BOTH `read`
- *  and `bash` (HANDOFF §4.2). Pi's one-off calls — the auto-compaction,
- *  `/compact` and the branch summarization — build their request context from a
- *  system prompt plus a user message with NO tools at all
- *  (pi-coding-agent dist/core/compaction/compaction.js:498 and
+/** The gate requires exactly one tool name: `read`. Measured against the live
+ *  gate on 2026-11-18 — `[read]` alone is accepted, while `[bash]`, `[grep, find,
+ *  ls]`, `[]` and an absent array are refused with `429 FreeUsageLimitError`, the
+ *  same answer a spent quota gets (which is why the refusal reads like a quota
+ *  problem). Pi's one-off calls — the auto-compaction, `/compact` and the branch
+ *  summarization — build their request context from a system prompt plus a user
+ *  message with NO tools at all (pi-coding-agent
+ *  dist/core/compaction/compaction.js:498 and
  *  dist/core/compaction/branch-summarization.js:224), and pi-ai only sets
  *  `params.tools` when the resolved transcript has tools
- *  (pi-ai dist/api/openai-completions.js:600), so those requests answered
- *  `403 FreeTierError`. */
-const GATE_TOOL_NAMES = ["read", "bash"];
+ *  (pi-ai dist/api/openai-completions.js:600), so those requests hit that
+ *  refusal. */
+const GATE_TOOL_NAMES = ["read"];
 
 /** Minimal tool declarations. The gate only inspects the names; `toolChoice:
  *  "none"` keeps the model from calling them. */
@@ -1394,15 +1397,18 @@ function resolveToolNames(messages: GateMessage[]): Set<string> {
 
 /** Make a request context acceptable to the free-tier gate.
  *
- *  A context that already resolves both gate tools is returned untouched: the
- *  normal conversation path must not change. Otherwise the missing names are
- *  injected as a TRAILING system message and `toolChoice` is pinned to `none`.
+ *  A context that already resolves the gate tool is returned untouched: the normal
+ *  conversation path must not change. Otherwise the missing name is injected as a
+ *  TRAILING system message. `toolChoice` is pinned to `none` ONLY when the caller
+ *  had no tools at all, because those declarations exist solely to satisfy the
+ *  gate; a partial set keeps the choice it asked for, so its own tools stay
+ *  callable (pinning it there is the defect PR #29 fixed).
  *
  *  The injection is appended, not patched into the leading system message,
  *  because Pi resolves every delta: an earlier `toolsRemoved` would otherwise
  *  drop the injected tool again (pi-ai
- *  dist/utils/transcript.js:41-51). Only the names that are actually missing
- *  are added, so a partial tool set is unioned instead of duplicated. */
+ *  dist/utils/transcript.js:41-51). Only the name that is actually missing is
+ *  added, so a partial tool set is unioned instead of duplicated. */
 export function gateRequestContext(context: GateContext): GateRequestContext {
 	const present = resolveToolNames(context.messages);
 	const missing = GATE_TOOL_NAMES.filter((name) => !present.has(name));
@@ -1423,7 +1429,8 @@ export function gateRequestContext(context: GateContext): GateRequestContext {
 		timestamp: Date.now(),
 	};
 
-	return { messages: [...context.messages, injected], toolChoice: "none" };
+	const messages = [...context.messages, injected];
+	return present.size === 0 ? { messages, toolChoice: "none" } : { messages };
 }
 
 /** Pi hands extensions its own copy of pi-ai — as a virtual module

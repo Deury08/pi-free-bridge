@@ -70,7 +70,7 @@ export function ensureEnvBlock(messages, cwd) {
 }
 
 function gateToolDeclarations() {
-	return ["read", "bash"].map((name) => ({
+	return ["read"].map((name) => ({
 		type: "function",
 		function: {
 			name,
@@ -89,10 +89,16 @@ function toolName(tool) {
 }
 
 /**
- * Make the wire body carry both gate tool names. A missing or empty `tools`
- * array is replaced with minimal `read` + `bash` declarations; a partial set is
- * completed with only the missing names, preserving the caller's `tool_choice`.
- * Only absent or empty tool sets are pinned to `"none"` to disable injected tools.
+ * Make the wire body carry the one gate tool name. A missing or empty `tools`
+ * array is replaced with a minimal `read` declaration and pinned to
+ * `tool_choice: "none"`; a partial set is completed with `read` only, preserving
+ * the caller's `tool_choice`.
+ *
+ * The gate inspects exactly one name. Measured 2026-11-18 against the live gate:
+ * `[read]` is accepted; `[bash]`, `[grep, find, ls]`, `[]` and an absent array are
+ * refused with `429 FreeUsageLimitError`, which reads like spent quota but is a
+ * contract refusal. `bash` is not inspected, so injecting it only hands a
+ * restricted agent a callable tool it does not own.
  */
 export function ensureGateTools(body) {
 	const next = { ...(body && typeof body === "object" ? body : {}) };
@@ -105,7 +111,7 @@ export function ensureGateTools(body) {
 	}
 
 	const present = new Set(tools.map(toolName).filter((name) => typeof name === "string"));
-	const missing = ["read", "bash"].filter((name) => !present.has(name));
+	const missing = ["read"].filter((name) => !present.has(name));
 	if (missing.length === 0) return next;
 
 	next.tools = [...tools, ...gateToolDeclarations().filter((tool) => missing.includes(tool.function.name))];

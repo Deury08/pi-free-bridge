@@ -75,7 +75,7 @@ máquina sin Bun.
 
 El relay es el único proceso que abre la conexión TLS contra OpenCode. Ahí viven
 los headers del gate, el session id, el bloque `<env>` con `Working directory:`
-y las tools `read`/`bash`. La respuesta vuelve byte por byte, sin parsear y sin
+y la tool `read` que exige el gate. La respuesta vuelve byte por byte, sin parsear y sin
 reescribir ningún chunk.
 
 Si el cliente consume más lento que el relay, la lectura del upstream espera a
@@ -284,9 +284,11 @@ upstream no salen del relay.
 
 - `stream: true` (`stream: false` → 403)
 - un mensaje inicial `system` o `developer` (contenido y longitud libres)
-- un array `tools` no vacío que contenga **ambos** nombres `read` **y** `bash`
-  — los nombres se inspeccionan; `[read, bash]` en cualquier orden pasa,
-  `[bash]` solo o dos nombres arbitrarios no
+- un array `tools` con una tool llamada **`read`**. Es el único nombre que el gate
+  inspecciona: `[read]`, `[read, grep]` y `[bash, read]` pasan en cualquier orden
+  y posición; `[bash]`, `[grep, find, ls]`, `[]` y la ausencia de `tools` se
+  rechazan (medido contra el gate en vivo el 2026-11-18, con dos modelos). `bash`
+  no se inspecciona.
 
 **Rol del mensaje y campo de tokens:** el puente registra **cada** modelo de
 `oc-sdk-zen` con `compat: { supportsDeveloperRole: false, maxTokensField:
@@ -326,8 +328,13 @@ cuerpo que entra exacto en 32 MiB se reenvía con normalidad.
 ### Requests sin tools (compactación, `/compact`, resúmenes de rama)
 
 El requisito de `tools` aplica a **toda** request, y las llamadas one-off de Pi arman
-su contexto con un system prompt y **ninguna tool** — por eso volvían `403
-FreeTierError` mientras el turno normal de conversación funcionaba:
+su contexto con un system prompt y **ninguna tool** — por eso fallaban mientras el
+turno normal de conversación funcionaba. El rechazo llega como **`429
+FreeUsageLimitError`** ("Free usage limit reached… subscribe to OpenCode Go") con un
+`retry-after` de ~19,5 h: idéntico a una cuota agotada aunque la cuota esté intacta.
+El `403 FreeTierError` ("can only be used from within OpenCode") es la otra cara
+del mismo rechazo, la que ve el cliente oficial cuando su array pierde `read`
+(opencode#51315). Ninguno de los dos es cuota:
 
 - `pi-coding-agent/dist/core/compaction/compaction.js:498` — `buildSummarizationContext`
   arma el contexto con un system prompt y un mensaje `user`; sin `tools`.
@@ -339,14 +346,19 @@ FreeTierError` mientras el turno normal de conversación funcionaba:
   transcript resuelto trae tools, así que un contexto sin tools no manda el array.
 
 El relay completa el array `tools` en el wire antes de reenviar: si falta o está
-vacío, inyecta declaraciones mínimas de `read` y `bash` y fija `tool_choice` en
-`"none"` para impedir que una petición sin herramientas propias las invoque.
-Si ya hay herramientas, agrega únicamente los nombres que faltan y conserva
-`tool_choice` tal como lo envía el cliente, incluso si está omitido. Esto incluye
-`"auto"`, `"required"` y selecciones de funciones específicas: las declaraciones
-añadidas también pueden participar en la selección del modelo. El relay no añade
-implementaciones que ejecuten esas herramientas. Un array que ya trae ambos
-nombres pasa intacto. La misma regla aplica al bloque `<env>`: se agrega sólo si
+vacío, inyecta una declaración mínima de `read` y fija `tool_choice` en `"none"`
+para impedir que una petición sin herramientas propias la invoque.
+Si ya hay herramientas, agrega `read` sólo cuando falta y conserva `tool_choice`
+tal como lo envía el cliente, incluso si está omitido. Esto incluye `"auto"`,
+`"required"` y selecciones de funciones específicas: la declaración añadida
+también puede participar en la selección del modelo. El relay no añade
+implementaciones que ejecuten esa herramienta. Un array que ya trae `read` pasa
+intacto — el conjunto del explorador (`read`, `grep`, `find`, sin `bash`) es el
+caso normal.
+
+Inyectar un nombre que el agente no tiene le ofrece al modelo una tool que el host
+no puede ejecutar (`Unknown tool name`), así que se inyecta sólo el nombre que el
+gate exige y ningún otro. `bash` no se inspecciona. La misma regla aplica al bloque `<env>`: se agrega sólo si
 el system prompt no lo tiene.
 
 `gateRequestContext` sigue en `index.ts` como implementación de referencia a
@@ -865,7 +877,7 @@ pi -p --model oc-sdk-zen/deepseek-v4.1-flash-free "Reply with exactly: OK"
 
 ```bash
 node --test test/relay.test.mjs  # helpers del relay: <env>, tools, mapeo de URL, cosecha de sesión — offline
-node test/gate-tools.mjs  # inyección de read/bash a nivel de contexto — offline
+node test/gate-tools.mjs  # inyección de `read` a nivel de contexto — offline
 node test/smoke.mjs   # filtro y registro contra el relay local — offline
 node repro.mjs        # gate vivo — con red
 ```
