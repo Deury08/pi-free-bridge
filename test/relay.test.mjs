@@ -8704,8 +8704,13 @@ import {
 	FAILURE_KIND,
 	FAILURE_SCOPE,
 	MAX_PROVIDER_COOLDOWN_MS,
+	autoDetectToolFilter,
 	backoffFor,
 	classifyFailure,
+	compactBuildOutput,
+	compactGitDiff,
+	compactSmartTruncate,
+	compressToolOutputs,
 	extractFailureFields,
 } from "../relay.mjs";
 
@@ -8866,6 +8871,158 @@ test("forward: warpMode on retries timeout errors onto local but stops on aborte
 		} finally {
 			fake.restore();
 		}
+	}
+});
+
+// S5: token saver — outgoing tool-output compression (buildOutput, gitDiff, smartTruncate).
+
+test("token-saver: compactGitDiff bounds large hunks, emits counts and truncation marker", () => {
+	const lines = [
+		"diff --git a/src/big.js b/src/big.js",
+		"index 1111111..2222222 100644",
+		"--- a/src/big.js",
+		"+++ b/src/big.js",
+		"@@ -1,125 +1,125 @@",
+		...Array.from({ length: 120 }, (_, i) => `+const line${i} = ${i};`),
+	].join("\n");
+	const compacted = compactGitDiff(lines);
+	assert.equal(compacted.includes("src/big.js"), true);
+	assert.equal(compacted.includes("lines truncated)"), true);
+	assert.equal(compacted.includes("[diff truncated by pi-free-bridge;"), true);
+	assert.equal(compacted.includes("+120 -0"), true);
+	assert.ok(compacted.length < lines.length);
+});
+
+test("token-saver: compactBuildOutput summarizes progress lines but keeps every error diagnostic", () => {
+	const lines = [
+		...Array.from({ length: 20 }, (_, i) => `   Compiling crate-${i} v0.1.0`),
+		"error[E0308]: mismatched types",
+		"  --> src/main.rs:12:5",
+		"   |",
+		"12 |     let x: u32 = \"hi\";",
+		"   = note: expected type `u32`",
+		"Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.2s",
+	].join("\n");
+	const compacted = compactBuildOutput(lines);
+	assert.equal(compacted.includes("Compiled 20 packages"), true);
+	assert.equal(compacted.includes("error[E0308]: mismatched types"), true);
+	assert.equal(compacted.includes("--> src/main.rs:12:5"), true);
+	assert.equal(compacted.includes("= note: expected type `u32`"), true);
+	assert.equal(compacted.includes("Compiling crate-0"), false);
+});
+
+test("token-saver: compactSmartTruncate keeps head 120 + tail 60 for >=250 lines and leaves shorter alone", () => {
+	const shortBlob = Array.from({ length: 100 }, (_, i) => `row ${i}`).join("\n");
+	assert.equal(compactSmartTruncate(shortBlob), shortBlob);
+
+	const longBlob = Array.from({ length: 300 }, (_, i) => `row ${i}`).join("\n");
+	const compacted = compactSmartTruncate(longBlob);
+	assert.equal(compacted.includes("row 0"), true);
+	assert.equal(compacted.includes("row 119"), true);
+	assert.equal(compacted.includes("... +120 lines truncated"), true);
+	assert.equal(compacted.includes("row 240"), true);
+	assert.equal(compacted.includes("row 299"), true);
+	assert.equal(compacted.includes("row 150"), false);
+});
+
+test("token-saver: autoDetectToolFilter selects git-diff, build-output, smart-truncate or null", () => {
+	assert.equal(autoDetectToolFilter("diff --git a/x b/x\n@@ -1 +1 @@\n+hi")?.filterName, "git-diff");
+	assert.equal(autoDetectToolFilter("   Compiling foo v1.0\n   Compiling bar v1.0")?.filterName, "build-output");
+	assert.equal(
+		autoDetectToolFilter(Array.from({ length: 260 }, (_, i) => `line ${i}`).join("\n"))?.filterName,
+		"smart-truncate",
+	);
+	assert.equal(autoDetectToolFilter("just a short question"), null);
+});
+
+test("token-saver: compressToolOutputs only touches non-error tool outputs >=500B and is fail-open", () => {
+	const bigDiff = [
+		"diff --git a/a.js b/a.js",
+		"@@ -1,130 +1,130 @@",
+		...Array.from({ length: 120 }, (_, i) => `+export const v${i} = ${i};`),
+	].join("\n");
+	const original = {
+		model: "big-pickle",
+		messages: [
+			{ role: "system", content: bigDiff },
+			{ role: "user", content: bigDiff },
+			{ role: "assistant", content: bigDiff },
+			{ role: "tool", tool_call_id: "1", content: bigDiff },
+			{ role: "tool", tool_call_id: "2", is_error: true, content: bigDiff },
+			{ role: "tool", tool_call_id: "3", content: "diff --git a/s b/s\n@@ -1 +1 @@\n+tiny" },
+		],
+	};
+	const { body, stats } = compressToolOutputs(original);
+	assert.equal(body.messages[0].content, bigDiff, "system prompt must never be compacted");
+	assert.equal(body.messages[1].content, bigDiff, "user prompt must never be compacted");
+	assert.equal(body.messages[2].content, bigDiff, "assistant message must never be compacted");
+	assert.ok(body.messages[3].content.length < bigDiff.length, "non-error tool output >=500B must be compacted");
+	assert.equal(body.messages[4].content, bigDiff, "error tool output must never be touched");
+	assert.equal(body.messages[5].content, original.messages[5].content, "short output <500B must stay intact");
+	assert.equal(original.messages[3].content, bigDiff, "caller messages object must not be mutated in place");
+	assert.ok(stats.saved > 0);
+	assert.equal(stats.hits.length, 1);
+	assert.equal(stats.hits[0].filter, "git-diff");
+
+	// Fail-open when a custom detector/filter throws
+	const { body: safeBody } = compressToolOutputs(original, {
+		enabled: true,
+		detect: () => () => {
+			throw new Error("filter boom");
+		},
+	});
+	assert.equal(safeBody.messages[3].content, bigDiff, "filter panic must fall back to raw output");
+});
+
+test("forward: compresses outgoing tool outputs unless tokenSaver is disabled and records stats", async () => {
+	resetWarpStateForTests();
+	const bigBuild = [
+		...Array.from({ length: 40 }, (_, i) => `   Compiling pkg-${i} v0.1.0`),
+		"Finished `dev` profile target(s) in 2.0s",
+	].join("\n");
+	const fake = installFakeFetch(() => new Response("data: [DONE]\n\n", {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	}));
+	try {
+		const res1 = fakeRelayRes();
+		await forward(
+			fakeReq({
+				model: "big-pickle",
+				messages: [
+					{ role: "user", content: "check build" },
+					{ role: "tool", tool_call_id: "t1", content: bigBuild },
+				],
+			}),
+			res1,
+			RESEND_PATH,
+			{ ...FORWARD_CONFIG, warpMode: "off" },
+		);
+		assert.equal(res1.status, 200);
+		const sent1 = JSON.parse(fake.calls.filter((c) => c.method === "POST")[0].body);
+		const toolMsg1 = sent1.messages.find((m) => m.role === "tool");
+		assert.equal(toolMsg1.content.includes("Compiled 40 packages"), true);
+		assert.ok(toolMsg1.content.length < bigBuild.length);
+		assert.equal(warpStateForTests().tokenSaver.blocksCompacted, 1);
+		assert.ok(warpStateForTests().tokenSaver.bytesSaved > 0);
+
+		const res2 = fakeRelayRes();
+		await forward(
+			fakeReq({
+				model: "big-pickle",
+				messages: [
+					{ role: "user", content: "check build" },
+					{ role: "tool", tool_call_id: "t1", content: bigBuild },
+				],
+			}),
+			res2,
+			RESEND_PATH,
+			{ ...FORWARD_CONFIG, warpMode: "off", tokenSaver: false },
+		);
+		const sent2 = JSON.parse(fake.calls.filter((c) => c.method === "POST")[1].body);
+		assert.equal(sent2.messages.find((m) => m.role === "tool").content, bigBuild);
+	} finally {
+		fake.restore();
 	}
 });
 
