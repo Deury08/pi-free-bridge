@@ -1924,6 +1924,40 @@ function fakeRelayRes({ socket } = {}) {
 const fakeReq = (payload) => Readable.from([Buffer.from(JSON.stringify(payload))]);
 const FORWARD_CONFIG = { ...WARP_CONFIG, cwd: ".", warpMode: "on", sessionSource: "test" };
 
+// S4: the gate answers a non-streaming request with `FreeUsageLimitError`, which
+// is byte-identical to a spent quota. `forward()` pins `stream: true` on the way
+// out, and this is the only thing standing between a caller's `stream: false`
+// and a 429 the relay would spend a rotation trying to explain. There is no RED
+// phase to show: the behaviour is correct today, so this is a guard, not a fix.
+// It bites the moment someone forwards the caller's `stream` instead of pinning.
+test("forward: the upstream body is always streamed, whatever the caller asks for (S4)", async () => {
+	const refused = () =>
+		new Response(JSON.stringify({ type: "error", error: { type: "FreeUsageLimitError" } }), {
+			status: 429,
+			headers: { "content-type": "application/json" },
+		});
+	const fake = installFakeFetch(refused);
+	try {
+		await forward(
+			fakeReq({ model: "big-pickle", stream: false, messages: [{ role: "user", content: "hi" }] }),
+			fakeRelayRes(),
+			"/v1/chat/completions",
+			{ ...FORWARD_CONFIG, warpMode: "off" },
+		);
+		const posts = fake.calls.filter((call) => call.method === "POST" && call.body);
+		assert.ok(posts.length > 0, "the relay must have reached upstream at all");
+		for (const call of posts) {
+			assert.equal(
+				JSON.parse(call.body).stream,
+				true,
+				"a non-streaming upstream request is refused as FreeUsageLimitError, not as a contract error",
+			);
+		}
+	} finally {
+		fake.restore();
+	}
+});
+
 test("forward: backpressure pauses upstream reads until drain", { timeout: 2_000 }, async () => {
 	const originalFetch = globalThis.fetch;
 	const chunks = [Buffer.from("data: first\n\n"), Buffer.from("data: second\n\n")];

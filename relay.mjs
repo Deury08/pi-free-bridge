@@ -1018,11 +1018,23 @@ export function bumpWarp429Streak(streak, status, egress) {
 
 /** Pure: the cause the relay can actually justify when the gate answers 429.
  *
- *  The vendor returns `FreeUsageLimitError` for three unrelated conditions: an
- *  unknown session id, a contract violation (user-agent or the `<env>` block),
- *  and a real daily quota. `retry-after` is identical for all three — measured
- *  2026-11-12, an id the registry never issued carried the same 00:00-UTC
- *  window as an exhausted quota — so a 429 on its own confirms nothing.
+ *  The vendor returns `FreeUsageLimitError` for four unrelated conditions: an
+ *  unknown session id, a contract violation, a non-streaming request, and a real
+ *  daily quota. `retry-after` is identical for all of them — measured 2026-11-12,
+ *  an id the registry never issued carried the same 00:00-UTC window as an
+ *  exhausted quota — so a 429 on its own confirms nothing.
+ *
+ *  Measured 2026-11-27 against the live gate, so the list of "contract
+ *  violations" cannot grow into folklore:
+ *  - `stream: false` is refused; `stream: true` is accepted. This is the one
+ *    condition the relay could produce on its own, which is why `forward()` pins
+ *    `stream: true` on every outbound body.
+ *  - a tool named `read` must be declared: an empty or absent array is refused,
+ *    and `shell` alone does not stand in for it.
+ *  - the user-agent, the `x-opencode-project` header and the `<env>` contents
+ *    decide nothing. A stock `opencode/1.19.3 ai-sdk/...` agent answered 200, and
+ *    so did the literal official tool contracts — the placeholder `read` this
+ *    relay injects is enough.
  *
  *  Ranked by the evidence the relay holds, never by the vendor's label:
  *  - the local egress is parked after burning its own quota: that IS the answer,
