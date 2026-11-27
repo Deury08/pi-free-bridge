@@ -530,15 +530,48 @@ export function egressOrder(mode, warpPreferred, localParked = false) {
  *  worth gambling a request on. */
 export const PARK_MARGIN_MS = 10_000;
 
+/** The one date shape RFC 9110 names for `retry-after`. Kept narrow on purpose:
+ *  `Date.parse` alone also accepts shapes this relay has no business interpreting. */
+const HTTP_DATE = /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/** Pure: a `retry-after` header value as milliseconds from now, or undefined
+ *  when the value carries no deadline. RFC 9110 allows exactly two shapes and
+ *  both of them reach this relay:
+ *
+ *  - delay-seconds (`"77986"`), always read as seconds and never handed to
+ *    `Date.parse`, which reads `"900"` as 1970 and would park an egress for
+ *    fifty-six years.
+ *  - HTTP-date (`"Wed, 21 Oct 2026 07:28:00 GMT"`), turned into a duration from
+ *    `now` and floored at 0, so a deadline that already passed reads as
+ *    "released now" instead of a negative park.
+ *
+ *  `"0"` is a real answer — the window is over — and must never be dropped as
+ *  falsy. Every other shape parks nothing: guessing the reset is the exact bug
+ *  this replaces (S16). */
+export function parseRetryAfterMs(value, now = Date.now()) {
+	const raw = String(value ?? "").trim();
+	if (!raw) return undefined;
+	if (/^\d+$/.test(raw)) {
+		const seconds = Number.parseInt(raw, 10);
+		return Number.isSafeInteger(seconds) ? seconds * 1000 : undefined;
+	}
+	// One narrow date shape on purpose: the IMF-fixdate RFC 9110 names. Accepting
+	// whatever `Date.parse` tolerates would let `"later"` or `"3600s"` through as
+	// some other day of some other year.
+	if (!HTTP_DATE.test(raw)) return undefined;
+	const deadline = Date.parse(raw);
+	return Number.isFinite(deadline) ? Math.max(0, deadline - now) : undefined;
+}
+
 /** Pure: how long the local egress stays parked, derived from its own 429.
- *  A missing or non-integer `retry-after` parks nothing: guessing the reset is
- *  the exact bug this replaces (S16). */
-export function parkDurationMs(retryAfter) {
-	const raw = String(retryAfter ?? "").trim();
-	if (!/^\d+$/.test(raw)) return undefined;
-	const seconds = Number.parseInt(raw, 10);
-	if (!Number.isSafeInteger(seconds)) return undefined;
-	return seconds * 1000 + PARK_MARGIN_MS;
+ *  A missing or unreadable `retry-after` parks nothing: guessing the reset is
+ *  the exact bug this replaces (S16). Both legal shapes are read by
+ *  `parseRetryAfterMs`, so a date-form header parks for its real window instead
+ *  of silently failing the old integer test. */
+export function parkDurationMs(retryAfter, now = Date.now()) {
+	const duration = parseRetryAfterMs(retryAfter, now);
+	if (duration === undefined) return undefined;
+	return duration + PARK_MARGIN_MS;
 }
 
 /** Pure: the next warp preference after one request.
@@ -1299,12 +1332,23 @@ export function parkQuotaEgress(ledger, { ip, exitId, parkedUntil, reason, now =
 	if (typeof parkedUntil !== "number" || !Number.isFinite(parkedUntil)) return ledger;
 	const egresses = { ...(ledger && typeof ledger.egresses === "object" && ledger.egresses ? ledger.egresses : {}) };
 	const previous = egresses[key];
+	// Only-extend (S2): a park may move a deadline later, never earlier. A short
+	// fallback park landing on top of a long daily-quota park would otherwise tell
+	// the relay the egress comes back in seconds, and it would spend a request
+	// finding out the truth — then park it again. The write is still history, so
+	// `hits` always counts even when the deadline does not move.
+	const previousUntil = Number.isFinite(previous?.parked_until) ? previous.parked_until : undefined;
+	const keep = previousUntil !== undefined && previousUntil > parkedUntil;
 	egresses[key] = {
 		prefix64: quotaPrefix64(key),
-		exit_id: typeof exitId === "string" && exitId.trim() ? exitId.trim() : undefined,
-		parked_until: parkedUntil,
+		exit_id: keep
+			? previous.exit_id
+			: typeof exitId === "string" && exitId.trim()
+				? exitId.trim()
+				: undefined,
+		parked_until: keep ? previousUntil : parkedUntil,
 		observed_at: now,
-		reason: typeof reason === "string" && reason ? reason : undefined,
+		reason: keep ? previous.reason : typeof reason === "string" && reason ? reason : undefined,
 		hits: (Number.isInteger(previous?.hits) && previous.hits > 0 ? previous.hits : 0) + 1,
 	};
 	return { version: QUOTA_LEDGER_VERSION, egresses };
