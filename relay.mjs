@@ -10,6 +10,7 @@
 //
 // The module exports its pure helpers so `test/relay.test.mjs` can run them
 // under plain Node; the server only starts when this file is executed directly.
+import { randomBytes } from "node:crypto";
 import {
 	appendFileSync,
 	existsSync,
@@ -1325,6 +1326,122 @@ export function compressToolOutputs(body, options = true) {
 }
 
 let tokenSaverStats = { blocksCompacted: 0, bytesBefore: 0, bytesAfter: 0, bytesSaved: 0 };
+let lastRequestTrace = undefined;
+
+// S6: per-stage request diagnostics (`received -> body_received -> dispatch -> first_delta -> finished|aborted`).
+// Only server-generated requestId, stripped pathname, monotonic timestamps, HTTP status,
+// and outcome are ever recorded; never bodies, headers, keys, or model names.
+
+export function hasUpstreamDelta(chunkText) {
+	if (typeof chunkText !== "string" || chunkText.length === 0) return false;
+	const lines = chunkText.split(/\r?\n/);
+	let sawSseControl = false;
+	for (const raw of lines) {
+		const line = raw.trim();
+		if (!line) continue;
+		if (line.startsWith(":")) {
+			sawSseControl = true;
+			continue;
+		}
+		if (line === "data" || line.startsWith("data:")) {
+			sawSseControl = true;
+			const payload = (line === "data" ? "" : line.slice(5)).trim();
+			if (payload && payload !== "[DONE]") return true;
+			continue;
+		}
+		if (line.startsWith("event:") || line.startsWith("id:") || line.startsWith("retry:")) {
+			sawSseControl = true;
+			continue;
+		}
+		return true;
+	}
+	return !sawSseControl && chunkText.trim().length > 0;
+}
+
+function normalizeTracePath(pathname) {
+	const raw = String(pathname ?? "/");
+	const q = raw.indexOf("?");
+	const clean = q >= 0 ? raw.slice(0, q) : raw;
+	return clean.replace(/\/+$/, "") || "/";
+}
+
+export function createRequestTrace(req, res, pathname, options = {}) {
+	const nowFn = typeof options.now === "function" ? options.now : Date.now;
+	const monoFn = typeof options.monotonicNow === "function" ? options.monotonicNow : () => performance.now();
+	const onTrace = typeof options.onTrace === "function"
+		? options.onTrace
+		: (ev) => logWarpEvent("request_stage", ev);
+	const onEnd = typeof options.onEnd === "function" ? options.onEnd : undefined;
+
+	const requestId = randomBytes(16).toString("hex");
+	const path = normalizeTracePath(pathname);
+	const startedMono = monoFn();
+	let lastElapsed = 0;
+	let lastAt = nowFn();
+	let sawFirstDelta = false;
+	let ended = false;
+	const stages = {};
+	let finalRecord = null;
+
+	const emit = (stage, extra = {}) => {
+		if (ended) return;
+		const rawElapsed = Math.round((monoFn() - startedMono) * 1000) / 1000;
+		const elapsedMs = Math.max(lastElapsed, Number.isFinite(rawElapsed) ? rawElapsed : lastElapsed);
+		lastElapsed = elapsedMs;
+		const wall = nowFn();
+		const at = Math.max(lastAt, Number.isFinite(wall) ? wall : lastAt);
+		lastAt = at;
+		stages[stage] = { at, elapsedMs };
+		try {
+			onTrace({ requestId, path, stage, at, elapsedMs, ...extra });
+		} catch {
+			/* diagnostics must never interrupt or fail a request */
+		}
+	};
+
+	const end = (stage) => {
+		if (ended) return;
+		const status = res?.headersSent ? (res.statusCode ?? res.status ?? null) : null;
+		const outcome = stage === "aborted" ? "aborted" : (status !== null && status >= 400 ? "failed" : "completed");
+		emit(stage, { status, outcome });
+		ended = true;
+		finalRecord = { requestId, path, stages: { ...stages }, status, outcome };
+		req?.off?.("aborted", onAbort);
+		res?.off?.("finish", onFinish);
+		res?.off?.("close", onClose);
+		try {
+			onEnd?.(finalRecord);
+		} catch {
+			/* ignore */
+		}
+	};
+
+	const onAbort = () => end("aborted");
+	const onFinish = () => end("finished");
+	const onClose = () => end(res?.writableFinished || res?.writableEnded ? "finished" : "aborted");
+
+	req?.once?.("aborted", onAbort);
+	res?.once?.("finish", onFinish);
+	res?.once?.("close", onClose);
+
+	emit("received");
+
+	return {
+		requestId,
+		step(stage, extra) {
+			emit(stage, extra);
+		},
+		markFirstDelta() {
+			if (sawFirstDelta || ended) return;
+			sawFirstDelta = true;
+			emit("first_delta");
+		},
+		end,
+		getRecord() {
+			return finalRecord ?? { requestId, path, stages: { ...stages }, status: null, outcome: null };
+		},
+	};
+}
 
 // S1: typed failure classifier (ported from dsh-our-free-model src/route/classify.js).
 // L3 exception: rate_limit (daily quota) keeps the full retry-after without the
@@ -2708,6 +2825,7 @@ export function resetWarpStateForTests() {
 	preferredExitId = undefined;
 	lastFailure = undefined;
 	tokenSaverStats = { blocksCompacted: 0, bytesBefore: 0, bytesAfter: 0, bytesSaved: 0 };
+	lastRequestTrace = undefined;
 }
 
 /** Test-only: the state `/health` reports, without standing a server up. */
@@ -2730,6 +2848,7 @@ export function warpStateForTests() {
 		preferredExitId,
 		lastFailure,
 		tokenSaver: { ...tokenSaverStats },
+		lastRequestTrace,
 	};
 }
 
@@ -3684,7 +3803,7 @@ function waitForResponseDrain(res, client) {
 }
 
 // Only explicit non-streaming clients use this bounded, request-local SSE fold.
-async function aggregateCompletion(response, client) {
+async function aggregateCompletion(response, client, onFirstDelta) {
 	const completion = { object: "chat.completion" };
 	const choices = new Map();
 	const decoder = new TextDecoder();
@@ -3705,6 +3824,7 @@ async function aggregateCompletion(response, client) {
 		} catch {
 			throw new Error("invalid upstream SSE JSON");
 		}
+		onFirstDelta?.();
 		for (const key of ["id", "model", "created", "usage", "system_fingerprint", "service_tier"]) {
 			if (chunk[key] !== undefined) completion[key] = chunk[key];
 		}
@@ -3790,11 +3910,17 @@ async function aggregateCompletion(response, client) {
 
 // Exported for the request-path tests: the counter and the drain order are only
 // observable from a real `forward()` call.
-export async function forward(req, res, pathname, config) {
+export async function forward(req, res, pathname, config, existingTrace) {
+	const trace = existingTrace ?? createRequestTrace(req, res, pathname, {
+		onEnd: (record) => {
+			lastRequestTrace = record;
+		},
+	});
 	const client = trackClient(res);
 	let countedDelivering = false;
 	try {
 		const raw = await readBody(req);
+		trace.step("body_received");
 		const incoming = JSON.parse(raw);
 		const source = incoming && typeof incoming === "object" ? incoming : {};
 
@@ -3836,6 +3962,7 @@ export async function forward(req, res, pathname, config) {
 		// The exit the delivered 429 was served by, so round 1 never asks the same
 		// exit twice for one request (S20, S24).
 		let ladderExitId;
+		trace.step("dispatch");
 		for (const egress of order) {
 			egressUsed = egress;
 			let candidate;
@@ -4057,8 +4184,11 @@ export async function forward(req, res, pathname, config) {
 
 		if (source.stream === false && response.status >= 200 && response.status < 300 &&
 			headers["content-type"]?.split(";")[0].trim().toLowerCase() === "text/event-stream") {
-			const completion = await aggregateCompletion(response, client);
-			if (client.gone) return;
+			const completion = await aggregateCompletion(response, client, () => trace.markFirstDelta());
+			if (client.gone) {
+				trace.end("aborted");
+				return;
+			}
 			sendJson(res, response.status, completion, { ...headers, "x-egress-used": egressUsed });
 			return;
 		}
@@ -4071,18 +4201,30 @@ export async function forward(req, res, pathname, config) {
 		}
 
 		const reader = response.body.getReader();
+		let checkedFirstDelta = false;
+		const deltaDecoder = new TextDecoder();
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			if (client.gone) {
 				// Nobody is listening: stop draining the upstream into a dead socket.
 				await reader.cancel();
+				trace.end("aborted");
 				return;
 			}
-			if (!res.write(Buffer.from(value))) {
+			const buf = Buffer.from(value);
+			if (!checkedFirstDelta) {
+				const text = deltaDecoder.decode(buf, { stream: true });
+				if (hasUpstreamDelta(text)) {
+					checkedFirstDelta = true;
+					trace.markFirstDelta();
+				}
+			}
+			if (!res.write(buf)) {
 				const drained = await waitForResponseDrain(res, client);
 				if (!drained || client.gone) {
 					await reader.cancel();
+					trace.end("aborted");
 					return;
 				}
 			}
@@ -4280,6 +4422,7 @@ export async function handle(req, res, config) {
 				enabled: config.tokenSaver !== false && process.env.RELAY_TOKEN_SAVER !== "0",
 				...tokenSaverStats,
 			},
+			lastRequestTrace: lastRequestTrace ?? null,
 			lastEgress: lastEgress,
 			pid: process.pid,
 		});
@@ -4287,7 +4430,12 @@ export async function handle(req, res, config) {
 	}
 
 	if (req.method === "POST" && pathname.startsWith("/v1/")) {
-		await forward(req, res, pathname, config);
+		const trace = createRequestTrace(req, res, pathname, {
+			onEnd: (record) => {
+				lastRequestTrace = record;
+			},
+		});
+		await forward(req, res, pathname, config, trace);
 		return;
 	}
 

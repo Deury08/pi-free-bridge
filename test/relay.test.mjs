@@ -8711,7 +8711,9 @@ import {
 	compactGitDiff,
 	compactSmartTruncate,
 	compressToolOutputs,
+	createRequestTrace,
 	extractFailureFields,
+	hasUpstreamDelta,
 } from "../relay.mjs";
 
 // S1: typed failure classifier (ported from dsh-our-free-model src/route/classify.js,
@@ -9023,6 +9025,191 @@ test("forward: compresses outgoing tool outputs unless tokenSaver is disabled an
 		assert.equal(sent2.messages.find((m) => m.role === "tool").content, bigBuild);
 	} finally {
 		fake.restore();
+	}
+});
+
+// S6: per-stage request diagnostics (received -> body_received -> dispatch -> first_delta -> finished|aborted).
+
+test("stage-diagnostics: hasUpstreamDelta ignores SSE heartbeats and [DONE] but detects content deltas", () => {
+	assert.equal(hasUpstreamDelta(": keep-alive\n\n"), false);
+	assert.equal(hasUpstreamDelta("   \n\n"), false);
+	assert.equal(hasUpstreamDelta("data: [DONE]\n\n"), false);
+	assert.equal(hasUpstreamDelta('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'), true);
+	assert.equal(hasUpstreamDelta('{"id":"1"}'), true);
+});
+
+test("stage-diagnostics: createRequestTrace emits monotonic timestamps, finishes once, cleans listeners and ignores throwing logger", () => {
+	const req = new EventEmitter();
+	const res = fakeRelayRes();
+	const events = [];
+	let endedRecord = null;
+	const monoSteps = [100, 105.5, 104, 120.25, 150]; // 104 simulates non-monotonic jump; trace must clamp monotonic
+	const wallSteps = [1000, 1005, 999, 1020, 1050];
+	let mi = 0;
+	let wi = 0;
+
+	const trace = createRequestTrace(req, res, "/v1/chat/completions?secret=1", {
+		monotonicNow: () => monoSteps[Math.min(mi++, monoSteps.length - 1)],
+		now: () => wallSteps[Math.min(wi++, wallSteps.length - 1)],
+		onTrace: (ev) => {
+			events.push(ev);
+			if (ev.stage === "dispatch") throw new Error("logger disk full");
+		},
+		onEnd: (record) => {
+			endedRecord = record;
+		},
+	});
+
+	assert.match(trace.requestId, /^[a-f0-9]{32}$/);
+	trace.step("body_received");
+	trace.step("dispatch");
+	trace.markFirstDelta();
+	trace.markFirstDelta(); // second delta must not emit duplicate first_delta
+	res.writeHead(200, { "content-type": "text/event-stream" });
+	res.end("ok");
+	req.emit("aborted"); // post-finish abort must not emit a second terminal event
+
+	assert.deepEqual(
+		events.map((e) => e.stage),
+		["received", "body_received", "dispatch", "first_delta", "finished"],
+	);
+	for (let i = 1; i < events.length; i += 1) {
+		assert.ok(events[i].elapsedMs >= events[i - 1].elapsedMs, "elapsedMs must be monotonic");
+		assert.ok(events[i].at >= events[i - 1].at, "at must be monotonic");
+	}
+	assert.equal(events[0].path, "/v1/chat/completions", "query string must be stripped");
+	assert.equal(events.at(-1).status, 200);
+	assert.equal(events.at(-1).outcome, "completed");
+	assert.equal(req.listenerCount("aborted"), 0);
+	assert.equal(res.listenerCount("finish"), 0);
+	assert.equal(res.listenerCount("close"), 0);
+	assert.ok(endedRecord);
+	assert.deepEqual(Object.keys(endedRecord.stages), ["received", "body_received", "dispatch", "first_delta", "finished"]);
+});
+
+test("forward: records complete stage trace on disk and in warpStateForTests without leaking bodies, headers or keys", async () => {
+	resetWarpStateForTests();
+	const file = join(logDir(), "relay-stages.jsonl");
+	setLogFileForTests(file);
+	const secretPrompt = "TOP_SECRET_USER_PROMPT_BODY";
+	const secretAuth = "Bearer sk-super-secret-token";
+
+	const sseBody = new ReadableStream({
+		start(controller) {
+			const enc = new TextEncoder();
+			controller.enqueue(enc.encode(": keep-alive\n\n"));
+			controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"hola"}}]}\n\n'));
+			controller.enqueue(enc.encode("data: [DONE]\n\n"));
+			controller.close();
+		},
+	});
+	const fake = installFakeFetch(() => new Response(sseBody, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	}));
+	try {
+		const req = Readable.from([Buffer.from(JSON.stringify({
+			model: "big-pickle",
+			messages: [{ role: "user", content: secretPrompt }],
+		}))]);
+		req.headers = { authorization: secretAuth, "x-api-key": "secret-key" };
+		const res = fakeRelayRes();
+		await forward(req, res, RESEND_PATH, { ...FORWARD_CONFIG, warpMode: "off" });
+		assert.equal(res.status, 200);
+
+		const stageEvents = readEvents(file).filter((e) => e.ev === "request_stage");
+		assert.deepEqual(
+			stageEvents.map((e) => e.stage),
+			["received", "body_received", "dispatch", "first_delta", "finished"],
+		);
+		const ids = new Set(stageEvents.map((e) => e.requestId));
+		assert.equal(ids.size, 1);
+
+		const serialized = JSON.stringify(stageEvents);
+		assert.equal(serialized.includes(secretPrompt), false, "request body must never reach stage logs");
+		assert.equal(serialized.includes(secretAuth), false, "headers/keys must never reach stage logs");
+		assert.equal(serialized.includes("secret-key"), false, "x-api-key must never reach stage logs");
+
+		const lastTrace = warpStateForTests().lastRequestTrace;
+		assert.ok(lastTrace);
+		assert.equal(lastTrace.outcome, "completed");
+		assert.equal(lastTrace.status, 200);
+		assert.deepEqual(
+			Object.keys(lastTrace.stages),
+			["received", "body_received", "dispatch", "first_delta", "finished"],
+		);
+	} finally {
+		setLogFileForTests("");
+		fake.restore();
+	}
+});
+
+test("forward: records aborted upload before body_received and failed 429 without first_delta", async () => {
+	resetWarpStateForTests();
+	const file = join(logDir(), "relay-stages-errors.jsonl");
+	setLogFileForTests(file);
+
+	// 1) Aborted request body before body_received
+	const brokenReq = new Readable({
+		read() {
+			this.destroy(new Error("client reset"));
+		},
+	});
+	const res1 = fakeRelayRes();
+	try {
+		await forward(brokenReq, res1, RESEND_PATH, { ...FORWARD_CONFIG, warpMode: "off" });
+		const events1 = readEvents(file).filter((e) => e.ev === "request_stage");
+		assert.deepEqual(events1.map((e) => e.stage), ["received", "finished"]);
+		assert.equal(events1.at(-1).status, 502);
+		assert.equal(events1.at(-1).outcome, "failed");
+
+		// 2) Client disconnect mid-stream triggers aborted
+		const abortFake = installFakeFetch(() => new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'));
+				},
+			}),
+			{ status: 200, headers: { "content-type": "text/event-stream" } },
+		));
+		try {
+			const res2 = fakeRelayRes({ socket: { destroyed: true } });
+			await forward(
+				fakeReq({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }),
+				res2,
+				RESEND_PATH,
+				{ ...FORWARD_CONFIG, warpMode: "off" },
+			);
+			const lastTrace = warpStateForTests().lastRequestTrace;
+			assert.equal(lastTrace.outcome, "aborted");
+			assert.equal(Object.hasOwn(lastTrace.stages, "aborted"), true);
+		} finally {
+			abortFake.restore();
+		}
+
+		// 3) Upstream 429 skips first_delta and ends with outcome=failed
+		const errFake = installFakeFetch(() => new Response(JSON.stringify({ error: { message: "limit" } }), {
+			status: 429,
+			headers: { "content-type": "application/json" },
+		}));
+		try {
+			const res3 = fakeRelayRes();
+			await forward(
+				fakeReq({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }),
+				res3,
+				RESEND_PATH,
+				{ ...FORWARD_CONFIG, warpMode: "off" },
+			);
+			const lastTrace = warpStateForTests().lastRequestTrace;
+			assert.equal(lastTrace.outcome, "failed");
+			assert.equal(lastTrace.status, 429);
+			assert.equal(Object.hasOwn(lastTrace.stages, "first_delta"), false);
+			assert.equal(Object.hasOwn(lastTrace.stages, "finished"), true);
+		} finally {
+			errFake.restore();
+		}
+	} finally {
+		setLogFileForTests("");
 	}
 });
 
