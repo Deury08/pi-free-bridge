@@ -1904,6 +1904,37 @@ export const LADDER_RESERVE_MS = positiveIntFromEnv(process.env.RELAY_LADDER_RES
  *  is replaced by the request's own measurements after the first round. */
 export const LADDER_ROUND_MS = positiveIntFromEnv(process.env.RELAY_LADDER_ROUND_MS, 6_000);
 
+// S3 (ladder-refill): the scarce resource under a 429 storm is the enrollment,
+// not the second. A rotation re-enrols the whole pool, so a time budget alone
+// would let a request with cheap rounds re-enrol the pool over and over. This
+// window caps re-enrollments per sliding window and is shared by the request's
+// own rounds and by the background refill: one number, one place.
+export const REFILL_MAX = positiveIntFromEnv(process.env.RELAY_REFILL_MAX, 3);
+export const REFILL_WINDOW_MS = positiveIntFromEnv(process.env.RELAY_REFILL_WINDOW_MS, 600_000);
+let enrollmentStamps = [];
+
+function pruneEnrollmentStamps(now) {
+	const kept = enrollmentStamps.filter((stamp) => now - stamp < REFILL_WINDOW_MS);
+	if (kept.length !== enrollmentStamps.length) enrollmentStamps = kept;
+	return enrollmentStamps;
+}
+
+/** How many re-enrollments happened inside the current window. */
+export function enrollmentsInWindow(now = Date.now()) {
+	return pruneEnrollmentStamps(now).length;
+}
+
+/** Whether another rotation may re-enroll the pool right now. Asking never enrols. */
+export function enrollmentWindowOpen(now = Date.now()) {
+	return enrollmentsInWindow(now) < REFILL_MAX;
+}
+
+/** Count one confirmed re-enrollment and return the window's new total. */
+export function recordEnrollment(now = Date.now()) {
+	pruneEnrollmentStamps(now).push(now);
+	return enrollmentStamps.length;
+}
+
 /** Pure: may another round start? `usable` is what the budget still allows once
  *  the reserve is set aside. A round that would end past the deadline is not
  *  started, because the answer we already have must still be delivered. */
@@ -2938,6 +2969,7 @@ export function resetWarpStateForTests() {
 	preferredExitId = undefined;
 	lastFailure = undefined;
 	ladderBudgetForTests = undefined;
+	enrollmentStamps = [];
 	tokenSaverStats = { blocksCompacted: 0, bytesBefore: 0, bytesAfter: 0, bytesSaved: 0 };
 	lastRequestTrace = undefined;
 }
@@ -3245,7 +3277,25 @@ async function runWarpRotation(config, client, snapshot, clock) {
 /** S3: the rotation itself. Every caller that only asks "did it rotate?" keeps
  *  that answer; the manual sweep asks the richer `runWarpRotation` directly. */
 export async function rotateWarpExit(config, client, clock) {
-	return (await runWarpRotation(config, client, undefined, clock)).rotated;
+	// A rotation with a clock is a ladder round: it may only run while the window
+	// still allows a re-enrollment. Without a clock it is the caller's explicit
+	// rotation (a manual /recycle), which is never refused - it is only counted,
+	// so the window sees every re-enrollment the pool actually paid for.
+	if (clock && !enrollmentWindowOpen()) {
+		logWarpEvent("refill_skipped", {
+			reason: "enrollment_window",
+			max: REFILL_MAX,
+			windowMs: REFILL_WINDOW_MS,
+			used: enrollmentsInWindow(),
+		});
+		return false;
+	}
+	const result = await runWarpRotation(config, client, undefined, clock);
+	if (result.rotated) {
+		const used = recordEnrollment();
+		logWarpEvent("refill_ok", { used, max: REFILL_MAX, windowMs: REFILL_WINDOW_MS });
+	}
+	return result.rotated;
 }
 
 /** The `/health` read behind both the rotation poll and the manual sweep. It

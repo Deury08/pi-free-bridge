@@ -9745,3 +9745,43 @@ test("forward: with no live park in the ledger a 429 ends the ladder exactly as 
 		resetWarpStateForTests();
 	}
 });
+
+// T4 / S3 (ladder-refill): the scarce resource under a 429 storm is the
+// enrollment, not the second. The time budget bounds how long a request waits;
+// this window bounds how many times the pool is re-enrolled, shared by the
+// request's own rounds and by the background refill, so one number covers both.
+
+test("enrollment window: the documented cap is three re-enrollments per ten minutes (S3)", () => {
+	assert.equal(relayApi.REFILL_MAX, 3);
+	assert.equal(relayApi.REFILL_WINDOW_MS, 600_000);
+});
+
+test("enrollment window: the fourth enrollment in a window is refused and the window frees again at the edge (S3)", () => {
+	relayApi.resetWarpStateForTests();
+	assert.equal(relayApi.enrollmentWindowOpen(1_000), true);
+	relayApi.recordEnrollment(1_000);
+	relayApi.recordEnrollment(2_000);
+	assert.equal(relayApi.enrollmentWindowOpen(3_000), true);
+	relayApi.recordEnrollment(3_000);
+	assert.equal(relayApi.enrollmentsInWindow(3_000), 3);
+	// The cap is spent: a round that would enrol a fourth time cannot start.
+	assert.equal(relayApi.enrollmentWindowOpen(3_000), false);
+	// Ten minutes after the first enrollment, only that stamp has aged out, so
+	// exactly one more round fits - the window slides, it does not reset.
+	const edge = 1_000 + relayApi.REFILL_WINDOW_MS;
+	assert.equal(relayApi.enrollmentsInWindow(edge), 2);
+	assert.equal(relayApi.enrollmentWindowOpen(edge), true);
+});
+
+test("enrollment window: a refused round does not enrol, and the reset clears the window (S3)", () => {
+	relayApi.resetWarpStateForTests();
+	relayApi.recordEnrollment(0);
+	relayApi.recordEnrollment(0);
+	relayApi.recordEnrollment(0);
+	assert.equal(relayApi.enrollmentWindowOpen(10), false);
+	// Asking is not enrolling: the count stays at exactly the cap.
+	assert.equal(relayApi.enrollmentsInWindow(10), 3);
+	relayApi.resetWarpStateForTests();
+	assert.equal(relayApi.enrollmentsInWindow(10), 0);
+	assert.equal(relayApi.enrollmentWindowOpen(10), true);
+});
