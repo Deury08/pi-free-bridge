@@ -1994,6 +1994,13 @@ let drainValveMs = DRAIN_VALVE_MS;
 // is built from. `undefined` means the configured defaults; production never
 // writes it, and `resetWarpStateForTests` clears it.
 let ladderBudgetForTests;
+// The last time the ladder actually ran, so /health can answer "what did it do?"
+// without a log file. Written at the end of every ladder run, in and out of
+// the refill loop.
+let lastLadder;
+export function lastLadderForTests() {
+	return lastLadder;
+}
 
 // ---------------------------------------------------------------------------
 // Quota ledger, keyed by egress IP (S5, S10, S12)
@@ -2970,6 +2977,7 @@ export function resetWarpStateForTests() {
 	lastFailure = undefined;
 	ladderBudgetForTests = undefined;
 	enrollmentStamps = [];
+	lastLadder = undefined;
 	tokenSaverStats = { blocksCompacted: 0, bytesBefore: 0, bytesAfter: 0, bytesSaved: 0 };
 	lastRequestTrace = undefined;
 }
@@ -3648,13 +3656,34 @@ async function publishedPool(config, now = Date.now()) {
 async function refillRotationRounds(config, pathname, body, original, client, clock) {
 	let refusal = original;
 	let round = 0;
+	let stop = "completed";
+	// One record per ladder run, written on every exit path, so /health can show
+	// what the last storm actually did: how many rounds it afforded, what each one
+	// cost on this machine, and why it stopped.
+	const finish = (outcome) => {
+		lastLadder = {
+			at: Date.now(),
+			rounds: round,
+			stop,
+			outcome,
+			elapsedMs: Math.round(clock.elapsedMs()),
+			budgetMs: clock.budgetMs,
+			estimateMs: clock.estimateMs,
+			enrollmentsUsed: enrollmentsInWindow(),
+		};
+		return outcome;
+	};
 	for (;;) {
 		// A client that left is nobody to answer, and its dead connection is not a
 		// reason to spend another round.
-		if (client && client.gone) break;
+		if (client && client.gone) {
+			stop = "client_gone";
+			break;
+		}
 		if (!clock.mayStartRound()) {
 			// S6: the refusal to start a round names what was left and what it would
 			// have cost, so a human can tune the budget from evidence.
+			stop = "deadline";
 			logWarpEvent("ladder_deadline_hit", {
 				stage: "ladder",
 				remainingMs: Math.round(clock.remainingMs()),
@@ -3670,7 +3699,10 @@ async function refillRotationRounds(config, pathname, body, original, client, cl
 		// The measurement replaces the guess: from here on the ladder knows what a
 		// round costs on this machine, and that is what the next refusal reads.
 		clock.observe(elapsedMs);
-		if (client && client.gone) break;
+		if (client && client.gone) {
+			stop = "client_gone";
+			break;
+		}
 
 		const pool = await publishedPool(config);
 		const clean = (pool ?? []).filter((exit) => !isEgressParked(quotaLedger, exit.ip, Date.now()));
@@ -3688,14 +3720,17 @@ async function refillRotationRounds(config, pathname, body, original, client, cl
 			// S4: the attempt carries the clean exit's credential, because only a named
 			// credential proves which address served the request and could park it.
 			const attempt = await freeRoundAttempt(config, pathname, body, chosen);
-			if (attempt && attempt.delivered) return { egress: "warp", response: attempt.delivered };
+			if (attempt && attempt.delivered) return finish({ egress: "warp", response: attempt.delivered });
 			if (attempt && attempt.refused) refusal = attempt.refused;
 		}
 		// A rotation that did not confirm is never posted a second time: today's
 		// ladder does not, and the deadline is for rounds that can still pay off.
-		if (!rotated) break;
+		if (!rotated) {
+			stop = enrollmentWindowOpen() ? "rotation_not_confirmed" : "enrollment_window";
+			break;
+		}
 	}
-	return { egress: "warp", response: rebuildOriginal(refusal).response };
+	return finish({ egress: "warp", response: rebuildOriginal(refusal).response });
 }
 
 export async function resendAfterRotation(config, pathname, body, original, client, ladder = {}) {
@@ -4724,6 +4759,16 @@ export async function handle(req, res, config) {
 			},
 			lastRequestTrace: lastRequestTrace ?? null,
 			lastEgress: lastEgress,
+			// S3/S6 (ladder-refill): the two things a human needs to understand a
+			// storm after it passed - how much enrollment budget is left in the
+			// window, and what the ladder did on its last run.
+			refill: {
+				used: enrollmentsInWindow(),
+				max: REFILL_MAX,
+				windowMs: REFILL_WINDOW_MS,
+				open: enrollmentWindowOpen(),
+			},
+			lastLadder: lastLadder ?? null,
 			pid: process.pid,
 		});
 		return;
