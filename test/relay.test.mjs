@@ -8700,6 +8700,229 @@ async function withRelayLoopback(run) {
 	}
 }
 
+import {
+	FAILURE_KIND,
+	FAILURE_SCOPE,
+	MAX_PROVIDER_COOLDOWN_MS,
+	backoffFor,
+	classifyFailure,
+	extractFailureFields,
+} from "../relay.mjs";
+
+// S1: typed failure classifier (ported from dsh-our-free-model src/route/classify.js,
+// minus the quota cooldown cap per L3).
+
+test("classifyFailure: exposes frozen 12 kinds and 4 scopes", () => {
+	assert.equal(Object.isFrozen(FAILURE_KIND), true);
+	assert.equal(Object.isFrozen(FAILURE_SCOPE), true);
+	assert.deepEqual(Object.values(FAILURE_KIND).sort(), [
+		"aborted",
+		"auth",
+		"billing",
+		"context_window",
+		"invalid_request",
+		"overloaded",
+		"permission",
+		"rate_limit",
+		"timeout",
+		"unavailable",
+		"unknown",
+		"upstream",
+	]);
+	assert.deepEqual(Object.values(FAILURE_SCOPE).sort(), ["account", "provider", "request", "transient"]);
+});
+
+test("classifyFailure: backoffFor doubles exponentially and caps at 300s", () => {
+	assert.equal(backoffFor(0), 2000);
+	assert.equal(backoffFor(1), 2000);
+	assert.equal(backoffFor(2), 4000);
+	assert.equal(backoffFor(3), 8000);
+	assert.equal(backoffFor(15), 300_000);
+});
+
+test("classifyFailure: precedence chain context_window > text > code > status > marker > statusLayer", () => {
+	// context_window beats rate_limit / 429
+	assert.deepEqual(
+		classifyFailure({ status: 429, code: "context_length_exceeded", message: "rate limit" }),
+		{ kind: "context_window", scope: "request", retryable: false, cooldownMs: 0, cooldownLevel: 0, rule: "context-window", status: 429 },
+	);
+	// text beats code and status; rate group precedes capacity group
+	const rateAndCap = classifyFailure({ status: 503, message: "capacity and rate limit" });
+	assert.equal(rateAndCap.kind, "rate_limit");
+	assert.equal(rateAndCap.scope, "account");
+	assert.equal(rateAndCap.retryable, true);
+	// code beats status when no text rule matches
+	const streamCut = classifyFailure({ status: 200, code: "stream_cut" });
+	assert.equal(streamCut.kind, "upstream");
+	assert.equal(streamCut.scope, "transient");
+	assert.equal(streamCut.retryable, true);
+	assert.equal(streamCut.rule, "code:stream_cut");
+	// status rules for 401/402/403/404/429
+	assert.equal(classifyFailure({ status: 401 }).kind, "auth");
+	assert.equal(classifyFailure({ status: 402 }).kind, "billing");
+	assert.equal(classifyFailure({ status: 403 }).kind, "permission");
+	assert.equal(classifyFailure({ status: 404 }).kind, "unavailable");
+	assert.equal(classifyFailure({ status: 404 }).retryable, false);
+	// marker rules (e.g. model_not_found in JSON)
+	const missing = classifyFailure({ status: 400, body: '{"error":{"code":"model_not_found"}}' });
+	assert.equal(missing.kind, "unavailable");
+	// status layer fallback (502/503/504/529 -> overloaded transient; 408 -> timeout; 400 -> invalid_request)
+	assert.equal(classifyFailure({ status: 503 }).kind, "overloaded");
+	assert.equal(classifyFailure({ status: 503 }).scope, "transient");
+	assert.equal(classifyFailure({ status: 408 }).kind, "timeout");
+	assert.equal(classifyFailure({ status: 400 }).kind, "invalid_request");
+	assert.equal(classifyFailure({ status: 400 }).retryable, false);
+});
+
+test("classifyFailure: L3 — rate_limit honors full retryAfterMs uncapped, provider overloaded caps at 30m", () => {
+	const dailyQuota = classifyFailure({ status: 429, retryAfterMs: 77_986_000 });
+	assert.equal(dailyQuota.kind, "rate_limit");
+	assert.equal(dailyQuota.cooldownMs, 77_986_000, "daily quota cooldown must not be capped at 30 minutes (L3)");
+	assert.equal(dailyQuota.rule, "status:429+provider-reset");
+
+	const overloaded = classifyFailure({ status: 503, message: "overloaded", retryAfterMs: 77_986_000 });
+	assert.equal(overloaded.kind, "overloaded");
+	assert.equal(overloaded.cooldownMs, MAX_PROVIDER_COOLDOWN_MS, "provider capacity stays capped at 30 minutes");
+});
+
+test("extractFailureFields: unwraps JSON and SSE error envelopes", () => {
+	assert.deepEqual(extractFailureFields('data: {"error":{"type":"FreeUsageLimitError","message":"limit reached"}}\n\n'), {
+		code: "FreeUsageLimitError",
+		message: "limit reached",
+	});
+	assert.deepEqual(extractFailureFields('{"error":{"code":"model_not_found","message":"gone"}}'), {
+		code: "model_not_found",
+		message: "gone",
+	});
+	assert.deepEqual(extractFailureFields("plain upstream text"), {});
+});
+
+test("forward: classifies non-429 upstream errors (401/402/404) without parking local egress", async () => {
+	resetWarpStateForTests();
+	for (const [status, expectedKind, body] of [
+		[401, "auth", '{"error":{"message":"invalid api key"}}'],
+		[402, "billing", '{"error":{"message":"payment required"}}'],
+		[404, "unavailable", '{"error":{"code":"model_not_found","message":"unknown model"}}'],
+	]) {
+		const fake = installFakeFetch(() => new Response(body, { status, headers: { "content-type": "application/json" } }));
+		try {
+			const res = fakeRelayRes();
+			await forward(
+				fakeReq({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }),
+				res,
+				RESEND_PATH,
+				{ ...FORWARD_CONFIG, warpMode: "off" },
+			);
+			assert.equal(res.status, status);
+			const state = warpStateForTests();
+			assert.equal(state.lastFailure?.kind, expectedKind);
+			assert.equal(state.lastFailure?.status, status);
+			assert.equal(state.localParkedUntil, 0, "non-429 errors must not park the local egress");
+		} finally {
+			fake.restore();
+		}
+	}
+});
+
+test("forward: warpMode on retries timeout errors onto local but stops on aborted", async () => {
+	resetWarpStateForTests();
+	// 1. timeout on warp falls back to local and delivers 200
+	{
+		const fake = installFakeFetch((call) => {
+			if (call.proxy) throw Object.assign(new Error("request timed out"), { name: "TimeoutError" });
+			return new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+		});
+		try {
+			const res = fakeRelayRes();
+			await forward(
+				fakeReq({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }),
+				res,
+				RESEND_PATH,
+				{ ...FORWARD_CONFIG, warpMode: "on" },
+			);
+			assert.equal(res.status, 200);
+			assert.equal(fake.calls.filter((c) => c.method === "POST").length, 2);
+		} finally {
+			fake.restore();
+		}
+	}
+	// 2. aborted error does not fall back to local
+	{
+		const fake = installFakeFetch((call) => {
+			if (call.method === "POST") throw Object.assign(new Error("request cancelled"), { code: "aborted" });
+			return healthJson({ status: "ok" });
+		});
+		try {
+			const res = fakeRelayRes();
+			await forward(
+				fakeReq({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }),
+				res,
+				RESEND_PATH,
+				{ ...FORWARD_CONFIG, warpMode: "on" },
+			);
+			assert.equal(res.status, 502);
+			assert.equal(fake.calls.filter((c) => c.method === "POST").length, 1, "aborted is non-retryable so local must not be tried");
+			assert.equal(warpStateForTests().lastFailure?.kind, "aborted");
+		} finally {
+			fake.restore();
+		}
+	}
+});
+
+test("forward: classifies stream_cut and empty_response in non-streaming aggregation", async () => {
+	resetWarpStateForTests();
+	const streamFrom = (chunks) =>
+		new ReadableStream({
+			start(controller) {
+				for (const c of chunks) controller.enqueue(Buffer.from(c));
+				controller.close();
+			},
+		});
+	// 1. bytes > 0 without [DONE] -> stream_cut
+	{
+		const fake = installFakeFetch(
+			() => new Response(streamFrom(['data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n']), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+		);
+		try {
+			const res = fakeRelayRes();
+			await forward(
+				fakeReq({ model: "big-pickle", stream: false, messages: [{ role: "user", content: "hi" }] }),
+				res,
+				RESEND_PATH,
+				{ ...FORWARD_CONFIG, warpMode: "off" },
+			);
+			assert.equal(res.status, 502);
+			assert.equal(warpStateForTests().lastFailure?.kind, "upstream");
+			assert.equal(warpStateForTests().lastFailure?.rule, "code:stream_cut");
+		} finally {
+			fake.restore();
+		}
+	}
+	// 2. empty body (no bytes) -> empty_response
+	{
+		const fake = installFakeFetch(
+			() => new Response(streamFrom([]), { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+		try {
+			const res = fakeRelayRes();
+			await forward(
+				fakeReq({ model: "big-pickle", stream: false, messages: [{ role: "user", content: "hi" }] }),
+				res,
+				RESEND_PATH,
+				{ ...FORWARD_CONFIG, warpMode: "off" },
+			);
+			assert.equal(res.status, 502);
+			assert.equal(warpStateForTests().lastFailure?.kind, "upstream");
+			assert.equal(warpStateForTests().lastFailure?.rule, "code:empty_response");
+		} finally {
+			fake.restore();
+		}
+	}
+});
+
 test("request body limit: a chunked loopback upload over the limit gets a real 413", async () => {
 	const accepted = bodyOfBytes(REQUEST_BODY_LIMIT);
 	const over = bodyOfBytes(REQUEST_BODY_LIMIT + 1);
