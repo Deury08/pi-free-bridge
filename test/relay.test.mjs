@@ -580,7 +580,17 @@ test("mintSessionFromService: returns the id the local server issues", async () 
 		assert.equal(await mintSessionFromService({ servicePath }), "ses_from_service");
 	});
 
-	assert.deepEqual(seen, [{ url: "/api/session", method: "POST", auth: basicAuthFor("pw") }]);
+	// Only POSTs to the minting endpoint belong to this contract. A stray
+	// connection from an earlier test can land on a recycled ephemeral port
+	// (seen in practice as a bare `GET /` with no auth); that is noise, while a
+	// duplicate POST or a wrong credential is exactly the regression to catch.
+	const minted = seen.filter((request) => request.method === "POST");
+	assert.deepEqual(minted, [{ url: "/api/session", method: "POST", auth: basicAuthFor("pw") }]);
+	assert.equal(
+		seen.filter((request) => request.method !== "GET").length,
+		1,
+		"the minter sends one POST and nothing else",
+	);
 });
 
 test("mintSessionFromService: an absent registration resolves nothing", async () => {
@@ -8648,7 +8658,14 @@ function postChunked(port, chunks, agent) {
 				method: "POST",
 				path: "/v1/chat/completions",
 				agent,
-				headers: { "content-type": "application/json" },
+				headers: {
+					"content-type": "application/json",
+					// Forced on purpose: Node only picks chunked when the body is already
+					// streaming, and with `maxSockets: 1` a queued request buffers every
+					// write and sends a Content-Length instead. Without this the transport
+					// under test is decided by timing.
+					"transfer-encoding": "chunked",
+				},
 			},
 			(res) => {
 				const parts = [];
