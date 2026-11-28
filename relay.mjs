@@ -1428,6 +1428,11 @@ export function createRequestTrace(req, res, pathname, options = {}) {
 
 	return {
 		requestId,
+		// S1 (ladder-refill): the ladder's budget is measured from the same
+		// monotonic origin `received` was stamped at, so "how much has this request
+		// spent" is one number with one source and never a second clock.
+		startedMono,
+		monotonicNow: monoFn,
 		step(stage, extra) {
 			emit(stage, extra);
 		},
@@ -1859,8 +1864,143 @@ let deliveringWarpStreams = 0;
  *  gives up at 5 minutes, so 2 of them is already past the point of no return
  *  and well short of losing both turns. */
 const DRAIN_VALVE_MS = 120_000;
+
+// ---------------------------------------------------------------------------
+// Ladder budget (odd/tasks/ladder-refill.md, S1)
+// ---------------------------------------------------------------------------
+//
+// The client pays for the pool's recovery only up to a deadline. Two numbers,
+// never conflated:
+//
+//   - MEASURED: how long this request has been running. The clock is monotonic
+//     and starts at `received`, so "how much have we spent" is a fact.
+//   - ESTIMATED: how long the NEXT round will take. It cannot be known in
+//     advance (a recycle is ~4s typical, 10s at the POST timeout), so it only
+//     decides whether another round may START. It never decides when we stop.
+//
+// What keeps an optimistic estimate harmless is the cut: every await inside a
+// round is bounded by `AbortSignal.timeout(usable)` and the drain valve is
+// `min(valve, usable)`. A round that overruns dies at the deadline and the
+// refusal already in hand is delivered. Worst case is a spent enrollment, never
+// a request without an answer.
+
+/** The tag a value has to pass to be a usable budget: a positive integer. */
+function positiveIntFromEnv(raw, fallback) {
+	const n = Number.parseInt(String(raw ?? "").trim(), 10);
+	return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+/** Ceiling on the whole ladder for one request. Pi configures no provider
+ *  timeout from this extension, so the default is deliberately conservative.
+ *  `RELAY_LADDER_BUDGET_MS` is the knob; unset, garbage or zero keep it. */
+export const LADDER_BUDGET_MS = positiveIntFromEnv(process.env.RELAY_LADDER_BUDGET_MS, 25_000);
+
+/** Time kept back for the terminal attempt and its delivery. Delivery alone is
+ *  milliseconds (the refusal is already in memory), but the terminal attempt is
+ *  a real request, so the reserve covers that. */
+export const LADDER_RESERVE_MS = positiveIntFromEnv(process.env.RELAY_LADDER_RESERVE_MS, 8_000);
+
+/** First guess for one round: recycle (~4s measured) plus the pool re-read. It
+ *  is replaced by the request's own measurements after the first round. */
+export const LADDER_ROUND_MS = positiveIntFromEnv(process.env.RELAY_LADDER_ROUND_MS, 6_000);
+
+// S3 (ladder-refill): the scarce resource under a 429 storm is the enrollment,
+// not the second. A rotation re-enrols the whole pool, so a time budget alone
+// would let a request with cheap rounds re-enrol the pool over and over. This
+// window caps re-enrollments per sliding window and is shared by the request's
+// own rounds and by the background refill: one number, one place.
+export const REFILL_MAX = positiveIntFromEnv(process.env.RELAY_REFILL_MAX, 3);
+export const REFILL_WINDOW_MS = positiveIntFromEnv(process.env.RELAY_REFILL_WINDOW_MS, 600_000);
+let enrollmentStamps = [];
+
+function pruneEnrollmentStamps(now) {
+	const kept = enrollmentStamps.filter((stamp) => now - stamp < REFILL_WINDOW_MS);
+	if (kept.length !== enrollmentStamps.length) enrollmentStamps = kept;
+	return enrollmentStamps;
+}
+
+/** How many re-enrollments happened inside the current window. */
+export function enrollmentsInWindow(now = Date.now()) {
+	return pruneEnrollmentStamps(now).length;
+}
+
+/** Whether another rotation may re-enroll the pool right now. Asking never enrols. */
+export function enrollmentWindowOpen(now = Date.now()) {
+	return enrollmentsInWindow(now) < REFILL_MAX;
+}
+
+/** Count one confirmed re-enrollment and return the window's new total. */
+export function recordEnrollment(now = Date.now()) {
+	pruneEnrollmentStamps(now).push(now);
+	return enrollmentStamps.length;
+}
+
+/** Pure: may another round start? `usable` is what the budget still allows once
+ *  the reserve is set aside. A round that would end past the deadline is not
+ *  started, because the answer we already have must still be delivered. */
+export function nextRoundFits(usableMs, estimateMs = LADDER_ROUND_MS) {
+	if (!Number.isFinite(usableMs) || !Number.isFinite(estimateMs)) return false;
+	if (estimateMs <= 0) return usableMs > 0;
+	return usableMs >= estimateMs;
+}
+
+/** The budget of one request: elapsed is measured, the round cost is estimated
+ *  and self-calibrating. `observe` feeds each finished round back in, so after
+ *  the first round the estimate is this machine's own number instead of ours. */
+export function createLadderClock({
+	monotonicNow = () => performance.now(),
+	startedAt,
+	budgetMs = LADDER_BUDGET_MS,
+	reserveMs = LADDER_RESERVE_MS,
+	estimateMs = LADDER_ROUND_MS,
+} = {}) {
+	const origin = Number.isFinite(startedAt) ? startedAt : monotonicNow();
+	let estimate = estimateMs;
+	const elapsedMs = () => Math.max(0, monotonicNow() - origin);
+	const remainingMs = () => Math.max(0, budgetMs - elapsedMs());
+	// What a round may spend: everything but the reserve for the answer we hold.
+	const usableMs = () => Math.max(0, remainingMs() - reserveMs);
+	return {
+		budgetMs,
+		reserveMs,
+		elapsedMs,
+		remainingMs,
+		usableMs,
+		get estimateMs() {
+			return estimate;
+		},
+		/** Replace the guess with a measurement, smoothed so one slow round does
+		 *  not make the ladder refuse a round that would have fit. */
+		observe(actualMs) {
+			if (!Number.isFinite(actualMs) || actualMs <= 0) return estimate;
+			estimate = Math.round(estimate === 0 ? actualMs : estimate * 0.5 + actualMs * 0.5);
+			return estimate;
+		},
+		/** May another round start now, under the current estimate? */
+		mayStartRound() {
+			return nextRoundFits(usableMs(), estimate);
+		},
+		/** The drain valve this request may use: never past the deadline. */
+		drainValveMs() {
+			return Math.max(0, Math.min(drainValveMs, usableMs()));
+		},
+	};
+}
+
 const DRAIN_POLL_MS = 50;
 let drainValveMs = DRAIN_VALVE_MS;
+
+// Test-only (see the hooks section below): the budget the next request's clock
+// is built from. `undefined` means the configured defaults; production never
+// writes it, and `resetWarpStateForTests` clears it.
+let ladderBudgetForTests;
+// The last time the ladder actually ran, so /health can answer "what did it do?"
+// without a log file. Written at the end of every ladder run, in and out of
+// the refill loop.
+let lastLadder;
+export function lastLadderForTests() {
+	return lastLadder;
+}
 
 // ---------------------------------------------------------------------------
 // Quota ledger, keyed by egress IP (S5, S10, S12)
@@ -2109,6 +2249,15 @@ export function nearestQuotaReset(ledger, now = Date.now()) {
 		if (until > now && (nearest === 0 || until < nearest)) nearest = until;
 	}
 	return nearest;
+}
+
+/** Pure: does this ledger hold at least one park that is still live? It is the
+ *  precondition of the in-request refill loop (S5): without a burnt address
+ *  parked in advance there is nothing the loop could save, so the ladder keeps
+ *  exactly the shape it had before that loop existed (L1, "solo si estan
+ *  parquedas de antemano"). */
+export function hasLiveQuotaPark(ledger, now = Date.now()) {
+	return nearestQuotaReset(ledger, now) > 0;
 }
 
 /** D10: the variable the clash message tells you to set is the variable the
@@ -2491,12 +2640,14 @@ export function parseWarpExits(body) {
 
 /** GET `<proxy>/exits`, parsed, cached for five seconds. A non-200, an
  *  unparseable body and a non-array all read as `undefined`: no evidence about
- *  the pool, which is the same answer a request gives when nothing is clean. */
-export async function readWarpExitsDetail(config, now = Date.now()) {
+ *  the pool, which is the same answer a request gives when nothing is clean.
+ *  `fresh` skips the cache and replaces it: a round that just enrolled exits must
+ *  read the pool it produced, not the one that was there before it (S4). */
+export async function readWarpExitsDetail(config, now = Date.now(), { fresh = false } = {}) {
 	const proxy = String(config?.warpProxy ?? "").trim().replace(/\/+$/, "");
 	if (!proxy) return undefined;
 	const cached = warpExitsDetailCache;
-	if (cached && cached.proxy === proxy && now - cached.at < WARP_EXITS_DETAIL_TTL_MS) return cached.entries;
+	if (!fresh && cached && cached.proxy === proxy && now - cached.at < WARP_EXITS_DETAIL_TTL_MS) return cached.entries;
 
 	let entries;
 	try {
@@ -2824,6 +2975,9 @@ export function resetWarpStateForTests() {
 	warpExitsDetailCache = undefined;
 	preferredExitId = undefined;
 	lastFailure = undefined;
+	ladderBudgetForTests = undefined;
+	enrollmentStamps = [];
+	lastLadder = undefined;
 	tokenSaverStats = { blocksCompacted: 0, bytesBefore: 0, bytesAfter: 0, bytesSaved: 0 };
 	lastRequestTrace = undefined;
 }
@@ -2866,6 +3020,19 @@ export function setWarpRotationTimingForTests(timeoutMs, pollMs, valveMs) {
 	rotationTimeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : ROTATION_TIMEOUT_MS;
 	rotationPollMs = Number.isFinite(pollMs) ? pollMs : ROTATION_POLL_MS;
 	drainValveMs = Number.isFinite(valveMs) ? valveMs : DRAIN_VALVE_MS;
+}
+
+/** Test-only: replace the budget the request's ladder clock is built from; the
+ *  production knobs are read from the environment at load, which a test cannot
+ *  re-read. Called with no arguments it restores them. */
+export function setLadderBudgetForTests(budgetMs, reserveMs, estimateMs) {
+	ladderBudgetForTests = Number.isFinite(budgetMs)
+		? {
+				budgetMs,
+				...(Number.isFinite(reserveMs) ? { reserveMs } : {}),
+				...(Number.isFinite(estimateMs) ? { estimateMs } : {}),
+			}
+		: undefined;
 }
 
 /** Test-only: pretend `count` responses are being delivered over warp now. */
@@ -2974,10 +3141,14 @@ function healthFromSnapshot(snapshot) {
  *  `client` is the request that asked for the rotation. If it left, nobody is
  *  waiting for the resend, so rotating up to two minutes later would only cost
  *  the other tenants their own retry. */
-async function drainBeforeRotation(client) {
+async function drainBeforeRotation(client, clock) {
 	if (deliveringWarpStreams <= 0) return true;
 	const startedAt = Date.now();
-	const valve = startedAt + drainValveMs;
+	// S1 (ladder-refill): the valve is no longer a constant the request cannot
+	// afford. With a budget, the wait is capped by what the request has left
+	// after the reserve, so the answer we already hold can still be delivered.
+	const valveMs = clock ? clock.drainValveMs() : drainValveMs;
+	const valve = startedAt + valveMs;
 	let valveHit = false;
 	while (deliveringWarpStreams > 0) {
 		if (client && client.gone) {
@@ -2996,6 +3167,15 @@ async function drainBeforeRotation(client) {
 	process.stderr.write(
 		`pi-free-bridge relay: waited ${Date.now() - startedAt}ms for in-flight warp responses before rotating${stuck}\n`,
 	);
+	if (clock && valveHit) {
+		logWarpEvent("ladder_deadline_hit", {
+			stage: "drain",
+			waitedMs: Date.now() - startedAt,
+			valveMs: Math.round(valveMs),
+			remainingMs: Math.round(clock.remainingMs()),
+			stillDelivering: deliveringWarpStreams,
+		});
+	}
 	return true;
 }
 
@@ -3011,8 +3191,12 @@ async function drainBeforeRotation(client) {
  *  `snapshot` is an optional pool read the caller already made: the manual sweep
  *  reads the pool to choose its cheapest step, and that same read is the
  *  pre-POST snapshot the confirmation compares against, so the rotation never
- *  reads the proxy twice for one answer. */
-async function runWarpRotation(config, client, snapshot) {
+ *  reads the proxy twice for one answer.
+ *  `clock` is the calling request's ladder budget (S1): it caps the drain wait,
+ *  so a rotation asked for by a request is never allowed to hold that request
+ *  past its own deadline. A caller with no clock (the background repair, the
+ *  manual sweep) keeps the plain valve it always had. */
+async function runWarpRotation(config, client, snapshot, clock) {
 	// A rotation already in flight belongs to another handler: a second POST
 	// would rotate the exit out from under that handler's in-flight resend and
 	// hand this request a stream nobody can serve. The original 429 is the honest
@@ -3027,7 +3211,7 @@ async function runWarpRotation(config, client, snapshot) {
 		return { rotated: false };
 	}
 
-	if (!(await drainBeforeRotation(client))) {
+	if (!(await drainBeforeRotation(client, clock))) {
 		logWarpEvent("rotate_skipped", {
 			reason: "drain_refused",
 			delivering: deliveringWarpStreams,
@@ -3100,8 +3284,26 @@ async function runWarpRotation(config, client, snapshot) {
 
 /** S3: the rotation itself. Every caller that only asks "did it rotate?" keeps
  *  that answer; the manual sweep asks the richer `runWarpRotation` directly. */
-export async function rotateWarpExit(config, client) {
-	return (await runWarpRotation(config, client, undefined)).rotated;
+export async function rotateWarpExit(config, client, clock) {
+	// A rotation with a clock is a ladder round: it may only run while the window
+	// still allows a re-enrollment. Without a clock it is the caller's explicit
+	// rotation (a manual /recycle), which is never refused - it is only counted,
+	// so the window sees every re-enrollment the pool actually paid for.
+	if (clock && !enrollmentWindowOpen()) {
+		logWarpEvent("refill_skipped", {
+			reason: "enrollment_window",
+			max: REFILL_MAX,
+			windowMs: REFILL_WINDOW_MS,
+			used: enrollmentsInWindow(),
+		});
+		return false;
+	}
+	const result = await runWarpRotation(config, client, undefined, clock);
+	if (result.rotated) {
+		const used = recordEnrollment();
+		logWarpEvent("refill_ok", { used, max: REFILL_MAX, windowMs: REFILL_WINDOW_MS });
+	}
+	return result.rotated;
 }
 
 /** The `/health` read behind both the rotation poll and the manual sweep. It
@@ -3419,8 +3621,124 @@ async function resendWarpOnce(config, pathname, body, original, via) {
 	return { refused };
 }
 
-export async function resendAfterRotation(config, pathname, body, original, client) {
-	if (!(await rotateWarpExit(config, client))) {
+// ---------------------------------------------------------------------------
+// The in-request refill loop (ladder-refill S4, S5, S6)
+// ---------------------------------------------------------------------------
+//
+// Round 1 spends the pool the request already has, and every attributable 429
+// parks its egress. What is left of the pool can then be parked end to end, and
+// an attempt there only buys a refusal the ledger already predicted. So the
+// ladder does not spend it: it spends the time on another recycle round instead,
+// and repeats that for as long as the request's own clock can still pay for one
+// (S4). The moment it cannot, the LAST 429 the ladder captured goes out
+// byte-exact (S28, S6).
+//
+// Nothing here starts unless the ledger already held a live park when the
+// request began (S5, L1): a pool that was not known to be burnt is no evidence
+// that rotating helps, and that is the case every other ladder test pins. The
+// precondition is read once, before round 1, so a park this request creates can
+// never be the reason it changes its own shape.
+
+/** The pool a round produced, in the ladder's own order. A failed read is no
+ *  evidence of a clean egress, which is the safe answer: nothing is attempted. */
+async function publishedPool(config, now = Date.now()) {
+	if ((await warpExitsCapability(config, now)) !== "structured") return undefined;
+	// `fresh` on purpose: the round may have enrolled exits, and the cached list
+	// is the pool from before it ran.
+	const entries = await readWarpExitsDetail(config, now, { fresh: true });
+	if (!Array.isArray(entries)) return undefined;
+	return orderedWarpExits(entries, now);
+}
+
+/** The ladder after round 1, when the pool is known to be burnt: rotate, ask the
+ *  pool what it produced, and attempt only what the ledger does not already hold
+ *  as refused. Bounded by the request's clock, never by a round count. */
+async function refillRotationRounds(config, pathname, body, original, client, clock) {
+	let refusal = original;
+	let round = 0;
+	let stop = "completed";
+	// One record per ladder run, written on every exit path, so /health can show
+	// what the last storm actually did: how many rounds it afforded, what each one
+	// cost on this machine, and why it stopped.
+	const finish = (outcome) => {
+		lastLadder = {
+			at: Date.now(),
+			rounds: round,
+			stop,
+			outcome,
+			elapsedMs: Math.round(clock.elapsedMs()),
+			budgetMs: clock.budgetMs,
+			estimateMs: clock.estimateMs,
+			enrollmentsUsed: enrollmentsInWindow(),
+		};
+		return outcome;
+	};
+	for (;;) {
+		// A client that left is nobody to answer, and its dead connection is not a
+		// reason to spend another round.
+		if (client && client.gone) {
+			stop = "client_gone";
+			break;
+		}
+		if (!clock.mayStartRound()) {
+			// S6: the refusal to start a round names what was left and what it would
+			// have cost, so a human can tune the budget from evidence.
+			stop = "deadline";
+			logWarpEvent("ladder_deadline_hit", {
+				stage: "ladder",
+				remainingMs: Math.round(clock.remainingMs()),
+				estimateMs: clock.estimateMs,
+				round,
+			});
+			break;
+		}
+		round += 1;
+		const startedAt = clock.elapsedMs();
+		const rotated = await rotateWarpExit(config, client, clock);
+		const elapsedMs = Math.max(0, clock.elapsedMs() - startedAt);
+		// The measurement replaces the guess: from here on the ladder knows what a
+		// round costs on this machine, and that is what the next refusal reads.
+		clock.observe(elapsedMs);
+		if (client && client.gone) {
+			stop = "client_gone";
+			break;
+		}
+
+		const pool = await publishedPool(config);
+		const clean = (pool ?? []).filter((exit) => !isEgressParked(quotaLedger, exit.ip, Date.now()));
+		const chosen = clean[0];
+		// S6: one line per finished round: its index, what it cost, the egress it
+		// will spend an attempt on (if any) and how much of the pool is parked.
+		logWarpEvent("ladder_round", {
+			round,
+			elapsedMs: Math.round(elapsedMs),
+			...(chosen ? { exit: chosen.id } : {}),
+			parked: (pool ?? []).length - clean.length,
+		});
+
+		if (chosen) {
+			// S4: the attempt carries the clean exit's credential, because only a named
+			// credential proves which address served the request and could park it.
+			const attempt = await freeRoundAttempt(config, pathname, body, chosen);
+			if (attempt && attempt.delivered) return finish({ egress: "warp", response: attempt.delivered });
+			if (attempt && attempt.refused) refusal = attempt.refused;
+		}
+		// A rotation that did not confirm is never posted a second time: today's
+		// ladder does not, and the deadline is for rounds that can still pay off.
+		if (!rotated) {
+			stop = enrollmentWindowOpen() ? "rotation_not_confirmed" : "enrollment_window";
+			break;
+		}
+	}
+	return finish({ egress: "warp", response: rebuildOriginal(refusal).response });
+}
+
+export async function resendAfterRotation(config, pathname, body, original, client, ladder = {}) {
+	// S4/S5: with a burnt pool in the ledger the tail of the ladder becomes the
+	// refill loop; without it this is exactly the function it always was.
+	const { clock, refill = false } = ladder;
+	if (clock && refill) return refillRotationRounds(config, pathname, body, original, client, clock);
+	if (!(await rotateWarpExit(config, client, clock))) {
 		process.stderr.write(
 			`pi-free-bridge relay: warp rotation not confirmed — delivering the original ${original.status}\n`,
 		);
@@ -3654,8 +3972,12 @@ async function freeWarpRound(config, pathname, body, client, attemptedId) {
  *
  *  No attribution means no target, and a body-less swap picks by live streams —
  *  which, by the time a 429 is being diagnosed, points at the wrong exit. So the
- *  ladder skips straight to the rotation instead of guessing. */
-export async function recoverWarp429(config, pathname, body, original, client) {
+ *  ladder skips straight to the rotation instead of guessing.
+ *
+ *  `ladder` carries this request's budget (`clock`, S1) and whether the refill
+ *  loop is armed (`refill`, S5). Both are decided once, by `forward`, before the
+ *  request spends anything: the evidence for the loop has to predate it. */
+export async function recoverWarp429(config, pathname, body, original, client, ladder = {}) {
 	// S20/S27/S28: round 1 is free and comes first, before anything is spent.
 	const free = await freeWarpRound(config, pathname, body, client, original.exitId);
 	// Something answered: that response is what the client gets, byte-exact, and
@@ -3696,7 +4018,7 @@ export async function recoverWarp429(config, pathname, body, original, client) {
 			});
 	if (!decision.swap) {
 		logWarpEvent("ladder_swap_skipped", { reason: decision.reason, exit: tunnelExit });
-		return resendAfterRotation(config, pathname, body, original, client);
+		return resendAfterRotation(config, pathname, body, original, client, ladder);
 	}
 	const drainedExit = tunnelExit;
 	const swap = await swapWarpExit(config, drainedExit, client);
@@ -3726,9 +4048,9 @@ export async function recoverWarp429(config, pathname, body, original, client) {
 		} else if (attempt) {
 			return attempt;
 		}
-		return resendAfterRotation(config, pathname, body, original, client);
+		return resendAfterRotation(config, pathname, body, original, client, ladder);
 	}
-	return resendAfterRotation(config, pathname, body, original, client);
+	return resendAfterRotation(config, pathname, body, original, client, ladder);
 }
 
 /** Pure: the upstream headers the relay forwards downstream. `content-type`
@@ -3916,6 +4238,18 @@ export async function forward(req, res, pathname, config, existingTrace) {
 			lastRequestTrace = record;
 		},
 	});
+	// S1 (ladder-refill): one budget per request, measured from the monotonic
+	// origin `received` was stamped at. It is built here, once, and threaded into
+	// the ladder, so "how long has this request been running" has a single answer.
+	const ladderClock = createLadderClock({
+		monotonicNow: typeof trace.monotonicNow === "function" ? trace.monotonicNow : undefined,
+		startedAt: trace.startedMono,
+		...(ladderBudgetForTests ?? {}),
+	});
+	// S5 (ladder-refill): whether the refill loop is available is decided HERE,
+	// before this request spends anything, so a park the request creates itself is
+	// never the evidence it acts on (L1: "solo si estan parquedas de antemano").
+	const ladder = { clock: ladderClock, refill: hasLiveQuotaPark(quotaLedger) };
 	const client = trackClient(res);
 	let countedDelivering = false;
 	try {
@@ -4096,6 +4430,7 @@ export async function forward(req, res, pathname, config, existingTrace) {
 					retryAfterMs: parkDurationMs(response.headers.get("retry-after")),
 				},
 				client,
+				ladder,
 			);
 			response = resend.response;
 			// No egress means the original 429 was handed back, so it keeps the
@@ -4424,6 +4759,16 @@ export async function handle(req, res, config) {
 			},
 			lastRequestTrace: lastRequestTrace ?? null,
 			lastEgress: lastEgress,
+			// S3/S6 (ladder-refill): the two things a human needs to understand a
+			// storm after it passed - how much enrollment budget is left in the
+			// window, and what the ladder did on its last run.
+			refill: {
+				used: enrollmentsInWindow(),
+				max: REFILL_MAX,
+				windowMs: REFILL_WINDOW_MS,
+				open: enrollmentWindowOpen(),
+			},
+			lastLadder: lastLadder ?? null,
 			pid: process.pid,
 		});
 		return;

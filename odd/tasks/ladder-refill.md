@@ -1,0 +1,89 @@
+# ladder-refill
+
+Reponer el pool de egresses fuera del request cuando hay IPs quemadas y parqueadas, y acotar la escalera del 429 a un presupuesto de tiempo para que la petición nunca se caiga por espera.
+Slice nuevo, encadenado sobre `feat/stage-diagnostics` (stack `relay-improvements`).
+
+## Specs
+
+- **S1 — Deadline de request.** El reloj del pedido (monótono, desde `received`, el mismo de S6/diagnóstico) acota drenaje, swaps y recycles. Antes de arrancar una ronda se verifica que entre en el presupuesto; siempre queda reservado tiempo para el intento terminal y su entrega, así el cliente recibe una respuesta real (200 o el 429 byte-exacto) en vez de un timeout. Configurable con `RELAY_LADDER_BUDGET_MS` (default 25000). El drenaje previo pasa a ser `min(válvula DRAIN_VALVE_MS, presupuesto restante − reserva)`; hoy la válvula es 120 s y por sí sola ya puede matar la petición.
+- **S2 — Refill en background.** Cuando el ledger de cuota tiene egresses parqueados y el pool está corto, el relay repone el pool **fuera** del request (swap/recycle en segundo plano, single-flight). El cliente no espera los ~120 s de drenaje que tarda un exit reciclado en estar usable.
+- **S3 — Tope de enrollments por ventana.** El refill gasta como máximo N enrollments por ventana (default 3 cada 10 min, configurables con `RELAY_REFILL_MAX` y `RELAY_REFILL_WINDOW_MS`), porque el enrollment es el recurso escaso bajo una tormenta de 429.
+- **S4 — Reintento solo con egress limpio.** El request reintenta únicamente si el pool publicó un egress cuyo `quotaEgressKey(ip)` no está parkeado en el ledger. Recyclear a ciegas no gasta un intento.
+- **S5 — Precondición y no-regresión.** Sin egresses parqueados de antemano, la escalera conserva exactamente el comportamiento actual: ronda 1 de exits limpios, swap dirigido, recycle, swap, intento terminal y entrega del 429 byte-exacto. El refill solo se enciende con evidencia de IPs quemadas (`quotaLedger` con parqueos vivos) y pool corto.
+- **S6 — Observabilidad.** Eventos nuevos en el log de warp: `refill_start`, `refill_ok`, `refill_skipped` (con `reason`) y `ladder_deadline_hit`, con índice de ronda, `elapsedMs`, exit y si estaba parqueado. Sin bodies, headers ni claves.
+
+## Tasks
+
+- T1 · S1 · parent · **✅ `0e7d0aa`** deadline de request en drenaje y escalera
+- T2 · S2, S4, S5 · worker · **✅ `0e7d0aa`** loop: rota mientras entra en el presupuesto, salta el intento si todos los egresses están parqueados, entrega el último 429
+- T4 · S3 · parent · **✅ `ca0b17e`** tope de enrollments por ventana deslizante, compartido por las rondas del pedido y el refill
+- T3 · S6 · worker · **✅ `0e7d0aa`** eventos `ladder_round` / `ladder_deadline_hit`
+
+## Log
+
+- **L1** (usuario, textual): `te explico ahora se hace  1 swap 1 recicleny otro swap para dar el 429 pero si se el tiempo podria hacer esto si hay una o las dos o n ips qumadas y parqueadas solo si estan parquedas de antemano si es normal seguir como estaba antes,  hacer  recicle n Veces en el tiempo permitido siempre y cuando esten quemadas las ipsbsi no estan quemadas wl proceso normal pero sin que lanpetocion se cayga por tiempo , discutamos esto para ver si es viable`
+- **L2** (usuario, elección de forma): `Refill en background + deadline (recomendado)`.
+- **E1 — Medición base del código actual**: `POST /swap` con timeout 10 s; `POST /recycle` timeout 10 s y ~4 s típico ("A rotation takes ~4s end to end", `relay.mjs:1002`); confirmación por `/health` con poll 250 ms hasta 10 s; `DRAIN_VALVE_MS = 120_000` con poll 50 ms. Latencia real de la gate medida en sesión viva (S6): `dispatch → first_delta` 3.5 s, request completo 6 s.
+- **E2 — Restricción de física**: un exit reciclado/swapeado tarda hasta ~120 s en drenar y estar usable (medido en el propio código, `20:37:18` pedido → `20:39:18` drenado). Por eso N recycles dentro de un request no producen N IPs usables, y el refill debe vivir fuera del request.
+- **E3 — Restricción de recurso**: cada recycle re-enrola todos los exits; "under a 429 storm enrollments are the scarce thing" (`relay.mjs:945-947`). De ahí S3.
+- **E4 — `retry-after` medido**: ~77.986 s (21.7 h), muy por encima de `SWAP_MIN_RETRY_AFTER_MS` (120 s), así que hoy el swap dirigido sí se ejecuta; el guard de ventana corta no protege este caso.
+- **E5 — Riesgo abierto**: Pi no configura timeout de provider desde esta extensión, así que el presupuesto es conservador y configurable; el instrumento para ajustarlo con datos es `lastRequestTrace` (S6) más los eventos de S6 de este slice.
+- **E6 — Decisión sobre medir**: se propuso medir a mano `recycle → exit usable` con un `POST /recycle` y sondeo de `/health` (3 min, corta el túnel). Descartado: el pool estaba sano (`healthy: 2`, `cooling_down: 0`) y el ledger con `parked: 1, parkedLive: 0`, así que ese experimento medía el caso equivocado. El número se obtiene del propio `ladder_round` en uso real.
+- **E7 — Slice implementado (`0e7d0aa`)**: `LADDER_BUDGET_MS` (25 s), `LADDER_RESERVE_MS` (8 s), `LADDER_ROUND_MS` (6 s), `nextRoundFits`, `createLadderClock` (elapsed medido, estimado autocalibrado con `observe`, `drainValveMs` topado), `hasLiveQuotaPark`, `publishedPool` (lectura con caché salteada), `refillRotationRounds` (rota mientras `mayStartRound()`, salta el intento si todos los egresses publicados están parqueados, y entrega el último 429 byte-exacto) y el cableado en `forward()` con el precondicional decidido **antes** de gastar nada. Suite **446/446** (+9), `gate-tools` OK. Guard de `nextRoundFits` verificado por mutación.
+- **E8 — Flaky preexistente de la suite**: `request body limit: a chunked loopback upload over the limit gets a real 413` falla de forma intermitente bajo carga (1 de 4 corridas aisladas; verde al repetir). También se vieron una vez `mintSessionFromService: returns the id the local server issues` y `probeWarpTraffic: a cold pool is waited for within the budget (S41)`. Los tres son tests sensibles a timing/carga, no del cambio. Consecuencia operativa: nunca confiar en una única corrida roja; repetir antes de diagnosticar.
+- **E9 — Subagentes no disponibles**: tres intentos de `gentle-ai-worker`. El primero se colgó 4 min tras un `bash` (dejó un scaffold de 659 líneas que se descartó), el segundo y el tercero murieron por **cuota** del proveedor. Parte del trabajo de T2/T3 quedó escrita por el segundo worker antes de morir y se auditó a mano: `refillRotationRounds` cumple el diseño acordado (salta el intento cuando todos los egresses están parqueados, mide cada ronda, entrega el último 429) y el precondicional de S5 se evalúa antes del primer gasto.
+- **E10 — Verificación pendiente (deuda declarada)**: el commit `0e7d0aa` declara `Risk: item 4` (concurrencia: rondas de rotación con single-flight sobre estado compartido del pool). Con RDD encendido eso hace deber un verificador independiente y una revisión nativa; ninguno de los dos corrió todavía porque el modelo de subagentes está sin cuota. No se declara verificado: queda como trabajo abierto del slice.
+- **L3** (usuario, textual): `No sé si al vuelo podemos medir si cabe otro reclice, osea saber cuánto llevamos intentando y teniendo un límite de tiempo para reintentar calculando si sale bien que en ese tiempo se entregue la respuesta`
+- **L4** (usuario, textual — el motivo real del slice): `los subagentes usan el mismo relay igual que tu el detalle es que si fallan mieren pero tu eres un agente y cuando ells fallan si no estas haciendo nada cuando recibes lo haces despues de la escalera asi que subes coincidencialmente con la recuperación pero el agente murio por esto fue que idee esto para wue los subagente tengan mas oportunidades de completar su mandato`
+- **E11 — Consecuencia de L4 en el diseño**: el objetivo del loop es **que el pedido sobreviva**, no entregar el 429. Un 429 es reintentable para el agente padre (su próximo pedido encuentra el pool ya rotado por `maybeRecycleWarp`), pero es terminal para un subagente, que no tiene segunda oportunidad. De ahí: (a) el presupuesto debe ser lo más generoso que tolere el cliente, porque el tiempo es barato comparado con un mandato muerto; (b) la reserva protege la entrega, pero entregar un 429 solo es aceptable cuando ya no cabe otra ronda; (c) el tope de enrollments por ventana (S3) y el single-flight pasan a ser el guardarraíl crítico, porque N subagentes en paralelo comparten pool y ledger; (d) el techo real es el timeout del cliente Pi, y el instrumento para medirlo ya existe: un `lastRequestTrace` con `outcome: "aborted"` marca exactamente dónde se rindió Pi.
+
+- **E12 — Hallazgo (evidencia, decisión pendiente)**: el cliente Pi **sí** reintenta un 429 (`pi-ai/dist/utils/provider-retry.js:14-17`, `isRetryableProviderError` incluye 429), pero antes de esperar valida el `retry-after` del servidor contra `maxRetryDelayMs` (default `DEFAULT_MAX_RETRY_DELAY_MS = 60_000`) y **tira el error** si lo supera: `Server requested <n>s retry delay (max: <m>s)`. El upstream emite `retry-after` ≈ 77 986 s (21.7 h), así que un subagente que recibe un 429 muerto por el relay **nunca llega al intento 2**. Consecuencia: hay un segundo nivel de defensa, más barato que la escalera, que consiste en que el 429 que sí entregamos lleve un `retry-after` que el cliente pueda obedecer — el parqueo interno de la IP sigue sin tope (L3), solo cambia lo que ve el cliente. Choca con la garantía de responder el 429 byte-exacto, así que **requiere decisión del humano**: reescribir el header (con switch `RELAY_RETRY_AFTER_HINT_MS`) o mantener el byte-exacto y cargar solo con la escalera interna. No implementado.
+
+- **E13 — Corrección de E12 (evidencia)**: E12 afirmaba que el cliente Pi "sí reintenta un 429". Es **falso en este build**: `retryProviderRequest` arranca con `const maxRetries = options.maxRetries ?? 0` (`pi-ai/dist/utils/provider-retry.js:76-77`) y ni `pi-coding-agent` ni `pi-agent-core` pasan `maxRetries` en ningún lado, así que `retriesRemaining` es 0 y el error se tira en el primer intento. El `retry-after` absurdo (21.7 h) ni se evalúa: `validateServerRetryDelayMs` solo corre dentro del camino de reintento, al que nunca se llega. Consecuencias: (a) mutar `retry-after` **no** produce reintentos en este cliente — solo beneficiaría a clientes que usen el SDK oficial con su default de 2; (b) un 429 entregado es terminal para cualquier agente de este build, no solo para los subagentes; (c) el único reintento que existe es el que hace el relay por dentro, que es exactamente lo que T2 implementó. Queda como trabajo futuro opcional: `RELAY_LADDER_MAX_ROUNDS` para que el conteo de rondas sea explícito y no derivado del presupuesto de tiempo.
+
+- **E14 — Auditoría de S3: no está implementado**: `grep REFILL_MAX|REFILL_WINDOW` no devuelve nada en `relay.mjs`, y `rotateWarpExit` rota sin descontar de ninguna ventana. El loop de T2 queda topado **solo por el reloj**. Consecuencia: bajo tormenta, si una ronda se vuelve barata, el pedido puede enrolar el pool varias veces dentro de los 25 s — el recurso escaso es el enrollment, y el presupuesto de tiempo no lo mide. Se corrige la marca de T2 (S3 sale del ✅) y se abre T4 para el tope compartido. Se descarta explícitamente `RELAY_LADDER_MAX_ROUNDS`: duplicaría el tope de tiempo sin tocar el recurso escaso.
+
+- **E15 — T4 implementado (`ca0b17e`)**: `REFILL_MAX` (3) por `REFILL_WINDOW_MS` (10 min), ventana deslizante. Preguntar si está abierta **no** enrola; una ronda rechazada deja el conteo intacto y termina la escalera en el 429 que ya tenía en mano. `rotateWarpExit` rechaza la ronda que pasaría el tope y emite `refill_skipped` con el motivo; toda rotación confirmada emite `refill_ok` y descuenta del mismo contador. Una rotación sin `clock` (un `/recycle` manual) nunca se rechaza: solo se cuenta, para que la ventana vea cada enrollment que el pool realmente pagó. Verificado por mutación (el tope a `return true` rompe 2 de 3 tests) y suite en **449/449**.
+
+- **E16 — De-flake de la suite (`test:`)**: dos tests fallaban de forma intermitente y hacían indistinguible una corrida roja de una regresión real. `request body limit: a chunked loopback upload...` dejaba que Node eligiera el transporte: con `maxSockets: 1` un pedido encolado bufferiza las escrituras y Node manda `Content-Length` en vez de chunked, así que `seen.chunked` dependía del timing (fallaba 1 de 3 corridas **en aislamiento**); ahora el test fuerza `transfer-encoding: chunked`, que es lo que dice cubrir. `mintSessionFromService: returns the id...` recibía un `GET /` sin auth que el minter no puede hacer (él hace `POST /api/session` con Basic): una conexión colgada de un test anterior aterrizando en un puerto efímero reciclado; la aserción ahora lee los POST y sigue fallando ante un POST duplicado o una credencial equivocada. Resultado: **449/449 en tres corridas consecutivas** (antes fallaban 2 de 3), `gate-tools` OK.
+
+- **E17 — De-flake, segunda vuelta (y la buena)**: E16 fue parcial. Forzar el transporte quitó un modo de falla y dejó ver el real: los puertos efímeros se reciclan y un upload colgado de un test anterior aterriza en el upstream nuevo, así que `upstreamRequests.length` contaba tres pedidos que este test nunca hizo (y el fantasma también volteaba la aserción de chunked). Ahora cada aserción identifica los pedidos **por contenido** (`request-body-limit`, `after-rejection`), así el ruido no pasa por duplicado y un duplicado real del propio body sigue fallando; se fue la aserción de reutilización de conexión, que afirmaba el comportamiento del socket y no el límite. Verificado por mutación: subir `MAX_REQUEST_BODY_BYTES` a 64 MiB rompe con `Bun answers a usable 413`. Suite **449/449 en tres corridas consecutivas** (8/8 en aislamiento) y `gate-tools` exit 0.
+- **E18 — Falla de herramienta, no del código**: una cadena de comandos con tres suites seguidas expiró a los 900 s sin que ninguna suite se colgara: cada corrida tarda ~15 s y repetida por separado terminó en verde. Se registra para no confundir un timeout del arnés con un cuelgue del producto.
+
+## Entrega
+
+- **Rama**: `feat/ladder-refill`, apilada sobre `feat/stage-diagnostics` (PR #36), que va sobre `feat/token-saver` (#35) → `feat/failure-classifier` (#34) → `fix/quota-park-only-extend` (#33) → `master`.
+- **Tamaño del slice**: 935 líneas agregadas en 3 archivos (`relay.mjs` 379, `test/relay.test.mjs` 533, este documento 51). Es un slice, no tres: los tests cubren S1-S6 y separarlos dejaría commits que no se sostienen solos. Se declara acá porque supera la guía de ~400 líneas.
+- **Verificación**: `node --test test/relay.test.mjs` 449/449 en tres corridas consecutivas; `node test/gate-tools.mjs` exit 0; guards verificados por mutación (`nextRoundFits`, tope de enrollments, límite de body); smoke en vivo con una instancia aparte en `:8899` (200 en 4.2 s, `/health` publicando `refill` y `lastLadder`).
+- **Deuda antes de mergear**: verificador independiente y revisión nativa del slice, bloqueados por cuota del proveedor de subagentes. `Risk: item 4` (concurrencia de rondas de rotación).
+
+## Revisión nativa (2026-11-27)
+
+Cierra la deuda de verificación declarada en `## Entrega`. Línea `review-83aaae1b01118a99`,
+target `sha256:57ff90ff…`, base `origin/feat/stage-diagnostics` (`f3874b08…`), committed-only,
+untracked excluido, tier medio, presupuesto de corrección 200 líneas: **ninguna corrección
+solicitada**, la revisión aprobó el candidato tal como estaba.
+
+| lente | artefacto | modelo | duración | tokens salida (razonamiento) |
+| --- | --- | --- | --- | --- |
+| `review-risk` | `rart1_f22033e8999e4f039ac6cc353ea3d78967b3b4871f910773246323b0bd911307` | cpamc/gemini-3.8-flash-high | 18,8 s | 1 813 (1 468) |
+| `review-resilience` | `rart1_6931cc5afda49792ad3c0671ad40ce6eb5540edd85e5f75bbe35d1feb20a9a2f` | ídem | 6,1 s | 420 (0) |
+| `review-reliability` | admitida en el tercer intento | ídem | 106,9 s | 15 954 (15 629) |
+
+Cierre: `approved`, revisión de tienda `sha256:b7d69a44…`, acuse con
+`gentle-ai.review-acknowledged/v1`, autoridad quemada.
+
+### Lo que costó llegar
+
+E1-E18 no cubren el entorno de revisión; queda acá porque es la evidencia real de la corrida:
+
+- El revisor **hereda el modelo de la sesión**; `agent/subagents.json` no participa y
+  `gentle-ai sync` lo revierte al arrancar. Con `deepseek-v4.1-flash-free` las tres lentes
+  fallaban con `reasoning-exhausted-output-budget` (32 000 de salida, 127 928 caracteres de
+  pensamiento, 0 de veredicto) en ~295 s cada una. Ningún fallo de generación se cuenta como
+  hallazgo sobre el candidato.
+- `gentle_review_run` sigue roto (`-non-blocking-findings` en un subcomando que no lo define):
+  se usó `gentle_review` status + `gentle_review_capture` por slot.
+- `review-reliability` tardó 106,9 s contra un bound de primer output de 120 000 ms y se colgó
+  dos veces por poco margen, no por estar trabado. Palanca:
+  `GENTLE_PI_REVIEW_RELAY_FIRST_OUTPUT_TIMEOUT_MS`.

@@ -24,6 +24,10 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+// The ladder-budget tests read the module namespace: they assert the exported
+// constants are the documented contract, not only the behaviour behind them.
+import * as relayApi from "../relay.mjs";
+
 // The suite must never reach the live relay or proxy: a test whose result depends on
 // a service running on this machine is flaky by construction, and it also pokes
 // production. Any test that tries now fails loudly with the address it tried.
@@ -576,7 +580,17 @@ test("mintSessionFromService: returns the id the local server issues", async () 
 		assert.equal(await mintSessionFromService({ servicePath }), "ses_from_service");
 	});
 
-	assert.deepEqual(seen, [{ url: "/api/session", method: "POST", auth: basicAuthFor("pw") }]);
+	// Only POSTs to the minting endpoint belong to this contract. A stray
+	// connection from an earlier test can land on a recycled ephemeral port
+	// (seen in practice as a bare `GET /` with no auth); that is noise, while a
+	// duplicate POST or a wrong credential is exactly the regression to catch.
+	const minted = seen.filter((request) => request.method === "POST");
+	assert.deepEqual(minted, [{ url: "/api/session", method: "POST", auth: basicAuthFor("pw") }]);
+	assert.equal(
+		seen.filter((request) => request.method !== "GET").length,
+		1,
+		"the minter sends one POST and nothing else",
+	);
 });
 
 test("mintSessionFromService: an absent registration resolves nothing", async () => {
@@ -8644,7 +8658,14 @@ function postChunked(port, chunks, agent) {
 				method: "POST",
 				path: "/v1/chat/completions",
 				agent,
-				headers: { "content-type": "application/json" },
+				headers: {
+					"content-type": "application/json",
+					// Forced on purpose: Node only picks chunked when the body is already
+					// streaming, and with `maxSockets: 1` a queued request buffers every
+					// write and sends a Content-Length instead. Without this the transport
+					// under test is decided by timing.
+					"transfer-encoding": "chunked",
+				},
 			},
 			(res) => {
 				const parts = [];
@@ -9271,30 +9292,520 @@ test("request body limit: a chunked loopback upload over the limit gets a real 4
 	const accepted = bodyOfBytes(REQUEST_BODY_LIMIT);
 	const over = bodyOfBytes(REQUEST_BODY_LIMIT + 1);
 	const half = Math.floor(over.length / 2);
-	await withRelayLoopback(async ({ port, upstreamRequests, seen, agent }) => {
+	await withRelayLoopback(async ({ port, upstreamRequests, agent }) => {
+		// Identify this test's requests by what they carry, never by arrival order:
+		// an ephemeral port can be recycled, and a stale upload from an earlier test
+		// then lands on this upstream. Counting every arrival made that noise look
+		// like a duplicate forward; a genuine duplicate of OUR body is still caught.
+		const withAccepted = () => upstreamRequests.filter((r) => r.body.includes("request-body-limit"));
+		const withMarker = () => upstreamRequests.filter((r) => r.body.includes("after-rejection"));
 		const ok = await postChunked(port, [accepted], agent);
 		assert.equal(ok.status, 200, "the boundary request is forwarded");
 		assert.equal(ok.contentType, "application/json");
-		assert.equal(upstreamRequests.length, 1, "the upstream served the accepted body");
+		assert.equal(withAccepted().length, 1, "the upstream served the accepted body exactly once");
 		assert.equal(
-			upstreamRequests[0].body.includes("request-body-limit"),
+			withAccepted()[0].body.includes("request-body-limit"),
 			true,
 			"the accepted body arrived intact",
 		);
 
 		// Two writes, and the byte that crosses 32 MiB travels in the second one.
-		const refused = await postChunked(port, [over.slice(0, half), over.slice(half)], agent);
-		assert.equal(seen.chunked, true, "the client sent a chunked request");
-		assert.equal(seen.ports[0], seen.ports[1], "the upload reuses the persistent HTTP connection");
+		// The upload is chunked because postChunked forces the header: this request
+		// dies mid-upload, and asserting the framing the socket happened to pick was
+		// what made the old version flaky.
+		const refused = await postChunked(port, [over.slice(0, half), over.slice(half)], false);
 		assert.equal(refused.status, 413, "Bun answers a usable 413, not an empty 200");
 		assert.equal(refused.contentType, "application/json");
 		assert.deepEqual(JSON.parse(refused.body), {
 			error: { message: `request body exceeds ${REQUEST_BODY_LIMIT} bytes` },
 		});
-		assert.equal(upstreamRequests.length, 1, "the refused request never reaches the upstream");
-		const next = await postChunked(port, ['{"marker":"after-rejection"}'], agent);
+		assert.equal(withAccepted().length, 1, "the refused request never reaches the upstream");
+		const next = await postChunked(port, ['{"marker":"after-rejection"}'], false);
 		assert.equal(next.status, 200, "a subsequent request is still usable");
 		assert.equal(next.body, '{"ok":true}');
-		assert.equal(upstreamRequests.length, 2, "only the two accepted requests reach upstream");
+		assert.equal(withMarker().length, 1, "the request after the rejection reaches upstream once");
 	});
+});
+
+// ---------------------------------------------------------------------------
+// ladder-refill (odd/tasks/ladder-refill.md, S1)
+// ---------------------------------------------------------------------------
+// The client pays for the pool's recovery only up to a deadline. The clock is
+// MEASURED (monotonic, from `received`); the round cost is ESTIMATED and
+// self-calibrating. The estimate only decides whether another round may start;
+// the reserve and the per-await cuts decide that the answer always goes out.
+
+test("ladder budget: the documented defaults are the contract (S1)", () => {
+	assert.equal(relayApi.LADDER_BUDGET_MS, 25_000, "25000ms by default");
+	assert.equal(relayApi.LADDER_RESERVE_MS, 8_000, "8000ms kept back for the terminal attempt and delivery");
+	assert.equal(relayApi.LADDER_ROUND_MS, 6_000, "6000ms is the first guess for one round");
+});
+
+test("nextRoundFits: a round that would end past the deadline is never started (S1)", () => {
+	assert.equal(relayApi.nextRoundFits(17_000, 6_000), true, "plenty of room");
+	assert.equal(relayApi.nextRoundFits(6_000, 6_000), true, "exactly one round still fits");
+	assert.equal(relayApi.nextRoundFits(5_999, 6_000), false, "one millisecond short is short");
+	assert.equal(relayApi.nextRoundFits(0, 6_000), false, "no budget, no round");
+	assert.equal(relayApi.nextRoundFits(1, 0), true, "a free round is not refused for lack of estimate");
+	assert.equal(relayApi.nextRoundFits(Number.NaN, 6_000), false, "an unreadable budget is not permission");
+});
+
+test("ladder clock: elapsed is measured, the reserve is never spendable, the valve is capped (S1)", () => {
+	let now = 1_000;
+	const clock = relayApi.createLadderClock({
+		monotonicNow: () => now,
+		startedAt: 1_000,
+		budgetMs: 25_000,
+		reserveMs: 8_000,
+		estimateMs: 6_000,
+	});
+
+	assert.equal(clock.elapsedMs(), 0);
+	assert.equal(clock.remainingMs(), 25_000);
+	assert.equal(clock.usableMs(), 17_000, "the reserve is not spendable");
+	assert.equal(clock.mayStartRound(), true);
+	assert.equal(clock.drainValveMs(), 17_000, "the 120s valve is capped by what the request has left");
+
+	now = 13_000; // 12s spent
+	assert.equal(clock.elapsedMs(), 12_000);
+	assert.equal(clock.remainingMs(), 13_000);
+	assert.equal(clock.usableMs(), 5_000);
+	assert.equal(clock.mayStartRound(), false, "5000ms cannot pay for a 6000ms round");
+	assert.equal(clock.drainValveMs(), 5_000, "and the valve follows the budget, not the constant");
+
+	now = 40_000; // past the deadline
+	assert.equal(clock.remainingMs(), 0, "the budget never turns negative");
+	assert.equal(clock.usableMs(), 0);
+	assert.equal(clock.drainValveMs(), 0);
+	assert.equal(clock.mayStartRound(), false);
+});
+
+test("ladder clock: each finished round replaces the guess with this machine's number (S1)", () => {
+	let now = 0;
+	const clock = relayApi.createLadderClock({
+		monotonicNow: () => now,
+		startedAt: 0,
+		budgetMs: 60_000,
+		reserveMs: 0,
+		estimateMs: 6_000,
+	});
+	assert.equal(clock.estimateMs, 6_000);
+	assert.equal(clock.observe(12_000), 9_000, "a slow round raises the estimate");
+	assert.equal(clock.observe(3_000), 6_000, "a fast one lowers it again");
+	assert.equal(clock.observe(Number.NaN), 6_000, "an unmeasurable round does not move it");
+	assert.equal(clock.observe(0), 6_000, "zero is not a measurement");
+	now = 30_000;
+	assert.equal(clock.usableMs(), 30_000);
+	assert.equal(clock.mayStartRound(), true, "the calibrated estimate decides the next round");
+});
+
+// ---------------------------------------------------------------------------
+// ladder-refill T2/T3 — the in-request refill loop (S4, S5, S6)
+// ---------------------------------------------------------------------------
+// Round 1 spends the pool the request already has, and every attributable 429
+// parks that egress. When what is left of the pool is parked end to end, an
+// attempt there buys nothing: every address is known to refuse. The time that
+// would have been spent is turned into another recycle round, repeated while
+// the request's own clock can still pay for it. The moment it cannot, the LAST
+// 429 the ladder captured is delivered byte-exact.
+//
+// The loop is off unless the ledger already held a live park when the request
+// started (S5): without a burnt address there is nothing it can save, and the
+// ladder keeps exactly today's shape.
+
+const EGRESS_C = "2a09:bac3:4099:2::7";
+const POOL_C = { id: "warp-c", state: "healthy", served: 0, streams: 0, ip: EGRESS_C, family: "v6" };
+
+const LAST_REFUSAL_BODY = '{"type":"FreeUsageLimitError","message":"the last refusal the ladder holds"}';
+const LAST_REFUSAL = {
+	status: 429,
+	contentType: "application/json",
+	retryAfter: "3600",
+	retryAfterMs: 3_600_000,
+	body: Buffer.from(LAST_REFUSAL_BODY),
+};
+
+/** A proxy whose published pool, health and upstream answers the case drives, so
+ *  a rotation can change what the next read sees. */
+function refillProxy(state) {
+	return installFakeFetch((call) => {
+		if (call.url === `${POOL_PROXY}/exits`) return healthJson(state.detail());
+		if (call.url === `${POOL_PROXY}/health`) {
+			return healthJson({ capabilities: { exits: true }, ...state.health() });
+		}
+		if (call.url === `${POOL_PROXY}/recycle`) {
+			state.recycles += 1;
+			state.onRecycle?.(state.recycles);
+			return new Response("{}", { status: 200 });
+		}
+		if (call.url.startsWith(WARP_CONFIG.upstream)) return state.upstream(call);
+		return new Response("", { status: 404 });
+	});
+}
+
+/** Health that CONFIRMS every rotation: a recycle publishes ids nobody has seen
+ *  yet, and the drained ones are gone, which is exactly what the pool-read wait
+ *  compares. */
+function rotatingPool(recycles) {
+	if (recycles === 0) {
+		return {
+			healthy: 2,
+			recycling: false,
+			exits: [`warp-a (in_use, served=0, streams=0)`, `warp-b (healthy, served=0, streams=0)`],
+		};
+	}
+	return {
+		healthy: 2,
+		recycling: false,
+		exits: [
+			`warp-r${recycles} (in_use, served=0, streams=0)`,
+			`warp-s${recycles} (healthy, served=0, streams=0)`,
+		],
+	};
+}
+
+/** Write a ledger that already parks these egresses, load it as the process
+ *  ledger, and hand the case the log file next to it. Every park lives an hour,
+ *  so nothing here expires mid-case. */
+async function withParkedLedger(ips, run) {
+	return withQuotaDir(async (file) => {
+		process.env.RELAY_QUOTA_PATH = file;
+		const now = Date.now();
+		let ledger = parseQuotaLedger("");
+		for (const ip of ips) {
+			ledger = parkQuotaEgress(ledger, { ip, parkedUntil: now + 3_600_000, reason: "gate_429", now });
+		}
+		writeFileSync(file, serializeQuotaLedger(ledger));
+		resetWarpStateForTests();
+		loadQuotaLedgerAtStartup(file);
+		const log = `${file}.log`;
+		setLogFileForTests(log);
+		try {
+			return await run({ file, log });
+		} finally {
+			setLogFileForTests("");
+			delete process.env.RELAY_QUOTA_PATH;
+			resetWarpStateForTests();
+		}
+	});
+}
+
+test("refill loop: a pool parked end to end buys no attempt, only another round (S4, S6)", async () => {
+	await withParkedLedger([EGRESS_A, EGRESS_B], async ({ log }) => {
+		const time = { now: 0 };
+		const clock = relayApi.createLadderClock({
+			monotonicNow: () => time.now,
+			startedAt: 0,
+			budgetMs: 10_000,
+			reserveMs: 0,
+			estimateMs: 1_000,
+		});
+		const state = {
+			recycles: 0,
+			// One round is measured as 3000ms, and that measurement is what the next
+			// round has to fit under.
+			onRecycle: () => {
+				time.now += 3_000;
+			},
+			detail: () => [freshExit(POOL_A), freshExit(POOL_B)],
+			health: () => rotatingPool(state.recycles),
+			upstream: () =>
+				new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } }),
+		};
+		const fake = refillProxy(state);
+		try {
+			const delivered = await resendAfterRotation(
+				WARP_CONFIG,
+				RESEND_PATH,
+				{ model: "m", messages: [] },
+				LAST_REFUSAL,
+				{ gone: false },
+				{ clock, refill: true },
+			);
+
+			assert.equal(
+				upstreamProxies(fake).length,
+				0,
+				"every published egress is parked, so no attempt is spent on a known refusal",
+			);
+			assert.equal(recyclePosts(fake.calls).length, 3, "the saved time buys rounds while the budget pays");
+
+			assert.equal(delivered.response.status, 429);
+			assert.equal(
+				await delivered.response.text(),
+				LAST_REFUSAL_BODY,
+				"the last 429 the ladder captured is delivered byte-exact",
+			);
+			assert.equal(delivered.response.headers.get("retry-after"), "3600", "with its own reset window");
+
+			const events = readEvents(log);
+			const rounds = events.filter((event) => event.ev === "ladder_round");
+			assert.deepEqual(rounds.map((event) => event.round), [1, 2, 3], "every finished round is recorded");
+			assert.deepEqual(rounds.map((event) => event.elapsedMs), [3_000, 3_000, 3_000], "measured, not guessed");
+			assert.deepEqual(rounds.map((event) => event.parked), [2, 2, 2], "how many published egresses are parked");
+			assert.ok(
+				rounds.every((event) => event.exit === undefined),
+				"no exit is named because none was attempted",
+			);
+
+			const hits = events.filter((event) => event.ev === "ladder_deadline_hit" && event.stage === "ladder");
+			assert.deepEqual(
+				hits.map((event) => ({ round: event.round, remainingMs: event.remainingMs, estimateMs: event.estimateMs })),
+				[{ round: 3, remainingMs: 1_000, estimateMs: 2_750 }],
+				"the refusal to start a round says what was left and what it would have cost",
+			);
+		} finally {
+			fake.restore();
+		}
+	});
+});
+
+test("refill loop: an unburned egress is what makes the next attempt happen (S4, S6)", async () => {
+	await withParkedLedger([EGRESS_A, EGRESS_B], async ({ log }) => {
+		const time = { now: 0 };
+		const clock = relayApi.createLadderClock({
+			monotonicNow: () => time.now,
+			startedAt: 0,
+			budgetMs: 60_000,
+			reserveMs: 0,
+			estimateMs: 1_000,
+		});
+		let reads = 0;
+		const state = {
+			recycles: 0,
+			onRecycle: () => {
+				time.now += 1_000;
+			},
+			// The first pool after a round is still parked end to end; the second one
+			// publishes an address the ledger never saw.
+			detail: () => {
+				reads += 1;
+				return reads < 2
+					? [freshExit(POOL_A), freshExit(POOL_B)]
+					: [freshExit(POOL_A), freshExit(POOL_B), freshExit(POOL_C)];
+			},
+			health: () => rotatingPool(state.recycles),
+			upstream: (call) =>
+				call.proxy === credit("warp-c")
+					? new Response('{"ok":true,"from":"warp-c"}', {
+							status: 200,
+							headers: { "content-type": "application/json" },
+						})
+					: new Response(GATE_429_BODY, { status: 429, headers: { "retry-after": "3600" } }),
+		};
+		const fake = refillProxy(state);
+		try {
+			const delivered = await resendAfterRotation(
+				WARP_CONFIG,
+				RESEND_PATH,
+				{ model: "m", messages: [] },
+				LAST_REFUSAL,
+				{ gone: false },
+				{ clock, refill: true },
+			);
+
+			assert.deepEqual(
+				upstreamProxies(fake),
+				[credit("warp-c")],
+				"the only attempt leaves through the one egress the ledger never parked",
+			);
+			assert.equal(delivered.response.status, 200, "and it delivered the turn");
+			assert.equal(recyclePosts(fake.calls).length, 2, "two rounds: the first only repaired the pool");
+			assert.equal(warpStateForTests().warpCrossExitAttempts, 1, "one attempt, through one named egress");
+
+			const rounds = readEvents(log).filter((event) => event.ev === "ladder_round");
+			assert.deepEqual(rounds.map((event) => event.round), [1, 2]);
+			assert.equal(rounds[0].exit, undefined, "the first round named nothing: its pool was fully parked");
+			assert.equal(rounds[0].parked, 2);
+			assert.equal(rounds[1].exit, "warp-c", "the second round names the egress it spent its attempt on");
+			assert.equal(rounds[1].parked, 2, "the two burnt addresses are still parked");
+		} finally {
+			fake.restore();
+		}
+	});
+});
+
+test("refill loop: with no live park in the ledger the ladder is exactly today's ladder (S5)", async () => {
+	const run = async (ladder) => {
+		resetWarpStateForTests();
+		const state = {
+			recycles: 0,
+			detail: () => [freshExit(POOL_A), freshExit(POOL_B)],
+			health: () => rotatingPool(state.recycles),
+			upstream: () => new Response(GATE_429_BODY, { status: 429, headers: { "retry-after": "3600" } }),
+		};
+		const fake = refillProxy(state);
+		try {
+			const delivered = await resendAfterRotation(
+				WARP_CONFIG,
+				RESEND_PATH,
+				{ model: "m", messages: [] },
+				LAST_REFUSAL,
+				{ gone: false },
+				ladder,
+			);
+			return {
+				recycles: recyclePosts(fake.calls).length,
+				exitsReads: fake.calls.filter((call) => call.url === `${POOL_PROXY}/exits`).length,
+				proxies: upstreamProxies(fake),
+				status: delivered.response.status,
+				body: await delivered.response.text(),
+			};
+		} finally {
+			fake.restore();
+		}
+	};
+
+	resetWarpStateForTests();
+	const withoutClock = await run(undefined);
+	const withClock = await run({
+		clock: relayApi.createLadderClock({ monotonicNow: () => 0, startedAt: 0, budgetMs: 60_000, reserveMs: 0 }),
+		refill: false,
+	});
+
+	assert.deepEqual(withClock, withoutClock, "the clock alone changes nothing: the ledger's evidence does");
+	assert.equal(withoutClock.recycles, 1, "one rotation, as before");
+	assert.equal(withoutClock.exitsReads, 0, "the room-filling pool is never re-read");
+	assert.deepEqual(withoutClock.proxies, [POOL_PROXY], "the resend leaves unnamed, on the proxy's own choice");
+	assert.equal(withoutClock.status, 429, "the resend's refusal is the answer");
+	assert.equal(withoutClock.body, GATE_429_BODY);
+});
+
+test("forward: a started request with a burnt egress refuses a round the budget cannot pay for (S1, S6)", async () => {
+	await withParkedLedger([EGRESS_B], async ({ file, log }) => {
+		const refusal = '{"type":"FreeUsageLimitError","from":"warp-c"}';
+		const fake = refillProxy({
+			recycles: 0,
+			// A third address on purpose: the egress that delivered the 429 is spent by
+			// the chain, the parked one is skipped, and `warp-c` is the clean candidate
+			// round 1 spends — which is what puts the ladder in need of a round.
+			detail: () => [freshExit(POOL_A), freshExit(POOL_B), freshExit(POOL_C)],
+			// A parked exit makes the ladder take the recycle instead of a swap (S13),
+			// which is the step the budget is asked to pay for.
+			health: () => ({
+				healthy: 2,
+				exits: [
+					`warp-a (in_use, served=0, streams=0)`,
+					`warp-b (cooldown, served=0, streams=0)`,
+					`warp-c (healthy, served=0, streams=0)`,
+				],
+			}),
+			upstream: (call) =>
+				call.proxy === credit("warp-c")
+					? new Response(refusal, {
+							status: 429,
+							headers: { "content-type": "application/json", "retry-after": "3600" },
+						})
+					: new Response(GATE_429_BODY, { status: 429, headers: { "retry-after": "3600" } }),
+		});
+		try {
+			// One millisecond of budget: the answer already in hand is all this request
+			// can still pay for, so no round may start.
+			relayApi.setLadderBudgetForTests(1, 0, 1_000);
+			const res = fakeRelayRes();
+			await forward(fakeReq({ marker: "no-budget" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+			assert.deepEqual(
+				upstreamProxies(fake),
+				[credit("warp-a"), credit("warp-c")],
+				"the chain's own attempt, then round 1's clean exit — never the parked address",
+			);
+			assert.equal(res.status, 429);
+			assert.equal(res.body(), refusal, "the 429 the ladder already holds is delivered byte-exact");
+			assert.equal(res.headers["retry-after"], "3600");
+
+			const events = readEvents(log);
+			const rotations = events.filter((event) => event.ev === "rotate_start").length;
+			assert.equal(rotations, 0, "the ladder asked the proxy to rotate exactly never");
+			assert.equal(
+				events.filter((event) => event.ev === "ladder_round").length,
+				0,
+				"nothing ran, so no round claims to have finished",
+			);
+			const hits = events.filter((event) => event.ev === "ladder_deadline_hit" && event.stage === "ladder");
+			assert.equal(hits.length, 1, "the refused round is recorded where a human can find it");
+			assert.equal(hits[0].round, 0, "no round had run");
+			assert.equal(hits[0].remainingMs, 0, "nothing was left");
+			assert.equal(hits[0].estimateMs, 1_000, "and the round it would have cost is named");
+
+			const parked = readQuotaLedger(file).egresses;
+			assert.ok(parked[quotaEgressKey(EGRESS_A)], "round 1's own refusal is still remembered");
+		} finally {
+			fake.restore();
+			relayApi.setLadderBudgetForTests();
+		}
+	});
+});
+
+test("forward: with no live park in the ledger a 429 ends the ladder exactly as before (S5)", async () => {
+	const bodies = {
+		"warp-a": '{"type":"Refusal","exit":"warp-a"}',
+		"warp-b": '{"type":"Refusal","exit":"warp-b"}',
+	};
+	const fake = fakePoolProxy({
+		detail: [freshExit(POOL_A), freshExit(POOL_B, 60)],
+		health: healthOf(["warp-a", "healthy"], ["warp-b", "healthy"]),
+		upstream: (call) => {
+			if (!call.url.startsWith(WARP_CONFIG.upstream)) return new Response("{}", { status: 501 });
+			const id = String(call.proxy ?? "").split("//")[1]?.split(":")[0];
+			return new Response(bodies[id] ?? "{}", { status: 429, headers: { "retry-after": "3600" } });
+		},
+	});
+	try {
+		resetWarpStateForTests();
+		const res = fakeRelayRes();
+		await forward(fakeReq({ marker: "no-park" }), res, RESEND_PATH, FORWARD_CONFIG);
+
+		assert.deepEqual(upstreamProxies(fake), [credit("warp-a"), credit("warp-b")], "round 1 spends each exit once");
+		assert.equal(
+			fake.calls.filter((call) => call.url === `${POOL_PROXY}/exits`).length,
+			1,
+			"the pool is read once: no round re-reads it when nothing was parked in advance",
+		);
+		assert.equal(res.status, 429);
+		assert.equal(res.body(), bodies["warp-b"], "the last refusal of round 1 is what the client gets");
+	} finally {
+		fake.restore();
+		resetWarpStateForTests();
+	}
+});
+
+// T4 / S3 (ladder-refill): the scarce resource under a 429 storm is the
+// enrollment, not the second. The time budget bounds how long a request waits;
+// this window bounds how many times the pool is re-enrolled, shared by the
+// request's own rounds and by the background refill, so one number covers both.
+
+test("enrollment window: the documented cap is three re-enrollments per ten minutes (S3)", () => {
+	assert.equal(relayApi.REFILL_MAX, 3);
+	assert.equal(relayApi.REFILL_WINDOW_MS, 600_000);
+});
+
+test("enrollment window: the fourth enrollment in a window is refused and the window frees again at the edge (S3)", () => {
+	relayApi.resetWarpStateForTests();
+	assert.equal(relayApi.enrollmentWindowOpen(1_000), true);
+	relayApi.recordEnrollment(1_000);
+	relayApi.recordEnrollment(2_000);
+	assert.equal(relayApi.enrollmentWindowOpen(3_000), true);
+	relayApi.recordEnrollment(3_000);
+	assert.equal(relayApi.enrollmentsInWindow(3_000), 3);
+	// The cap is spent: a round that would enrol a fourth time cannot start.
+	assert.equal(relayApi.enrollmentWindowOpen(3_000), false);
+	// Ten minutes after the first enrollment, only that stamp has aged out, so
+	// exactly one more round fits - the window slides, it does not reset.
+	const edge = 1_000 + relayApi.REFILL_WINDOW_MS;
+	assert.equal(relayApi.enrollmentsInWindow(edge), 2);
+	assert.equal(relayApi.enrollmentWindowOpen(edge), true);
+});
+
+test("enrollment window: a refused round does not enrol, and the reset clears the window (S3)", () => {
+	relayApi.resetWarpStateForTests();
+	relayApi.recordEnrollment(0);
+	relayApi.recordEnrollment(0);
+	relayApi.recordEnrollment(0);
+	assert.equal(relayApi.enrollmentWindowOpen(10), false);
+	// Asking is not enrolling: the count stays at exactly the cap.
+	assert.equal(relayApi.enrollmentsInWindow(10), 3);
+	relayApi.resetWarpStateForTests();
+	assert.equal(relayApi.enrollmentsInWindow(10), 0);
+	assert.equal(relayApi.enrollmentWindowOpen(10), true);
 });
