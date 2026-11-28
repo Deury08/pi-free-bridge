@@ -1016,6 +1016,316 @@ export function bumpWarp429Streak(streak, status, egress) {
 	return streak;
 }
 
+// S5: token saver — outgoing tool-output compaction.
+// Adapted from RTK command filters (https://github.com/rtk-ai/rtk, Apache-2.0,
+// CLI command-filter half only; no BUSL-1.1 proxy/engine code) and
+// dsh-our-free-model (https://github.com/Ebony-Vinyl/dsh-our-free-model, MIT).
+// See LICENSE for third-party notices.
+
+const TOKEN_SAVER_RAW_CAP = 10 * 1024 * 1024;
+const TOKEN_SAVER_MIN_SIZE = 500;
+const TOKEN_SAVER_DETECT_WINDOW = 1024;
+const GIT_DIFF_HUNK_MAX_LINES = 100;
+const SMART_TRUNCATE_HEAD = 120;
+const SMART_TRUNCATE_TAIL = 60;
+const SMART_TRUNCATE_MIN_LINES = 250;
+
+const BUILD_SUMMARY_ROW = /^(?:(?:added|removed|changed|audited|installed)\s+\d+\s+package|Finished\s+|BUILD SUCCESS|\d+\s+(?:vulnerabilities|packages?|warnings?|errors?)|Successfully (?:installed|built)|To address .* issues|Run `npm (?:audit|fund)`)|packages are looking for funding/i;
+const BUILD_ERROR_ROW = /^(?:npm (?:ERR!|error)|yarn error|\[ERROR\]|BUILD FAILED)/i;
+const BUILD_DEPRECATION_ROW = /^npm warn deprecated/i;
+const BUILD_WARNING_ROW = /^(?:npm warn|yarn warn|\[WARNING\])/i;
+const BUILD_DIAGNOSTIC_START = /^error(?:\[|:)/i;
+const BUILD_WARNING_DIAGNOSTIC_START = /^warning(?:\[|:)/i;
+const BUILD_DIAGNOSTIC_CONTINUATION = /^\s*(?:-->|\||\d+\s*\||=)/;
+const BUILD_COMPILING_ROW = /^Compiling\s+\S+/i;
+const BUILD_DOWNLOAD_ROW = /^(?:Downloading\s+\S+|Fetching\s+)/i;
+
+export function compactBuildOutput(input) {
+	const errors = [];
+	const warnings = [];
+	const deprecated = [];
+	const summaries = [];
+	let warningCount = 0;
+	let deprecationCount = 0;
+	let compiled = 0;
+	let downloaded = 0;
+	let inDiagnostic = false;
+
+	let offset = 0;
+	for (;;) {
+		const newline = input.indexOf("\n", offset);
+		const end = newline < 0 ? input.length : newline;
+		const row = input.slice(offset, end);
+		const text = row.trim();
+
+		if (inDiagnostic && text !== "" && BUILD_DIAGNOSTIC_CONTINUATION.test(row)) {
+			errors.push(row);
+		} else {
+			inDiagnostic = false;
+			if (BUILD_ERROR_ROW.test(text)) {
+				errors.push(row);
+			} else if (BUILD_DEPRECATION_ROW.test(text)) {
+				deprecationCount += 1;
+				if (deprecated.length < 3) deprecated.push(row);
+			} else if (BUILD_WARNING_ROW.test(text)) {
+				warningCount += 1;
+				if (warnings.length < 5) warnings.push(row);
+			} else if (BUILD_DIAGNOSTIC_START.test(text) || text.startsWith("error -->")) {
+				errors.push(row);
+				inDiagnostic = true;
+			} else if (BUILD_WARNING_DIAGNOSTIC_START.test(text) || text.startsWith("warning -->")) {
+				warningCount += 1;
+				if (warnings.length < 5) warnings.push(row);
+				inDiagnostic = true;
+			} else if (BUILD_COMPILING_ROW.test(text)) {
+				compiled += 1;
+			} else if (BUILD_DOWNLOAD_ROW.test(text)) {
+				downloaded += 1;
+			} else if (BUILD_SUMMARY_ROW.test(text)) {
+				summaries.push(row);
+			}
+		}
+
+		if (newline < 0) break;
+		offset = newline + 1;
+	}
+
+	const head = deprecated.slice();
+	if (deprecationCount > 3) head.push(`... +${deprecationCount - 3} more deprecated packages`);
+	if (compiled > 0) head.push(`Compiled ${compiled} packages`);
+	if (downloaded > 0) head.push(`Downloaded ${downloaded} packages`);
+
+	let result = head.join("\n");
+	const append = (row) => {
+		result += `${result ? "\n" : ""}${row}`;
+	};
+	for (const row of errors) append(row);
+	for (const row of warnings) append(row);
+	if (warningCount > 5) append(`... +${warningCount - 5} more warnings`);
+	for (const row of summaries) append(row);
+	return result || input;
+}
+compactBuildOutput.filterName = "build-output";
+
+const DIFF_TRUNCATION_NOTE =
+	"[diff truncated by pi-free-bridge; disable tool-output compression and request the diff again]";
+
+export function compactGitDiff(input, maxLines = 500) {
+	const output = [];
+	let file = "";
+	let added = 0;
+	let removed = 0;
+	let shown = 0;
+	let omitted = 0;
+	let inHunk = false;
+	let truncated = false;
+
+	const flushOmitted = () => {
+		if (omitted === 0) return;
+		output.push(`  ... (${omitted} lines truncated)`);
+		truncated = true;
+		omitted = 0;
+	};
+	const flushCounts = () => {
+		if (file && (added > 0 || removed > 0)) output.push(`  +${added} -${removed}`);
+	};
+
+	let offset = 0;
+	for (;;) {
+		const newline = input.indexOf("\n", offset);
+		const end = newline < 0 ? input.length : newline;
+		const row = input.slice(offset, end);
+
+		if (row.startsWith("diff --git") || row.startsWith("@@")) {
+			flushOmitted();
+			shown = 0;
+			inHunk = row.startsWith("@@");
+			if (inHunk) {
+				output.push(`  ${row}`);
+			} else {
+				flushCounts();
+				const marker = row.indexOf(" b/");
+				file = marker < 0 ? "unknown" : row.slice(marker + 3);
+				output.push(`\n${file}`);
+				added = 0;
+				removed = 0;
+			}
+		} else if (inHunk) {
+			const isAddition = row[0] === "+" && !row.startsWith("+++");
+			const isDeletion = row[0] === "-" && !row.startsWith("---");
+			if (isAddition) added += 1;
+			if (isDeletion) removed += 1;
+			if (isAddition || isDeletion) {
+				if (shown < GIT_DIFF_HUNK_MAX_LINES) {
+					output.push(`  ${row}`);
+					shown += 1;
+				} else {
+					omitted += 1;
+				}
+			} else if (shown > 0 && shown < GIT_DIFF_HUNK_MAX_LINES && row[0] !== "\\") {
+				output.push(`  ${row}`);
+				shown += 1;
+			}
+		}
+
+		if (output.length >= maxLines) {
+			output.push("\n... (more changes truncated)");
+			truncated = true;
+			break;
+		}
+		if (newline < 0) break;
+		offset = newline + 1;
+	}
+
+	flushOmitted();
+	flushCounts();
+	if (truncated) output.push(DIFF_TRUNCATION_NOTE);
+	return output.join("\n");
+}
+compactGitDiff.filterName = "git-diff";
+
+export function compactSmartTruncate(input) {
+	let count = 1;
+	let headEnd = input.length;
+	let position = input.indexOf("\n");
+	while (position !== -1) {
+		if (count === SMART_TRUNCATE_HEAD) headEnd = position;
+		count += 1;
+		position = input.indexOf("\n", position + 1);
+	}
+	if (count < SMART_TRUNCATE_MIN_LINES) return input;
+
+	let tailStart = input.length;
+	for (let line = 0; line < SMART_TRUNCATE_TAIL; line += 1) {
+		tailStart = input.lastIndexOf("\n", tailStart - 1);
+	}
+	const removed = count - SMART_TRUNCATE_HEAD - SMART_TRUNCATE_TAIL;
+	return `${input.slice(0, headEnd)}\n... +${removed} lines truncated\n${input.slice(tailStart + 1)}`;
+}
+compactSmartTruncate.filterName = "smart-truncate";
+
+const TOKEN_SAVER_SIGNALS = [
+	[/^(?:diff --git |@@ )/m, compactGitDiff],
+	[
+		/^(?:npm (?:warn|error|ERR!)|yarn (?:warn|error)|\s*Compiling\s+\S+|\s*Downloading\s+\S+|added \d+ package|\[ERROR\]|BUILD (?:SUCCESS|FAILED)|\s*Finished\s+|Successfully (?:installed|built)|ERROR:)/im,
+		compactBuildOutput,
+	],
+];
+
+function reachesTruncationThreshold(text) {
+	let count = 1;
+	let position = -1;
+	while (count < SMART_TRUNCATE_MIN_LINES) {
+		position = text.indexOf("\n", position + 1);
+		if (position < 0) return false;
+		count += 1;
+	}
+	return true;
+}
+
+export function autoDetectToolFilter(text) {
+	if (typeof text !== "string") return null;
+	const head = text.slice(0, TOKEN_SAVER_DETECT_WINDOW);
+	for (const [pattern, filter] of TOKEN_SAVER_SIGNALS) {
+		if (pattern.test(head)) return filter;
+	}
+	if (reachesTruncationThreshold(text)) return compactSmartTruncate;
+	return null;
+}
+
+function safeApplyToolFilter(filter, text) {
+	if (typeof filter !== "function") return text;
+	try {
+		const result = filter(text);
+		return typeof result === "string" ? result : text;
+	} catch {
+		return text;
+	}
+}
+
+function compressToolText(text, stats, shape, detect) {
+	const before = text.length;
+	stats.bytesBefore += before;
+	let result = text;
+	if (before >= TOKEN_SAVER_MIN_SIZE && before <= TOKEN_SAVER_RAW_CAP) {
+		const filter = detect(text);
+		if (filter !== null) {
+			const candidate = safeApplyToolFilter(filter, text);
+			if (candidate.length > 0 && candidate.length < before) {
+				result = candidate;
+				stats.hits.push({ shape, filter: filter.filterName || filter.name || "filter", saved: before - candidate.length });
+			}
+		}
+	}
+	stats.bytesAfter += result.length;
+	return result;
+}
+
+function compactContentValue(content, stats, stringShape, arrayShape, detect) {
+	if (typeof content === "string") {
+		const next = compressToolText(content, stats, stringShape, detect);
+		return next === content ? content : next;
+	}
+	if (!Array.isArray(content)) return content;
+	let changed = false;
+	const nextParts = content.map((part) => {
+		if (!part || part.type !== "text" || typeof part.text !== "string") return part;
+		const nextText = compressToolText(part.text, stats, arrayShape, detect);
+		if (nextText === part.text) return part;
+		changed = true;
+		return { ...part, text: nextText };
+	});
+	return changed ? nextParts : content;
+}
+
+/** Pure, fail-open: compact non-error tool outputs in an outgoing body without
+ *  mutating the caller's object or touching system/user/assistant turns. */
+export function compressToolOutputs(body, options = true) {
+	const enabled = options !== false && (options === null || typeof options !== "object" || options.enabled !== false);
+	const detect = options && typeof options === "object" && typeof options.detect === "function"
+		? options.detect
+		: autoDetectToolFilter;
+	const stats = { enabled, bytesBefore: 0, bytesAfter: 0, saved: 0, hits: [] };
+	if (!enabled || !body || typeof body !== "object" || !Array.isArray(body.messages)) {
+		return { body, stats };
+	}
+	try {
+		let anyChanged = false;
+		const nextMessages = body.messages.map((item) => {
+			if (!item || typeof item !== "object") return item;
+			if (item.role === "tool") {
+				if (item.is_error === true || item.isError === true || item.status === "error") return item;
+				const nextContent = compactContentValue(item.content, stats, "openai-tool", "openai-tool-array", detect);
+				if (nextContent === item.content) return item;
+				anyChanged = true;
+				return { ...item, content: nextContent };
+			}
+			if (Array.isArray(item.content)) {
+				let blockChanged = false;
+				const nextBlocks = item.content.map((block) => {
+					if (!block || block.type !== "tool_result" || block.is_error === true || block.isError === true) return block;
+					const nextContent = compactContentValue(block.content, stats, "claude-string", "claude-array", detect);
+					if (nextContent === block.content) return block;
+					blockChanged = true;
+					return { ...block, content: nextContent };
+				});
+				if (!blockChanged) return item;
+				anyChanged = true;
+				return { ...item, content: nextBlocks };
+			}
+			return item;
+		});
+		stats.saved = stats.bytesBefore - stats.bytesAfter;
+		return { body: anyChanged ? { ...body, messages: nextMessages } : body, stats };
+	} catch {
+		stats.bytesAfter = stats.bytesBefore - stats.hits.reduce((sum, hit) => sum + hit.saved, 0);
+		stats.saved = stats.bytesBefore - stats.bytesAfter;
+		return { body, stats };
+	}
+}
+
+let tokenSaverStats = { blocksCompacted: 0, bytesBefore: 0, bytesAfter: 0, bytesSaved: 0 };
+
 // S1: typed failure classifier (ported from dsh-our-free-model src/route/classify.js).
 // L3 exception: rate_limit (daily quota) keeps the full retry-after without the
 // 30-minute provider cap (`MAX_PROVIDER_COOLDOWN_MS`), because capping 21.7h to 30m
@@ -2397,6 +2707,7 @@ export function resetWarpStateForTests() {
 	warpExitsDetailCache = undefined;
 	preferredExitId = undefined;
 	lastFailure = undefined;
+	tokenSaverStats = { blocksCompacted: 0, bytesBefore: 0, bytesAfter: 0, bytesSaved: 0 };
 }
 
 /** Test-only: the state `/health` reports, without standing a server up. */
@@ -2418,6 +2729,7 @@ export function warpStateForTests() {
 		deliveringWarpStreams,
 		preferredExitId,
 		lastFailure,
+		tokenSaver: { ...tokenSaverStats },
 	};
 }
 
@@ -3487,10 +3799,25 @@ export async function forward(req, res, pathname, config) {
 		const source = incoming && typeof incoming === "object" ? incoming : {};
 
 		// The only mutations on the Pi path: the gate-mandated `<env>` block, the
-		// tool names, and `stream: true` (S21-S23).
+		// tool names, `stream: true` (S21-S23), and fail-open tool-output compaction (S5).
+		const tokenSaverEnabled = config.tokenSaver !== false && process.env.RELAY_TOKEN_SAVER !== "0";
+		const compacted = compressToolOutputs(
+			{ ...source, messages: ensureEnvBlock(source.messages, config.cwd) },
+			tokenSaverEnabled,
+		);
+		if (compacted.stats.hits.length > 0) {
+			tokenSaverStats.blocksCompacted += compacted.stats.hits.length;
+			tokenSaverStats.bytesBefore += compacted.stats.bytesBefore;
+			tokenSaverStats.bytesAfter += compacted.stats.bytesAfter;
+			tokenSaverStats.bytesSaved += compacted.stats.saved;
+			logWarpEvent("token_saver", {
+				hits: compacted.stats.hits.length,
+				saved: compacted.stats.saved,
+				filters: [...new Set(compacted.stats.hits.map((h) => h.filter))],
+			});
+		}
 		const body = ensureGateTools({
-			...source,
-			messages: ensureEnvBlock(source.messages, config.cwd),
+			...compacted.body,
 			stream: true,
 		});
 
@@ -3949,6 +4276,10 @@ export async function handle(req, res, config) {
 			// apart from "preferable".
 			preferredExit: preferredExitId ?? null,
 			lastFailure: lastFailure ?? null,
+			tokenSaver: {
+				enabled: config.tokenSaver !== false && process.env.RELAY_TOKEN_SAVER !== "0",
+				...tokenSaverStats,
+			},
 			lastEgress: lastEgress,
 			pid: process.pid,
 		});
@@ -4017,6 +4348,7 @@ async function startServer() {
 		wireModeSource: normalizeWireMode(process.env.RELAY_WIRE_MODE) ? "env" : "config",
 		warpProxy: process.env.RELAY_WARP_PROXY || WARP_PROXY_DEFAULT,
 		warpHealthPath: process.env.RELAY_WARP_HEALTH_PATH || WARP_HEALTH_PATH_DEFAULT,
+		tokenSaver: process.env.RELAY_TOKEN_SAVER !== "0",
 	};
 
 	const server = createServer((req, res) => {
