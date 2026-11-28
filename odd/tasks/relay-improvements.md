@@ -20,8 +20,8 @@ Un commit por función; PRs encadenados sobre `master` (default verificado: `ref
 - T2 · S4 · parent · **✅ `c813867`** `docs(relay): name the non-streaming cause of FreeUsageLimitError`
 - T3 · S1 · parent · **✅ `b4ef816`** `feat(relay): classify upstream failures by kind and scope`
 - T4 · S5 · parent · **✅ `7e00e53`** `feat(relay): compress tool outputs before dispatch`
-- T5 · S6 · worker · commit `feat(relay): record per-stage request diagnostics`
-- T6 · S7 · parent · preparar ramas y cuerpos de PR encadenados
+- T5 · S6 · parent · **✅ `0113fbe`** `feat(relay): record per-stage request diagnostics`
+- T6 · S7 · parent · **✅ PRs #33→#34→#35→#36** ramas pusheadas y PRs encadenados sobre `master`
 
 ## Log
 
@@ -38,3 +38,9 @@ Un commit por función; PRs encadenados sobre `master` (default verificado: `ref
 - **E6 — Slice 1 cerrado**: rama `fix/quota-park-only-extend` con T1 (`966d72e`) + T2 (`c813867`) + ODD (`a816780`), **255 líneas autoradas** sobre `master` y suite **419/419**. Es un slice completo y revisable por sí solo. T2 fue un test de guarda, no de fix: no hay RED posible porque el comportamiento ya era correcto; se verificó que muerde rompiendo el pin a propósito y viéndolo fallar.
 - **E7 — Slice 2 cerrado**: rama `feat/failure-classifier` (encadenada sobre `fix/quota-park-only-extend`) con T3 (`b4ef816`), **569 líneas** respecto a su base (334 en `relay.mjs` + 223 de los 8 tests nuevos — supera los 400 como unidad única código+tests inseparable, sin cortes artificiales). Suite **427/427**, `gate-tools` OK. Nota: el contador del hook de commit suma contra `origin/master` (824); el diff propio del PR #2 contra su base `fix/quota-park-only-extend` es 569 líneas.
 - **E8 — Slice 3 cerrado**: rama `feat/token-saver` (encadenada sobre `feat/failure-classifier`) con T4 (`7e00e53`), **509 líneas** respecto a su base (338 en `relay.mjs` + 157 en `test/relay.test.mjs` + 17 en `LICENSE` con atribución Apache-2.0 para la mitad `src/cmds/` de RTK y MIT para `dsh-our-free-model`, sin código BUSL-1.1). Suite **433/433**, `gate-tools` OK. Nota de licencia: la spec S5 pedía verificar y atribuir Apache-2.0 antes de portar — verificado en `A/LICENSE` y `src/token-saver/compact/*.js`.
+- **E9 — Slice 4 cerrado**: rama `feat/stage-diagnostics` (encadenada sobre `feat/token-saver`) con T5 (`0113fbe`), **350 líneas** respecto a su base (160 en `relay.mjs` + 187 en `test/relay.test.mjs`). Suite **437/437**, `gate-tools` OK, `node --check` y `git diff --check` limpios.
+- **E10 — Cadena de PRs publicada (T6 / S7)**:
+  - PR #33: `fix/quota-park-only-extend` → `master` (`+238 -17`, 3 archivos) — https://github.com/Deury08/pi-free-bridge/pull/33
+  - PR #34: `feat/failure-classifier` → `fix/quota-park-only-extend` (`+560 -14`, 3 archivos) — https://github.com/Deury08/pi-free-bridge/pull/34
+  - PR #35: `feat/token-saver` → `feat/failure-classifier` (`+511 -4`, 4 archivos) — https://github.com/Deury08/pi-free-bridge/pull/35
+  - PR #36: `feat/stage-diagnostics` → `feat/token-saver` (`+343 -7`, 3 archivos) — https://github.com/Deury08/pi-free-bridge/pull/36
