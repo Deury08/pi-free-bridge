@@ -56,3 +56,34 @@ Slice nuevo, encadenado sobre `feat/stage-diagnostics` (stack `relay-improvement
 - **Tamaño del slice**: 935 líneas agregadas en 3 archivos (`relay.mjs` 379, `test/relay.test.mjs` 533, este documento 51). Es un slice, no tres: los tests cubren S1-S6 y separarlos dejaría commits que no se sostienen solos. Se declara acá porque supera la guía de ~400 líneas.
 - **Verificación**: `node --test test/relay.test.mjs` 449/449 en tres corridas consecutivas; `node test/gate-tools.mjs` exit 0; guards verificados por mutación (`nextRoundFits`, tope de enrollments, límite de body); smoke en vivo con una instancia aparte en `:8899` (200 en 4.2 s, `/health` publicando `refill` y `lastLadder`).
 - **Deuda antes de mergear**: verificador independiente y revisión nativa del slice, bloqueados por cuota del proveedor de subagentes. `Risk: item 4` (concurrencia de rondas de rotación).
+
+## Revisión nativa (2026-11-27)
+
+Cierra la deuda de verificación declarada en `## Entrega`. Línea `review-83aaae1b01118a99`,
+target `sha256:57ff90ff…`, base `origin/feat/stage-diagnostics` (`f3874b08…`), committed-only,
+untracked excluido, tier medio, presupuesto de corrección 200 líneas: **ninguna corrección
+solicitada**, la revisión aprobó el candidato tal como estaba.
+
+| lente | artefacto | modelo | duración | tokens salida (razonamiento) |
+| --- | --- | --- | --- | --- |
+| `review-risk` | `rart1_f22033e8999e4f039ac6cc353ea3d78967b3b4871f910773246323b0bd911307` | cpamc/gemini-3.8-flash-high | 18,8 s | 1 813 (1 468) |
+| `review-resilience` | `rart1_6931cc5afda49792ad3c0671ad40ce6eb5540edd85e5f75bbe35d1feb20a9a2f` | ídem | 6,1 s | 420 (0) |
+| `review-reliability` | admitida en el tercer intento | ídem | 106,9 s | 15 954 (15 629) |
+
+Cierre: `approved`, revisión de tienda `sha256:b7d69a44…`, acuse con
+`gentle-ai.review-acknowledged/v1`, autoridad quemada.
+
+### Lo que costó llegar
+
+E1-E18 no cubren el entorno de revisión; queda acá porque es la evidencia real de la corrida:
+
+- El revisor **hereda el modelo de la sesión**; `agent/subagents.json` no participa y
+  `gentle-ai sync` lo revierte al arrancar. Con `deepseek-v4.1-flash-free` las tres lentes
+  fallaban con `reasoning-exhausted-output-budget` (32 000 de salida, 127 928 caracteres de
+  pensamiento, 0 de veredicto) en ~295 s cada una. Ningún fallo de generación se cuenta como
+  hallazgo sobre el candidato.
+- `gentle_review_run` sigue roto (`-non-blocking-findings` en un subcomando que no lo define):
+  se usó `gentle_review` status + `gentle_review_capture` por slot.
+- `review-reliability` tardó 106,9 s contra un bound de primer output de 120 000 ms y se colgó
+  dos veces por poco margen, no por estar trabado. Palanca:
+  `GENTLE_PI_REVIEW_RELAY_FIRST_OUTPUT_TIMEOUT_MS`.
