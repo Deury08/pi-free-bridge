@@ -728,7 +728,14 @@ test("resolveRelaySession: an empty machine falls back to a generated id", async
 // Egress selection (bun-upgrades S5)
 // ---------------------------------------------------------------------------
 
-import { egressOrder, parkDurationMs, PARK_MARGIN_MS, updateWarpPreference, WARP_MODES } from "../relay.mjs";
+import {
+	egressOrder,
+	parkDurationMs,
+	parseRetryAfterMs,
+	PARK_MARGIN_MS,
+	updateWarpPreference,
+	WARP_MODES,
+} from "../relay.mjs";
 
 test("egressOrder: off is always local-only", () => {
 	assert.deepEqual(egressOrder("off", false), ["local"]);
@@ -784,6 +791,46 @@ test("parkDurationMs: no usable header parks nothing", () => {
 	for (const value of [undefined, null, "", "   ", "later", "-60", "1.5", "3600s"]) {
 		assert.equal(parkDurationMs(value), undefined, `retry-after ${JSON.stringify(value)}`);
 	}
+});
+
+// S3: one parser for every shape `retry-after` really arrives in.
+
+test('parseRetryAfterMs: "0" is released now, never an absent header', () => {
+	// 0 is the one value that means "this window is over": dropping it as falsy
+	// would treat a released egress as a missing header.
+	assert.equal(parseRetryAfterMs("0"), 0);
+	assert.notEqual(parseRetryAfterMs("0"), undefined);
+});
+
+test("parseRetryAfterMs: a bare number is seconds, never a 1970 date", () => {
+	// Date.parse("900") is 1970-01-01, which would park an egress for 56 years.
+	assert.equal(parseRetryAfterMs("900"), 900_000);
+	assert.equal(parseRetryAfterMs(" 77986 "), 77_986_000);
+});
+
+test("parseRetryAfterMs: an HTTP-date is a deadline measured from now, never negative", () => {
+	const now = Date.UTC(2026, 9, 21, 7, 0, 0);
+	assert.equal(parseRetryAfterMs("Wed, 21 Oct 2026 07:28:00 GMT", now), 28 * 60 * 1000);
+	assert.equal(
+		parseRetryAfterMs("Wed, 21 Oct 2026 06:00:00 GMT", now),
+		0,
+		"a deadline that already passed is released now"
+	);
+});
+
+test("parseRetryAfterMs: an empty or unparsable value is absent", () => {
+	for (const value of [undefined, null, "", "   ", "later", "-60", "1.5", "3600s"]) {
+		assert.equal(parseRetryAfterMs(value), undefined, `retry-after ${JSON.stringify(value)}`);
+	}
+});
+
+test("parkDurationMs: a date-form retry-after parks until that deadline plus the margin", () => {
+	const now = Date.UTC(2026, 9, 21, 7, 0, 0);
+	assert.equal(
+		parkDurationMs("Wed, 21 Oct 2026 07:28:00 GMT", now),
+		28 * 60 * 1000 + PARK_MARGIN_MS,
+		"a date-form header must park, not fail the integer test"
+	);
 });
 
 test("updateWarpPreference: auto elevates when warp was the final egress", () => {
@@ -1876,6 +1923,40 @@ function fakeRelayRes({ socket } = {}) {
 
 const fakeReq = (payload) => Readable.from([Buffer.from(JSON.stringify(payload))]);
 const FORWARD_CONFIG = { ...WARP_CONFIG, cwd: ".", warpMode: "on", sessionSource: "test" };
+
+// S4: the gate answers a non-streaming request with `FreeUsageLimitError`, which
+// is byte-identical to a spent quota. `forward()` pins `stream: true` on the way
+// out, and this is the only thing standing between a caller's `stream: false`
+// and a 429 the relay would spend a rotation trying to explain. There is no RED
+// phase to show: the behaviour is correct today, so this is a guard, not a fix.
+// It bites the moment someone forwards the caller's `stream` instead of pinning.
+test("forward: the upstream body is always streamed, whatever the caller asks for (S4)", async () => {
+	const refused = () =>
+		new Response(JSON.stringify({ type: "error", error: { type: "FreeUsageLimitError" } }), {
+			status: 429,
+			headers: { "content-type": "application/json" },
+		});
+	const fake = installFakeFetch(refused);
+	try {
+		await forward(
+			fakeReq({ model: "big-pickle", stream: false, messages: [{ role: "user", content: "hi" }] }),
+			fakeRelayRes(),
+			"/v1/chat/completions",
+			{ ...FORWARD_CONFIG, warpMode: "off" },
+		);
+		const posts = fake.calls.filter((call) => call.method === "POST" && call.body);
+		assert.ok(posts.length > 0, "the relay must have reached upstream at all");
+		for (const call of posts) {
+			assert.equal(
+				JSON.parse(call.body).stream,
+				true,
+				"a non-streaming upstream request is refused as FreeUsageLimitError, not as a contract error",
+			);
+		}
+	} finally {
+		fake.restore();
+	}
+});
 
 test("forward: backpressure pauses upstream reads until drain", { timeout: 2_000 }, async () => {
 	const originalFetch = globalThis.fetch;
@@ -5536,6 +5617,52 @@ test("parkQuotaEgress: re-parking the same IP increments hits and moves the rese
 	assert.equal(entry.exit_id, "warp-7", "the exit that burnt it last is the one reported");
 	assert.equal(entry.prefix64, "2001:0db8:0001:0002::/64");
 	assert.equal(first.egresses["2001:db8:1:2::1"].hits, 1, "the previous ledger is untouched");
+});
+
+// S2: only-extend. A short fallback park must never erase a long real one.
+
+test("parkQuotaEgress: a shorter park never shortens a longer deadline (S2)", () => {
+	const long = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: V4_A,
+		exitId: "warp-2",
+		parkedUntil: LEDGER_NOW + 86_400_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	const shorter = parkQuotaEgress(long, {
+		ip: V4_A,
+		exitId: "warp-9",
+		parkedUntil: LEDGER_NOW + 10_000,
+		reason: "fallback",
+		now: LEDGER_NOW + 1_000,
+	});
+	const entry = shorter.egresses[V4_A];
+	assert.equal(entry.parked_until, LEDGER_NOW + 86_400_000, "the long real park stays");
+	assert.equal(entry.exit_id, "warp-2", "the park that reaches the deadline is the one reported");
+	assert.equal(entry.reason, "gate_429", "and its reason is the one kept");
+	assert.equal(entry.hits, 2, "the shorter write is still history on the entry");
+	assert.equal(long.egresses[V4_A].parked_until, LEDGER_NOW + 86_400_000, "the previous ledger is untouched");
+});
+
+test("parkQuotaEgress: a later write still extends a shorter deadline (S2)", () => {
+	const first = parkQuotaEgress(parseQuotaLedger(""), {
+		ip: V6_A,
+		exitId: "warp-2",
+		parkedUntil: LEDGER_NOW + 60_000,
+		reason: "gate_429",
+		now: LEDGER_NOW,
+	});
+	const second = parkQuotaEgress(first, {
+		ip: V6_A,
+		exitId: "warp-3",
+		parkedUntil: LEDGER_NOW + 3_600_000,
+		reason: "gate_429",
+		now: LEDGER_NOW + 1_000,
+	});
+	const entry = second.egresses["2001:db8:1:2::1"];
+	assert.equal(entry.parked_until, LEDGER_NOW + 3_600_000, "extending is still allowed");
+	assert.equal(entry.exit_id, "warp-3", "the exit that burnt it last is the one reported");
+	assert.equal(entry.hits, 2);
 });
 
 test("parkQuotaEgress: two IPs are two entries", () => {
