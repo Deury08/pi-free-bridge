@@ -1016,6 +1016,292 @@ export function bumpWarp429Streak(streak, status, egress) {
 	return streak;
 }
 
+// S1: typed failure classifier (ported from dsh-our-free-model src/route/classify.js).
+// L3 exception: rate_limit (daily quota) keeps the full retry-after without the
+// 30-minute provider cap (`MAX_PROVIDER_COOLDOWN_MS`), because capping 21.7h to 30m
+// would make the relay re-hammer a spent quota the same day.
+export const FAILURE_KIND = Object.freeze(
+	Object.fromEntries(
+		[
+			"invalid_request",
+			"context_window",
+			"auth",
+			"permission",
+			"billing",
+			"rate_limit",
+			"overloaded",
+			"timeout",
+			"upstream",
+			"unavailable",
+			"aborted",
+			"unknown",
+		].map((name) => [name.toUpperCase(), name]),
+	),
+);
+export const FAILURE_SCOPE = Object.freeze(
+	Object.fromEntries(["request", "account", "provider", "transient"].map((name) => [name.toUpperCase(), name])),
+);
+export const COOLDOWN_LONG_MS = 120_000;
+export const COOLDOWN_SHORT_MS = 5_000;
+export const TRANSIENT_COOLDOWN_MS = 30_000;
+export const MAX_PROVIDER_COOLDOWN_MS = 1_800_000;
+export const BACKOFF_BASE_MS = 2_000;
+export const BACKOFF_MAX_MS = 300_000;
+export const BACKOFF_MAX_LEVEL = 15;
+
+export function backoffFor(level) {
+	const exponent = Number.isFinite(level) ? Math.min(14, Math.max(0, Math.floor(level) - 1)) : 0;
+	return Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** exponent);
+}
+
+function failurePolicy(kind, scope, duration, retryable = duration < 0) {
+	return { kind, scope, retryable, ...(duration < 0 ? { backoff: true } : { cooldownMs: duration }) };
+}
+
+const ACCOUNT_AUTH = failurePolicy("auth", "account", COOLDOWN_LONG_MS);
+const ACCOUNT_PERMISSION = failurePolicy("permission", "account", COOLDOWN_LONG_MS);
+const ACCOUNT_RATE = failurePolicy("rate_limit", "account", -1);
+const PROVIDER_CAPACITY = failurePolicy("overloaded", "provider", -1);
+const MISSING_MODEL = failurePolicy("unavailable", "account", COOLDOWN_LONG_MS);
+const TRANSIENT_SERVER = failurePolicy("upstream", "transient", TRANSIENT_COOLDOWN_MS, true);
+
+const TEXT_RULES = [
+	{ text: "no credentials", ...ACCOUNT_AUTH },
+	{ text: "request not allowed", ...failurePolicy("permission", "account", COOLDOWN_SHORT_MS) },
+	{ text: "improperly formed request", ...failurePolicy("invalid_request", "account", COOLDOWN_LONG_MS) },
+	{ text: "too many requests", ...ACCOUNT_RATE },
+	{ text: "rate limit", ...ACCOUNT_RATE },
+	{ text: "quota exceeded", ...ACCOUNT_RATE },
+	{ text: "overloaded", ...PROVIDER_CAPACITY },
+	{ text: "capacity", ...PROVIDER_CAPACITY },
+];
+
+const STATUS_RULES = new Map([
+	[401, ACCOUNT_AUTH],
+	[402, failurePolicy("billing", "account", COOLDOWN_LONG_MS)],
+	[403, ACCOUNT_PERMISSION],
+	[404, MISSING_MODEL],
+	[429, ACCOUNT_RATE],
+]);
+
+const CODE_VERDICTS = Object.assign(Object.create(null), {
+	aborted: failurePolicy("aborted", "request", 0),
+	timeout: failurePolicy("timeout", "transient", TRANSIENT_COOLDOWN_MS, true),
+	transport: failurePolicy("unavailable", "transient", TRANSIENT_COOLDOWN_MS, true),
+	server: TRANSIENT_SERVER,
+	stream_cut: TRANSIENT_SERVER,
+	empty_response: TRANSIENT_SERVER,
+	client_error: failurePolicy("invalid_request", "request", 0),
+	invalid_credential: ACCOUNT_AUTH,
+	invalid_api_key: ACCOUNT_AUTH,
+	unauthorized: ACCOUNT_AUTH,
+	permission_denied: ACCOUNT_PERMISSION,
+	forbidden: ACCOUNT_PERMISSION,
+	rate_limit: ACCOUNT_RATE,
+	region_blocked: failurePolicy("unavailable", "provider", 0),
+	lane_locked: failurePolicy("unavailable", "provider", 0),
+	authorization_required: failurePolicy("auth", "provider", 0),
+});
+
+const CONTEXT_WINDOW_CODES = ["context_length_exceeded", "model_context_window_exceeded"];
+const CONTEXT_WINDOW_MARKERS = [
+	"context_length_exceeded",
+	"maximum context length",
+	"context window exceeded",
+	"exceeds the context window",
+	"prompt is too long",
+];
+const MARKER_RULES = [
+	{ marker: "rate_limit", ...ACCOUNT_RATE },
+	{ marker: "resourceexhausted", ...PROVIDER_CAPACITY },
+	{ marker: "resource exhausted", ...PROVIDER_CAPACITY },
+	{ marker: "resource_exhausted", ...PROVIDER_CAPACITY },
+	{ marker: "limit reached", ...PROVIDER_CAPACITY },
+	{ marker: "internal_server_error", ...TRANSIENT_SERVER },
+	{ marker: "internal server error", ...TRANSIENT_SERVER },
+	{ marker: "model_not_found", ...MISSING_MODEL },
+];
+const OVERLOAD_STATUSES = new Set([502, 503, 504, 529]);
+
+function verdictOf(kind, scope, { retryable = false, cooldownMs = 0, cooldownLevel = 0, rule = "default" } = {}) {
+	return { kind, scope, retryable: retryable === true, cooldownMs, cooldownLevel, rule };
+}
+
+function selectedVerdict(selected, level, label) {
+	if (!selected) return null;
+	if (selected.backoff === true) {
+		const next = Math.min(BACKOFF_MAX_LEVEL, Math.max(0, level) + 1);
+		return verdictOf(selected.kind, selected.scope, {
+			retryable: true,
+			cooldownMs: backoffFor(next),
+			cooldownLevel: next,
+			rule: label,
+		});
+	}
+	return verdictOf(selected.kind, selected.scope, {
+		retryable: selected.retryable,
+		cooldownMs: selected.cooldownMs,
+		rule: label,
+	});
+}
+
+function bodyTextOf(value) {
+	if (value == null) return "";
+	if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+	try {
+		return JSON.stringify(value) ?? "";
+	} catch {
+		return "";
+	}
+}
+
+function failureCodes(code, body) {
+	let parsed = body;
+	while (typeof parsed === "string") {
+		try {
+			parsed = JSON.parse(parsed);
+		} catch {
+			break;
+		}
+	}
+	const candidates = [code];
+	if (parsed !== null && typeof parsed === "object") {
+		candidates.push(parsed.code, parsed.type);
+		if (parsed.error !== null && typeof parsed.error === "object" && !Array.isArray(parsed.error)) {
+			candidates.push(parsed.error.code, parsed.error.type);
+		}
+	}
+	const codes = new Set();
+	for (const candidate of candidates) {
+		if (typeof candidate === "string" && candidate.trim()) codes.add(candidate.trim().toLowerCase());
+	}
+	return [...codes];
+}
+
+/** Pure: pull `{ code, message }` out of a JSON or SSE error payload, failing
+ *  open to `{}` on plain text or malformed envelopes. */
+export function extractFailureFields(bodyText) {
+	if (typeof bodyText !== "string") return {};
+	let text = bodyText.trim();
+	if (!text) return {};
+	// Unwrap the first SSE `data:` frame when an upstream emits an error inside a stream.
+	for (const line of text.split(/\r?\n/)) {
+		if (line.startsWith("data:")) {
+			const payload = line.slice(5).trim();
+			if (payload && payload !== "[DONE]") {
+				text = payload;
+				break;
+			}
+		}
+	}
+	try {
+		const parsed = JSON.parse(text);
+		if (!parsed || typeof parsed !== "object") return {};
+		const err = parsed.error && typeof parsed.error === "object" && !Array.isArray(parsed.error) ? parsed.error : parsed;
+		const code = typeof err.code === "string" && err.code.trim()
+			? err.code.trim()
+			: typeof err.type === "string" && err.type.trim()
+				? err.type.trim()
+				: undefined;
+		const message = typeof err.message === "string" && err.message.trim() ? err.message.trim() : undefined;
+		return { ...(code ? { code } : {}), ...(message ? { message } : {}) };
+	} catch {
+		return {};
+	}
+}
+
+/** Pure: classify an upstream failure into `{ kind, scope, retryable, cooldownMs,
+ *  cooldownLevel, rule, status? }`. `rate_limit` honors the full `retryAfterMs`
+ *  without the 30-minute provider cap (L3). */
+export function classifyFailure({ status, code, message, body, retryAfterMs, backoffLevel = 0 } = {}) {
+	const normalizedStatus = Number.isInteger(status)
+		? status
+		: typeof status === "string" && /^\d{1,3}$/.test(status.trim())
+			? Number(status)
+			: undefined;
+	const level = Number.isFinite(backoffLevel) ? Math.max(0, Math.floor(backoffLevel)) : 0;
+	const text = [bodyTextOf(message), typeof code === "string" ? code : "", bodyTextOf(body)]
+		.filter(Boolean)
+		.join(" ")
+		.toLowerCase();
+	const codes = failureCodes(code, body);
+
+	let verdict = null;
+	if (
+		codes.some((c) => CONTEXT_WINDOW_CODES.includes(c)) ||
+		CONTEXT_WINDOW_MARKERS.some((marker) => text.includes(marker))
+	) {
+		verdict = verdictOf("context_window", "request", { rule: "context-window" });
+	}
+	if (!verdict) {
+		for (const rule of TEXT_RULES) {
+			if (text.includes(rule.text)) {
+				verdict = selectedVerdict(rule, level, `text:${rule.text}`);
+				break;
+			}
+		}
+	}
+	if (!verdict) {
+		for (const c of codes) {
+			if (Object.hasOwn(CODE_VERDICTS, c)) {
+				verdict = selectedVerdict(CODE_VERDICTS[c], level, `code:${c}`);
+				break;
+			}
+		}
+	}
+	if (!verdict && normalizedStatus !== undefined) {
+		verdict = selectedVerdict(STATUS_RULES.get(normalizedStatus), level, `status:${normalizedStatus}`);
+	}
+	if (!verdict) {
+		for (const rule of MARKER_RULES) {
+			if (text.includes(rule.marker)) {
+				verdict = selectedVerdict(rule, level, `marker:${rule.marker}`);
+				break;
+			}
+		}
+	}
+	if (!verdict && normalizedStatus !== undefined) {
+		const label = `status:${normalizedStatus}`;
+		if (normalizedStatus === 408 || normalizedStatus === 425 || (normalizedStatus >= 500 && normalizedStatus <= 599)) {
+			const kind = normalizedStatus === 408 ? "timeout" : OVERLOAD_STATUSES.has(normalizedStatus) ? "overloaded" : "upstream";
+			verdict = verdictOf(kind, "transient", { retryable: true, cooldownMs: TRANSIENT_COOLDOWN_MS, rule: label });
+		} else if (normalizedStatus >= 400 && normalizedStatus < 500) {
+			verdict = verdictOf("invalid_request", "request", { rule: label });
+		}
+	}
+	if (!verdict) {
+		verdict = verdictOf("unknown", "transient", { retryable: true, cooldownMs: TRANSIENT_COOLDOWN_MS, rule: "transient" });
+	}
+
+	if (Number.isFinite(retryAfterMs) && Math.trunc(retryAfterMs) > 0 && verdict.retryable && verdict.cooldownMs > 0) {
+		const rawMs = Math.trunc(retryAfterMs);
+		verdict.cooldownMs = verdict.kind === "rate_limit" ? rawMs : Math.min(rawMs, MAX_PROVIDER_COOLDOWN_MS);
+		verdict.rule += "+provider-reset";
+	}
+	if (normalizedStatus !== undefined) verdict.status = normalizedStatus;
+	return verdict;
+}
+
+/** Pure: classify a thrown runtime/fetch/stream error using `classifyFailure`. */
+export function classifyThrownError(err, clientGone = false) {
+	const rawCode = err && typeof err.failureCode === "string"
+		? err.failureCode
+		: err && typeof err.code === "string"
+			? err.code
+			: undefined;
+	const msg = err && err.message ? String(err.message) : String(err ?? "");
+	let code = rawCode;
+	if (!code) {
+		const name = err && err.name ? String(err.name) : "";
+		if (clientGone || (name === "AbortError" && clientGone)) code = "aborted";
+		else if (name === "TimeoutError" || /timed out|timeout/i.test(msg)) code = "timeout";
+		else if (isNetworkError(err)) code = "transport";
+	}
+	return classifyFailure({ code, message: msg });
+}
+
+let lastFailure = undefined;
+
 /** Pure: the cause the relay can actually justify when the gate answers 429.
  *
  *  The vendor returns `FreeUsageLimitError` for four unrelated conditions: an
@@ -2110,6 +2396,7 @@ export function resetWarpStateForTests() {
 	warpExitsProbe = undefined;
 	warpExitsDetailCache = undefined;
 	preferredExitId = undefined;
+	lastFailure = undefined;
 }
 
 /** Test-only: the state `/health` reports, without standing a server up. */
@@ -2130,6 +2417,7 @@ export function warpStateForTests() {
 		localParkedUntil,
 		deliveringWarpStreams,
 		preferredExitId,
+		lastFailure,
 	};
 }
 
@@ -3143,7 +3431,9 @@ async function aggregateCompletion(response, client) {
 			}
 		}
 	}
-	if (!response.body) throw new Error("upstream SSE ended without [DONE]");
+	if (!response.body) {
+		throw Object.assign(new Error("upstream SSE ended without [DONE]"), { failureCode: "empty_response" });
+	}
 	const reader = response.body.getReader();
 	let bytes = 0;
 	let cancellation;
@@ -3169,7 +3459,11 @@ async function aggregateCompletion(response, client) {
 			if (bytes > 32 * 1024 * 1024) throw new Error("upstream SSE exceeds 32 MiB");
 			consume(decoder.decode(next.value, { stream: true }));
 		}
-		if (!done) throw new Error("upstream SSE ended without [DONE]");
+		if (!done) {
+			throw Object.assign(new Error("upstream SSE ended without [DONE]"), {
+				failureCode: bytes === 0 ? "empty_response" : "stream_cut",
+			});
+		}
 	} finally {
 		clearInterval(departure);
 		await cancel();
@@ -3288,10 +3582,11 @@ export async function forward(req, res, pathname, config) {
 					}
 				}
 			} catch (err) {
-				// S7: modo "on" y WARP falla con error de red (no 429/403 de
-				// quota) → fallback a local para evitar 502. Nada se ha
-				// entregado al cliente aún (fetch rechazó antes del primer byte).
-				if (config.warpMode === "on" && egress === "warp" && isNetworkError(err)) {
+				const errVerdict = classifyThrownError(err, client.gone);
+				lastFailure = errVerdict;
+				// S7/S1: modo "on" y WARP falla con error retryable de red/timeout
+				// (no un request abortado ni una negativa de contrato) -> fallback a local.
+				if (config.warpMode === "on" && egress === "warp" && (errVerdict.retryable || isNetworkError(err)) && errVerdict.kind !== "aborted") {
 					try {
 						candidate = await egressFetch(config, pathname, {
 							body: JSON.stringify(body),
@@ -3300,6 +3595,7 @@ export async function forward(req, res, pathname, config) {
 						response = candidate;
 						break;
 					} catch (err2) {
+						lastFailure = classifyThrownError(err2, client.gone);
 						errors.push(`local: ${err2 && err2.message ? err2.message : String(err2)}`);
 						continue;
 					}
@@ -3404,13 +3700,28 @@ export async function forward(req, res, pathname, config) {
 		if (response.status >= 400) {
 			const errorBody = Buffer.from(await response.arrayBuffer());
 			const snapshot = errorBody.subarray(0, 4096);
+			const snapshotText = snapshot.toString("utf8");
+			const fields = extractFailureFields(snapshotText);
+			const verdict = classifyFailure({
+				status: response.status,
+				code: fields.code,
+				message: fields.message,
+				body: snapshotText,
+				retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
+			});
+			lastFailure = verdict;
+			logWarpEvent("upstream_failure", {
+				status: response.status,
+				egress: egressUsed,
+				kind: verdict.kind,
+				scope: verdict.scope,
+				retryable: verdict.retryable,
+				rule: verdict.rule,
+			});
 			process.stderr.write(
-				`pi-free-bridge relay: upstream ${response.status} via ${egressUsed} ${toUpstreamUrl(config.upstream, pathname)}
-` +
-					`pi-free-bridge relay: session ${config.session} (from ${config.sessionSource})
-` +
-					`pi-free-bridge relay: upstream body: ${snapshot.toString("utf8")}
-`,
+				`pi-free-bridge relay: upstream ${response.status} [${verdict.kind}/${verdict.scope}] via ${egressUsed} ${toUpstreamUrl(config.upstream, pathname)}\n` +
+					`pi-free-bridge relay: session ${config.session} (from ${config.sessionSource})\n` +
+					`pi-free-bridge relay: upstream body: ${snapshotText}\n`,
 			);
 			res.writeHead(response.status, headers);
 			res.end(errorBody);
@@ -3453,6 +3764,16 @@ export async function forward(req, res, pathname, config) {
 	} catch (err) {
 		// Only our body-limit error changes status; other failures remain 502.
 		const status = err instanceof RequestBodyTooLargeError ? 413 : 502;
+		if (!(err instanceof RequestBodyTooLargeError)) {
+			lastFailure = classifyThrownError(err, client.gone);
+			logWarpEvent("upstream_failure", {
+				status,
+				kind: lastFailure.kind,
+				scope: lastFailure.scope,
+				retryable: lastFailure.retryable,
+				rule: lastFailure.rule,
+			});
+		}
 		sendJson(res, status, { error: { message: err && err.message ? err.message : String(err) } });
 	} finally {
 		if (countedDelivering) deliveringWarpStreams -= 1;
@@ -3627,6 +3948,7 @@ export async function handle(req, res, config) {
 			// The exit the last attempt actually named, so "preferred" can be read
 			// apart from "preferable".
 			preferredExit: preferredExitId ?? null,
+			lastFailure: lastFailure ?? null,
 			lastEgress: lastEgress,
 			pid: process.pid,
 		});
